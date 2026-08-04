@@ -256,6 +256,60 @@ export function ProjectProvider({
     return () => window.removeEventListener("keydown", onKey);
   }, [undo, redo]);
 
+  // Frame navigation (todo 9): left/right steps a frame, space plays/pauses,
+  // up/down jumps to the selected point's next/previous keyframe (its pins
+  // plus whatever manual corrections have been promoted to ground truth --
+  // W1's `ground_truth`, read the same locally-typed way Timeline.tsx and
+  // PointsPanel.tsx do, since it is not part of the shared `TrackData` type),
+  // home/end jump to the first/last frame. Ignored while typing in a field,
+  // same guard as undo/redo above.
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (!project || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      // A focused button also treats space/enter as "activate it" -- deferring
+      // to that native behaviour there avoids a focused Play button both
+      // toggling itself and being toggled again by this shortcut.
+      if (target && /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target.tagName)) return;
+      const lastFrame = Math.max(project.video.frames - 1, 0);
+
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setCurrentFrame(Math.min(lastFrame, currentFrame + 1));
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setCurrentFrame(Math.max(0, currentFrame - 1));
+      } else if (event.key === " " || event.code === "Space") {
+        event.preventDefault();
+        setIsPlaying((playing) => !playing);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        setCurrentFrame(0);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        setCurrentFrame(lastFrame);
+      } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        if (!selectedPointId) return;
+        const point = project.points.find((p) => p.id === selectedPointId);
+        const promoted = (tracks[selectedPointId] as (TrackData & { ground_truth?: { frame: number }[] }) | undefined)
+          ?.ground_truth;
+        const frames = (promoted ? promoted.map((q) => q.frame) : point?.queries.map((q) => q.frame)) ?? [];
+        const marks = [...new Set(frames)].sort((a, b) => a - b);
+        if (marks.length === 0) return;
+        event.preventDefault();
+        if (event.key === "ArrowUp") {
+          const next = marks.find((f) => f > currentFrame);
+          setCurrentFrame(next ?? marks[marks.length - 1]);
+        } else {
+          const prev = [...marks].reverse().find((f) => f < currentFrame);
+          setCurrentFrame(prev ?? marks[0]);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [project, currentFrame, selectedPointId, tracks, setCurrentFrame, setIsPlaying]);
+
   // Whenever a track/retrack job for a point finishes, drop the stale cache
   // entry and refresh the project so its summary (frames, confidence) updates.
   const seenDoneJobs = useRef(new Set<string>());

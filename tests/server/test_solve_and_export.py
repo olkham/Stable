@@ -145,10 +145,30 @@ def test_export_curves_after_solve(client: TestClient, tracked_project) -> None:
     assert len(rows) == source.frame_count
 
 
+def smooth_a_little(client: TestClient, project_id: str) -> None:
+    """Configure a real smoothing filter, so the render is not the identity.
+
+    Without this the stabilisation warp is ``smoothed . raw^-1`` with
+    ``smoothed == raw`` on every frame, and the export is refused as a no-op —
+    see ``test_export_refuses_a_render_that_would_change_nothing``.
+    """
+    response = client.put(
+        f"/api/projects/{project_id}/smoothing",
+        json={
+            "filters": [
+                {"channel": c, "filter": "butterworth", "params": {"cutoff_hz": 1.0}}
+                for c in ("x", "y")
+            ]
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
 def test_export_video_end_to_end(client: TestClient, tracked_project) -> None:
     project_id, _source = tracked_project
     submit = client.post(f"/api/projects/{project_id}/solve")
     wait_job(client, project_id, submit.json()["job_id"])
+    smooth_a_little(client, project_id)
 
     render = client.post(
         f"/api/projects/{project_id}/export/video",
@@ -162,6 +182,17 @@ def test_export_video_end_to_end(client: TestClient, tracked_project) -> None:
     assert download.status_code == 200
     assert download.headers["content-type"] == "video/mp4"
     assert len(download.content) > 0
+
+    # A finished render must stay reachable after the export dialog forgets it.
+    listed = client.get(f"/api/projects/{project_id}/export/renders")
+    assert listed.status_code == 200
+    assert [entry["filename"] for entry in listed.json()] == ["out.mp4"]
+    assert listed.json()[0]["bytes"] > 0
+
+
+def test_renders_listing_is_empty_before_any_export(client: TestClient, tracked_project) -> None:
+    project_id, _source = tracked_project
+    assert client.get(f"/api/projects/{project_id}/export/renders").json() == []
 
 
 def test_export_download_rejects_path_traversal(client: TestClient, tracked_project) -> None:

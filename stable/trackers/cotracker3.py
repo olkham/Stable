@@ -50,7 +50,10 @@ COTRACKER3_OFFLINE = register_model(
         key="cotracker3_offline",
         url="https://huggingface.co/facebook/cotracker3/resolve/main/scaled_offline.pth",
         filename="cotracker3_scaled_offline.pth",
-        sha256=None,  # unpinned: see CONTRIBUTING.md "Pinning a checkpoint"
+        # Pinned from a real download verified against a real inference run (see
+        # CONTRIBUTING.md "Pinning a checkpoint"); ~97 MiB, 101890938 bytes.
+        sha256="2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834",
+        size_bytes=101890938,
         license="CC-BY-NC-4.0",
         non_commercial=True,
         notes=(

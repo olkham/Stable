@@ -6,6 +6,14 @@ The curve math is the real Phase 3 stack — :mod:`stable.solver`,
 This module is only the HTTP surface: settings persistence, job submission and
 serving one warped frame.
 
+It also owns the stabilisation *options* — target, crop and border fill (todo
+17). They are not part of the locked v1 project schema, so they persist in a
+sidecar next to the solve and smoothing caches (see
+:data:`stable.server.motion.RENDER_OPTIONS_CACHE`); the request models for them
+live here rather than in ``schemas.py`` for the same reason the correction
+models do: one definition of what a valid option is, in
+:mod:`stable.render.options`, instead of a Pydantic mirror that can drift.
+
 Note:
     Solved curves are pivot-relative, so a stabilisation warp is never rebuilt
     from raw channel values here. See :mod:`stable.server.motion`.
@@ -16,9 +24,12 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel
 
 from ...core.errors import StableError
 from ...core.project import Project, SmoothingSpec
+from ...render.fill import FILL_MODES
+from ...render.options import CROP_CENTRES, TARGET_MODES, RenderOptions
 from ...render.warp import rescale_transform, warp_frame
 from ...smoothing.motion import SmoothedMotion
 from ...solver.motion import MotionSolve
@@ -28,7 +39,14 @@ from ..schemas import SmoothingUpdate, SolveSettingsUpdate
 from ..storage import Workspace, get_workspace
 from ..tracking import load_display_track
 
-__all__ = ["router", "load_solve", "load_smoothed", "recompute_smoothed"]
+__all__ = [
+    "router",
+    "load_solve",
+    "load_smoothed",
+    "recompute_smoothed",
+    "load_options",
+    "preview_plan",
+]
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["solve"])
 
@@ -47,6 +65,19 @@ def _solve_path(workspace: Workspace, project_id: str) -> Any:
 
 def _smoothing_path(workspace: Workspace, project_id: str) -> Any:
     return workspace.project_dir(project_id) / motion_glue.SMOOTHING_CACHE
+
+
+def _options_path(workspace: Workspace, project_id: str) -> Any:
+    return motion_glue.options_path(workspace.project_dir(project_id))
+
+
+def load_options(workspace: Workspace, project_id: str) -> RenderOptions:
+    """Return a project's stabilisation options (target / crop / fill).
+
+    Shared with :mod:`stable.server.routes.export`, so the preview and the
+    export are planned from exactly the same choices.
+    """
+    return motion_glue.load_render_options(workspace.project_dir(project_id))
 
 
 def load_solve(workspace: Workspace, project_id: str) -> MotionSolve | None:
@@ -240,18 +271,136 @@ def update_smoothing(
 # -- stabilized frame preview --------------------------------------------------
 
 
-def _preview_plan(workspace: Workspace, project_id: str, project: Project, motion: SmoothedMotion):
-    """Return the render plan for the preview, memoised on the caches' mtimes."""
+def _scaled_fill(fill: Any, scale: float) -> Any:
+    """Re-express a border fill for a proxy's resolution.
+
+    ``blur`` and ``feather`` are pixel distances, so they scale with the frame;
+    the mode, colour and tint are dimensionless and pass through untouched.
+    """
+    if fill is None or scale == 1.0:
+        return fill
+    from dataclasses import replace  # noqa: PLC0415 - one caller, keeps the import local
+
+    return replace(fill, blur=fill.blur * scale, feather=fill.feather * scale)
+
+
+def preview_plan(
+    workspace: Workspace, project_id: str, project: Project, motion: SmoothedMotion
+):
+    """Return the render plan for the preview, memoised on the caches' mtimes.
+
+    The same call the export uses, so "what you see is what you get" survives
+    the stabilisation target, the crop scale and the border fill as well as the
+    border policy.
+    """
+    options_file = _options_path(workspace, project_id)
     key = (
         _solve_path(workspace, project_id).stat().st_mtime_ns,
         _smoothing_path(workspace, project_id).stat().st_mtime_ns,
+        options_file.stat().st_mtime_ns if options_file.is_file() else 0,
         project.render.border,
         project.video.w,
         project.video.h,
     )
+    options = load_options(workspace, project_id)
     return motion_glue.cached_plan(
-        project_id, key, lambda: motion_glue.build_plan(project, motion)
+        project_id, key, lambda: motion_glue.build_plan(project, motion, options=options)
     )
+
+
+# -- stabilisation options (target / crop / fill) -------------------------------
+
+
+class TargetUpdate(BaseModel):
+    """The ``target`` block of ``PUT /api/projects/{id}/render/options``."""
+
+    mode: str | None = None
+    point_id: str | None = None
+    anchor_frame: int | None = None
+
+
+class CropUpdate(BaseModel):
+    """The ``crop`` block of ``PUT /api/projects/{id}/render/options``."""
+
+    scale: float | None = None
+    centre: str | None = None
+
+
+class FillUpdate(BaseModel):
+    """The ``fill`` block of ``PUT /api/projects/{id}/render/options``."""
+
+    mode: str | None = None
+    color: list[int] | None = None
+    blur: float | None = None
+    tint: float | None = None
+    feather: float | None = None
+
+
+class RenderOptionsUpdate(BaseModel):
+    """Body for ``PUT /api/projects/{id}/render/options``.
+
+    Every block is optional and replaces only the keys it names, so the export
+    dialog can change one control without having to send back a whole
+    configuration it might be holding a stale copy of.
+    """
+
+    target: TargetUpdate | None = None
+    crop: CropUpdate | None = None
+    fill: FillUpdate | None = None
+
+
+def _options_payload(workspace: Workspace, project_id: str, project: Project) -> dict[str, Any]:
+    """Return the options plus everything the UI needs to offer valid choices."""
+    return {
+        "options": load_options(workspace, project_id).to_dict(),
+        "target_modes": list(TARGET_MODES),
+        "crop_centres": list(CROP_CENTRES),
+        "fill_modes": list(FILL_MODES),
+        "points": motion_glue.target_choices(project),
+    }
+
+
+@router.get("/render/options")
+def get_render_options(
+    project_id: str, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Return the stabilisation target, crop and border fill, plus the valid choices."""
+    project = workspace.load_project(project_id)
+    return _options_payload(workspace, project_id, project)
+
+
+@router.put("/render/options")
+def update_render_options(
+    project_id: str, body: RenderOptionsUpdate, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Update the stabilisation target, crop scale and/or border fill.
+
+    These drive the stabilized preview as well as the export, so the memoised
+    render plan is dropped here — the same rule the border policy follows.
+
+    Raises:
+        HTTPException: 400 if a mode, colour or number is not a valid choice
+            (validated by :mod:`stable.render.options`, not re-implemented here).
+    """
+    project = workspace.load_project(project_id)
+    current = load_options(workspace, project_id).to_dict()
+    for block, update in (("target", body.target), ("crop", body.crop), ("fill", body.fill)):
+        if update is None:
+            continue
+        current[block] = {
+            **current[block],
+            **{k: v for k, v in update.model_dump(exclude_unset=True).items()},
+        }
+    try:
+        options = RenderOptions.from_dict(current)
+        # Fail now, with a message naming the target, rather than inside the
+        # export job twenty seconds later.
+        motion_glue.resolve_target_positions(project, options.target)
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    motion_glue.save_render_options(workspace.project_dir(project_id), options)
+    motion_glue.clear_plan_cache(project_id)
+    return _options_payload(workspace, project_id, project)
 
 
 @router.get("/frames/{index}/stabilized")
@@ -260,10 +409,11 @@ def get_stabilized_frame(
 ) -> Response:
     """Return one proxy frame warped by the solved+smoothed stabilization transform.
 
-    The warp is the render's own ``output_transform`` — stabilisation plus the
-    project's border policy (crop / auto_zoom / transparent) — re-expressed for
-    the proxy's resolution by :func:`stable.render.warp.rescale_transform`, so
-    what the preview shows is what the export will produce.
+    The warp is the render's own ``output_transform`` — stabilisation (including
+    the stabilisation target's lock) plus the project's border policy and crop —
+    re-expressed for the proxy's resolution by
+    :func:`stable.render.warp.rescale_transform`, so what the preview shows is
+    what the export will produce, border fill and all.
 
     Raises:
         HTTPException: 409 if the project has not been solved yet; 404 if the
@@ -280,7 +430,7 @@ def get_stabilized_frame(
     try:
         store = workspace.get_proxy_store(project_id, tier)
         frame = store.get_frame(index)
-        plan = _preview_plan(workspace, project_id, project, motion)
+        plan = preview_plan(workspace, project_id, project, motion)
     except StableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except IndexError as exc:
@@ -296,6 +446,9 @@ def get_stabilized_frame(
         ),
         border=plan.border,
         interpolation=plan.interpolation,
+        # The fill's blur and feather are in pixels, so a proxy needs them
+        # scaled or the preview shows a softer edge than the export will.
+        fill=_scaled_fill(plan.fill, scale),
     )
 
     import cv2  # noqa: PLC0415 - lazy, matches the rest of the video stack

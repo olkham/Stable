@@ -22,8 +22,14 @@ from conftest import MarkerBackend, anchor_at
 
 from stable.core.errors import TrackerError
 from stable.core.types import Query, TrackResult
+from stable.trackers.correlation import CorrelationTracker
 from stable.trackers.cotracker3 import CoTracker3Tracker
+from stable.trackers.kalman import KalmanTracker
+from stable.trackers.klt import KLTTracker
 from stable.trackers.lk import LKTracker
+from stable.trackers.meanshift import MeanShiftTracker
+from stable.trackers.particle import ParticleFilterTracker
+from stable.trackers.raft import RaftTracker
 from stable.trackers.registry import available_trackers, describe_trackers, get_tracker
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.template import TemplateTracker
@@ -37,17 +43,40 @@ def make_plugin(name: str):
     """Build a ready-to-track plugin instance by tracker name."""
     if name == "lk":
         return LKTracker()
+    if name == "klt":
+        return KLTTracker()
     if name == "template":
         return TemplateTracker()
+    if name == "correlation":
+        return CorrelationTracker()
+    if name == "kalman":
+        return KalmanTracker()
+    if name == "particle":
+        return ParticleFilterTracker()
+    if name == "meanshift":
+        return MeanShiftTracker()
     if name == "cotracker3":
         return CoTracker3Tracker(backend=MarkerBackend(), **DEEP_KWARGS)
     if name == "tapir":
         return TapirTracker(backend=MarkerBackend(), **DEEP_KWARGS)
+    if name == "raft":
+        return RaftTracker(backend=MarkerBackend(), **DEEP_KWARGS)
     raise AssertionError(f"unknown tracker {name!r}")
 
 
-TRACKERS = ["lk", "template", "cotracker3", "tapir"]
-DEEP = ["cotracker3", "tapir"]
+TRACKERS = [
+    "lk",
+    "klt",
+    "template",
+    "correlation",
+    "kalman",
+    "particle",
+    "meanshift",
+    "cotracker3",
+    "tapir",
+    "raft",
+]
+DEEP = ["cotracker3", "tapir", "raft"]
 
 
 @pytest.fixture(params=TRACKERS)

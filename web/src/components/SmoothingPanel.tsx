@@ -245,6 +245,28 @@ function CurvePreview({
       })
       .join(" ");
   const cursorX = (cursor / (raw.length - 1)) * width;
+
+  // Click jumps to a frame; holding and dragging scrubs through frames in real
+  // time, the same as the main timeline (todo 21). A plain click is just a
+  // drag with zero movement, so one handler covers both.
+  function seek(clientX: number, svg: SVGSVGElement) {
+    const rect = svg.getBoundingClientRect();
+    const frac = (clientX - rect.left) / rect.width;
+    onSeek(Math.max(0, Math.min(raw.length - 1, Math.round(frac * (raw.length - 1)))));
+  }
+
+  function handleMouseDown(e: React.MouseEvent<SVGSVGElement>) {
+    const svg = e.currentTarget;
+    seek(e.clientX, svg);
+    const move = (ev: MouseEvent) => seek(ev.clientX, svg);
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  }
+
   return (
     <svg
       className="curve-chart"
@@ -252,11 +274,7 @@ function CurvePreview({
       height={height}
       viewBox={`0 0 ${width} ${height}`}
       preserveAspectRatio="none"
-      onClick={(e) => {
-        const rect = (e.target as SVGElement).closest("svg")!.getBoundingClientRect();
-        const frac = (e.clientX - rect.left) / rect.width;
-        onSeek(Math.round(frac * (raw.length - 1)));
-      }}
+      onMouseDown={handleMouseDown}
     >
       <polyline
         points={toPoints(raw)}

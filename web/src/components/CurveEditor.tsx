@@ -339,7 +339,16 @@ export function CurveEditor() {
       window.addEventListener("mouseup", up);
       return;
     }
+    // A plain click scrubs, and — matching the main timeline (todo 21) — held
+    // and dragged it keeps scrubbing in real time rather than only seeking once.
     setCurrentFrame(startFrame);
+    const move = (ev: MouseEvent) => setCurrentFrame(frameAt(ev.clientX));
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
   }
 
   // -- actions -------------------------------------------------------------------
@@ -437,7 +446,7 @@ export function CurveEditor() {
         <span className="curve-editor__key curve-editor__key--raw" /> raw solve
         <span className="curve-editor__key curve-editor__key--ghost" /> previous smoothing
         <span className="curve-editor__key curve-editor__key--now" /> current smoothing
-        {" · "}wheel zooms, alt-drag pans, shift-drag selects a range, click scrubs
+        {" · "}wheel zooms, alt-drag pans, shift-drag selects a range, click/drag scrubs
       </p>
     </div>
   );

@@ -13,17 +13,41 @@ Typical use::
     plan = StabilizationPlan.build(motion, source_size=(video.width, video.height),
                                    border="auto_zoom")
     plan.geometry.zoom                      # what the shot cost in crop
+    plan.is_no_op                           # True => nothing asked it to move
     render_stabilized(video, plan, "out.mp4", audio_source="in.mp4")
+
+The operator's three choices — what to hold still, how much to crop, what goes
+in the exposed edge — are :class:`~stable.render.options.RenderOptions`::
+
+    plan = StabilizationPlan.build(
+        motion, source_size=(w, h), border="crop",
+        target_positions=path_of_the_point_to_pin,   # [T, 2] in source pixels
+        crop=CropSpec(scale=0.9, centre="target"),
+        fill=BorderFill(mode="blur", feather=8.0),
+    )
 
 Layout:
 
 ``warp``       the per-frame affine, the border policies and the zoom solve
+``fill``       what goes in the uncovered edge (solid / stretch / mirror / blur)
+``options``    the serialisable target / crop / fill choices
 ``stabilize``  planning a whole clip and streaming it to a file or PNG sequence
 """
 
 from __future__ import annotations
 
+from .fill import FILL_MODES, BorderFill, composite_fill
+from .options import (
+    CROP_CENTRES,
+    TARGET_MODES,
+    CropSpec,
+    RenderOptions,
+    StabilizationTarget,
+    average_positions,
+    hold_gaps,
+)
 from .stabilize import (
+    IDENTITY_TOLERANCE_PX,
     StabilizationPlan,
     iter_stabilized_frames,
     render_stabilized,
@@ -50,7 +74,20 @@ __all__ = [
     "warp_frame",
     "rescale_transform",
     "cuda_available",
+    # border fill
+    "FILL_MODES",
+    "BorderFill",
+    "composite_fill",
+    # operator options
+    "TARGET_MODES",
+    "CROP_CENTRES",
+    "StabilizationTarget",
+    "CropSpec",
+    "RenderOptions",
+    "average_positions",
+    "hold_gaps",
     # rendering
+    "IDENTITY_TOLERANCE_PX",
     "StabilizationPlan",
     "iter_stabilized_frames",
     "render_stabilized",

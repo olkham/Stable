@@ -22,6 +22,8 @@ from ..schemas import AnchorCreate, PointCreate, PointUpdate, TrackRequest
 from ..serialize import point_summary
 from ..storage import Workspace, get_workspace
 from ..tracking import (
+    effective_anchors,
+    load_anchor_violations,
     load_display_track,
     load_raw_track,
     load_report,
@@ -184,6 +186,11 @@ def track_point(
     Runs :func:`stable.trackers.merge.plan_anchor_runs`, executes each run with
     the chosen tracker plugin, and merges the results — the real Phase 0-2
     pipeline, not a stub. See :mod:`stable.server.tracking`.
+
+    "Every one of its anchors" includes the ones the operator's manual
+    corrections promoted (:func:`stable.server.tracking.effective_anchors`), and
+    a run that reaches a keyframe it disagrees with is stopped there rather than
+    drifting past it — the job result names the frame and the pixel distance.
     """
     project = workspace.load_project(project_id)
     try:
@@ -200,6 +207,7 @@ def track_point(
             direction=body.direction,
             device=body.device,
             progress=progress,
+            anchor_tolerance_px=body.anchor_tolerance_px,
         )
 
     job = jobs.submit(project_id, "track", _run, target=point_id)
@@ -256,6 +264,8 @@ def get_track(
         if path:
             report = load_report(report_path_for(Path(path)))
 
+    anchors = effective_anchors(point)
+    violations = load_anchor_violations(project, point)
     payload: dict[str, Any] = {
         "point_id": point_id,
         "n_frames": track.n_frames,
@@ -265,9 +275,14 @@ def get_track(
         "visible": track.visible.tolist(),
         "disagreement": (report or {}).get("disagreement", [None] * track.n_frames),
         "contributions": (report or {}).get("contributions", [0] * track.n_frames),
-        "anchor_frames": (report or {}).get(
-            "anchor_frames", [q.frame for q in point.sorted_queries()]
-        ),
+        "anchor_frames": (report or {}).get("anchor_frames", [q.frame for q in anchors]),
+        # Every position the operator has stated, pins plus promoted manual
+        # corrections — what the panel lists and the timeline pins.
+        "ground_truth": [q.to_dict() for q in anchors],
+        # Keyframes a run reached and disagreed with: drawn red on the timeline
+        # and the reason a track needs manual review (todos 13, 15).
+        "anchor_violations": violations,
+        "flagged_anchors": sorted({int(v["frame"]) for v in violations}),
         "corrections": [c.to_dict() for c in point.corrections],
         "gaps": _gaps(track),
         "raw_x": None,

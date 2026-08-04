@@ -47,12 +47,25 @@ penalty that reaches zero at :attr:`MergeConfig.disagreement_px`.
 Frames covered by a single run pass through untouched, and anchor frames are
 overwritten with the user's ground truth afterwards, so neither is subject to
 the blend at all.
+
+Runs that cross an anchor
+-------------------------
+:func:`plan_anchor_runs` never plans a run *through* an anchor — each span is
+bounded by the anchors either side of it — so within a full multi-anchor track
+the blend above is the whole story. Runs started somewhere else (a "retrack from
+here", or a bounded run the operator asked for) do cross anchors, and for those
+:func:`enforce_anchor_agreement` is the guard: a run that arrives at a
+user-placed keyframe more than ``tolerance_px`` away from it is **stopped there**
+rather than allowed to carry on from a position the user has already said is
+wrong. The disagreement is returned as an :class:`AnchorViolation` so the caller
+can report *where* and *by how much* instead of silently losing frames.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
@@ -65,9 +78,21 @@ __all__ = [
     "MergeConfig",
     "MergeReport",
     "MergeResult",
+    "AnchorViolation",
+    "DEFAULT_ANCHOR_TOLERANCE_PX",
     "plan_anchor_runs",
     "merge_anchor_runs",
+    "enforce_anchor_agreement",
 ]
+
+DEFAULT_ANCHOR_TOLERANCE_PX = 6.0
+"""How far a run may land from a user anchor before the run is stopped there.
+
+A few pixels of disagreement is ordinary tracker noise; more than that means the
+run and the operator are describing different features, and every frame the run
+produces beyond that point is derived from a position the operator has already
+contradicted.
+"""
 
 RunDirection = Literal["fwd", "bwd"]
 """A planned run is always single-direction; ``bidir`` is a caller convenience."""
@@ -219,6 +244,42 @@ class MergeResult:
     report: MergeReport
 
 
+@dataclass(frozen=True)
+class AnchorViolation:
+    """A run that reached a user-placed anchor and disagreed with it.
+
+    Produced by :func:`enforce_anchor_agreement`. It is the "where, and by how
+    much" the operator needs: the run was stopped at :attr:`frame`, having
+    wandered :attr:`distance` pixels away from the keyframe they placed there.
+
+    Args:
+        frame: The anchor frame the run was stopped at.
+        anchor: The operator's ground-truth ``(x, y)`` at that frame.
+        tracked: Where the run had actually got to.
+        distance: Distance between the two, in pixels.
+        origin: Frame the run started from.
+        direction: Direction the run was travelling in when it was stopped.
+    """
+
+    frame: int
+    anchor: tuple[float, float]
+    tracked: tuple[float, float]
+    distance: float
+    origin: int
+    direction: RunDirection
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe form the server reports to the UI."""
+        return {
+            "frame": int(self.frame),
+            "anchor": [float(self.anchor[0]), float(self.anchor[1])],
+            "tracked": [float(self.tracked[0]), float(self.tracked[1])],
+            "distance": float(self.distance),
+            "origin": int(self.origin),
+            "direction": self.direction,
+        }
+
+
 def plan_anchor_runs(anchors: list[Query], frame_range: tuple[int, int]) -> list[RunSpec]:
     """Turn a point's anchors into the minimal set of single-direction runs.
 
@@ -262,6 +323,113 @@ def plan_anchor_runs(anchors: list[Query], frame_range: tuple[int, int]) -> list
         runs.append(RunSpec(first, "fwd", (first.frame, first.frame + 1)))
     runs.sort(key=lambda r: (r.frame_range[0], r.direction))
     return runs
+
+
+def enforce_anchor_agreement(
+    track: PointTrack,
+    anchors: Sequence[Query],
+    *,
+    origin: int,
+    direction: str = "bidir",
+    tolerance_px: float = DEFAULT_ANCHOR_TOLERANCE_PX,
+) -> tuple[PointTrack, list[AnchorViolation]]:
+    """Stop a run at the first anchor it disagrees with, in each direction.
+
+    A user-placed keyframe is ground truth. A run travelling away from
+    ``origin`` that arrives at one more than ``tolerance_px`` away from it has
+    lost the feature: it is not merely imprecise there, everything it produces
+    *beyond* that frame is stepped off a position the operator has already said
+    is wrong. Such a run is truncated from that frame onwards (inclusive) rather
+    than allowed to drift past, and the disagreement is returned so the caller
+    can tell the operator where it happened and by how much.
+
+    Anchors are examined in travel order, so a run that agrees with the first
+    keyframe it meets carries on to the next one — several anchors in a row are
+    all honoured, which is what makes "track everything forwards and backwards"
+    across many keyframes safe.
+
+    Args:
+        track: The run's output over the whole clip timeline.
+        anchors: The point's anchor keyframes. The one sitting on ``origin``
+            (the run's own query) is ignored — a run never disagrees with the
+            position it started from.
+        origin: Absolute frame the run started from.
+        direction: ``"fwd"``, ``"bwd"`` or ``"bidir"``; which way(s) to walk.
+        tolerance_px: Disagreement, in pixels, that stops the run.
+
+    Returns:
+        ``(track, violations)`` — the (possibly truncated) track and one
+        :class:`AnchorViolation` per direction that was stopped, in travel
+        order. When nothing disagreed the track is returned unchanged.
+
+    Raises:
+        ContractError: If ``tolerance_px`` is not positive or ``direction`` is
+            not one of the three accepted values.
+    """
+    if tolerance_px <= 0:
+        raise ContractError(f"tolerance_px must be positive, got {tolerance_px}")
+    if direction not in ("fwd", "bwd", "bidir"):
+        raise ContractError(f"unknown direction {direction!r}; expected fwd, bwd or bidir")
+
+    n_frames = track.n_frames
+    guarded = {
+        int(a.frame): (float(a.x), float(a.y))
+        for a in anchors
+        if int(a.frame) != int(origin) and 0 <= int(a.frame) < n_frames
+    }
+    if not guarded:
+        return track, []
+
+    steps: list[RunDirection] = []
+    if direction in ("fwd", "bidir"):
+        steps.append("fwd")
+    if direction in ("bwd", "bidir"):
+        steps.append("bwd")
+
+    points = track.points
+    violations: list[AnchorViolation] = []
+    cut = np.zeros(n_frames, dtype=bool)
+    for run_direction in steps:
+        step = 1 if run_direction == "fwd" else -1
+        for frame in range(int(origin) + step, n_frames if step > 0 else -1, step):
+            anchor = guarded.get(frame)
+            if anchor is None:
+                continue
+            x, y = float(points[frame, 0]), float(points[frame, 1])
+            if not (np.isfinite(x) and np.isfinite(y)):
+                continue
+            distance = float(np.hypot(x - anchor[0], y - anchor[1]))
+            if distance <= tolerance_px:
+                continue
+            violations.append(
+                AnchorViolation(
+                    frame=frame,
+                    anchor=anchor,
+                    tracked=(x, y),
+                    distance=distance,
+                    origin=int(origin),
+                    direction=run_direction,
+                )
+            )
+            if step > 0:
+                cut[frame:] = True
+            else:
+                cut[: frame + 1] = True
+            break
+
+    if not violations:
+        return track, []
+
+    trimmed_points = np.array(track.points, dtype=np.float32, copy=True)
+    trimmed_conf = np.array(track.confidence, dtype=np.float32, copy=True)
+    trimmed_visible = np.array(track.visible, dtype=bool, copy=True)
+    trimmed_points[cut] = np.nan
+    trimmed_conf[cut] = 0.0
+    trimmed_visible[cut] = False
+    return (
+        PointTrack(points=trimmed_points, confidence=trimmed_conf, visible=trimmed_visible),
+        violations,
+    )
 
 
 def _gather(

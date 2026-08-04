@@ -300,3 +300,144 @@ def test_the_stabilised_clip_really_is_steadier(tmp_path, stabilize_inputs):
 
     # Frame-to-frame difference across the whole shot: much smaller once locked.
     assert np.abs(last - first).mean() < np.abs(raw_last - raw_first).mean()
+
+
+# -- todo 17: stabilisation target, crop size and border fill -----------------
+
+
+def test_a_target_stabilises_with_no_smoothing_at_all(tmp_path, stabilize_inputs, capsys):
+    """`--target` is the direct way to ask for stabilisation.
+
+    Without it, `--smooth none` leaves `smoothed == raw`, the warp is the
+    identity on every frame and the render is a re-encode — the web UI's
+    version of exactly that is the bug behind todo 17.
+    """
+    from stable.video.source import PyAVVideoSource
+
+    video, tracks, clip = stabilize_inputs
+    flat = str(tmp_path / "flat.mp4")
+    assert main(
+        ["stabilize", video, "--tracks", tracks, "--out", flat, "--channels", "none"]
+    ) == 0
+    assert "re-encode of the input" in capsys.readouterr().err
+
+    pinned = str(tmp_path / "pinned.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", pinned,
+            "--channels", "none", "--target", "point:4",
+        ]
+    ) == 0
+    printed = capsys.readouterr()
+    assert "holding point 4" in printed.out
+    assert "re-encode of the input" not in printed.err
+
+    # Point 4 of GRID is the frame centre, so pinning it must steady the middle.
+    def centre_drift(path: str) -> float:
+        with PyAVVideoSource(path) as decoded:
+            first = decoded.get_frame(0).astype(np.float64)
+            last = decoded.get_frame(decoded.frame_count - 1).astype(np.float64)
+        h, w = first.shape[:2]
+        box = (slice(h // 4, 3 * h // 4), slice(w // 4, 3 * w // 4))
+        return float(np.abs(last[box] - first[box]).mean())
+
+    assert centre_drift(pinned) < centre_drift(flat) / 2.0
+    assert frame_count(pinned) == clip.frame_count
+
+
+def test_centroid_target_needs_no_point_index(tmp_path, stabilize_inputs, capsys):
+    video, tracks, _ = stabilize_inputs
+    out = str(tmp_path / "centroid.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", out,
+            "--channels", "none", "--target", "centroid",
+        ]
+    ) == 0
+    assert "holding every point" in capsys.readouterr().out
+
+
+def test_a_target_index_outside_the_tracks_is_reported(tmp_path, stabilize_inputs, capsys):
+    video, tracks, _ = stabilize_inputs
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "x.mp4"),
+            "--target", "point:99",
+        ]
+    ) == 1
+    assert "out of range" in capsys.readouterr().err
+
+
+def test_crop_scale_sets_the_output_size(tmp_path, stabilize_inputs):
+    from stable.video.source import PyAVVideoSource
+
+    video, tracks, clip = stabilize_inputs
+    out = str(tmp_path / "half.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", out,
+            "--border", "crop", "--crop", "0.5", "--quiet",
+        ]
+    ) == 0
+    with PyAVVideoSource(out) as decoded:
+        assert decoded.width == pytest.approx(clip.width // 2, abs=2)
+        assert decoded.height == pytest.approx(clip.height // 2, abs=2)
+
+
+def test_a_crop_wider_than_the_coverage_warns_and_fills(tmp_path, stabilize_inputs, capsys):
+    """Keeping the whole frame is allowed; the fill is what makes it usable."""
+    from stable.video.source import PyAVVideoSource
+
+    video, tracks, _ = stabilize_inputs
+    out = str(tmp_path / "filled.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", out,
+            "--border", "crop", "--crop", "1.0", "--tripod",
+            "--fill", "mirror", "--feather", "4",
+        ]
+    ) == 0
+    assert "fill will be visible" in capsys.readouterr().out
+
+    black = str(tmp_path / "black.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", black,
+            "--border", "crop", "--crop", "1.0", "--tripod", "--quiet",
+        ]
+    ) == 0
+
+    def letterbox_pixels(path: str) -> int:
+        with PyAVVideoSource(path) as decoded:
+            frame = decoded.get_frame(decoded.frame_count - 1)
+        return int(np.count_nonzero(frame.max(axis=2) < 12))
+
+    assert letterbox_pixels(black) > 200
+    assert letterbox_pixels(out) < letterbox_pixels(black) / 5
+
+
+@pytest.mark.parametrize("mode", ["solid", "stretch", "mirror", "blur"])
+def test_every_fill_mode_renders(tmp_path, stabilize_inputs, mode):
+    video, tracks, clip = stabilize_inputs
+    out = str(tmp_path / f"{mode}.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", out, "--quiet",
+            "--border", "crop", "--crop", "1.0", "--tripod",
+            "--fill", mode, "--fill-color", "#20c040", "--fill-tint", "0.25",
+            "--fill-blur", "3", "--feather", "2",
+        ]
+    ) == 0
+    assert frame_count(out) == clip.frame_count
+
+
+def test_a_bad_fill_colour_is_rejected_by_argparse(tmp_path, stabilize_inputs, capsys):
+    video, tracks, _ = stabilize_inputs
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "x.mp4"),
+                "--fill-color", "300,0,0",
+            ]
+        )
+    assert "0-255" in capsys.readouterr().err

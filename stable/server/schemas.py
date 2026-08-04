@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..trackers.merge import DEFAULT_ANCHOR_TOLERANCE_PX
+
 __all__ = [
     "PointCreate",
     "AnchorCreate",
@@ -57,11 +59,17 @@ class PointUpdate(BaseModel):
 
 
 class TrackRequest(BaseModel):
-    """Body for ``POST /api/projects/{id}/points/{point_id}/track``."""
+    """Body for ``POST /api/projects/{id}/points/{point_id}/track``.
+
+    ``anchor_tolerance_px`` is how far a run may land from one of the point's
+    keyframes before it is stopped there and the keyframe reported as
+    unreached; see :func:`stable.trackers.merge.enforce_anchor_agreement`.
+    """
 
     tracker: str | None = None
     direction: Direction = "bidir"
     device: str | None = None
+    anchor_tolerance_px: float = Field(default=DEFAULT_ANCHOR_TOLERANCE_PX, gt=0)
 
 
 class SolveSettingsUpdate(BaseModel):
@@ -134,14 +142,22 @@ class CorrectionUpdate(BaseModel):
 
 
 class RetrackRequest(BaseModel):
-    """Body for ``POST /api/projects/{id}/points/{point_id}/retrack``."""
+    """Body for ``POST /api/projects/{id}/points/{point_id}/retrack``.
+
+    A retrack is a *bounded* run, not a whole-clip one. ``x``/``y`` may be
+    omitted to start from wherever the point already is at ``frame``, which is
+    what the panel's "track on to the next keyframe" buttons send.
+    """
 
     frame: int
-    x: float
-    y: float
+    x: float | None = None
+    y: float | None = None
     direction: Direction = "fwd"
     tracker: str | None = None
     device: str | None = None
+    max_frames: int | None = Field(default=None, gt=0)
+    stop_at_keyframe: bool = False
+    anchor_tolerance_px: float = Field(default=DEFAULT_ANCHOR_TOLERANCE_PX, gt=0)
 
 
 class ModelDownloadRequest(BaseModel):

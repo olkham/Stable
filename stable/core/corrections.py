@@ -31,7 +31,7 @@ from uuid import uuid4
 import numpy as np
 
 from .errors import ContractError
-from .types import PointTrack
+from .types import PointTrack, Query
 
 __all__ = [
     "Correction",
@@ -41,8 +41,10 @@ __all__ = [
     "DeleteRangeCorrection",
     "RetrackCorrection",
     "CORRECTION_TYPES",
+    "GROUND_TRUTH_KINDS",
     "correction_from_dict",
     "apply_corrections",
+    "ground_truth_anchors",
     "RetrackResolver",
     "FALLOFF_SHAPES",
     "INTERPOLATION_METHODS",
@@ -301,6 +303,18 @@ CORRECTION_TYPES: dict[str, type[Correction]] = {
 }
 """Discriminator (``kind``) to class map used for project-file deserialisation."""
 
+GROUND_TRUTH_KINDS: tuple[str, ...] = ("replace", "retrack")
+"""Correction kinds that state an absolute position, i.e. *are* ground truth.
+
+These are the edits where the operator said "the feature is **here**", in
+pixels, so they promote to anchor keyframes (see :func:`ground_truth_anchors`).
+``offset`` is deliberately absent: it is a relative nudge, meaningful only
+against the track it was applied to. The server promotes a drag by recording the
+resulting absolute position as a companion ``replace`` at the same frame, which
+is what makes the promotion survive a re-track without doubling the nudge.
+``gap_fill`` and ``delete_range`` state no position at all.
+"""
+
 
 def correction_from_dict(data: dict[str, Any]) -> Correction:
     """Rebuild a typed correction from its project-file dict.
@@ -329,6 +343,36 @@ def correction_from_dict(data: dict[str, Any]) -> Correction:
         return cls(**kwargs)
     except TypeError as exc:
         raise ContractError(f"invalid {kind!r} correction: {exc}") from exc
+
+
+def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
+    """Return the anchor keyframes a point's manual corrections amount to.
+
+    Every enabled correction that states an absolute position (see
+    :data:`GROUND_TRUTH_KINDS`) is a place the operator has told the tool where
+    the feature actually is — which is precisely what an anchor keyframe is.
+    Promoting them means a later re-track plans its runs *through* those
+    positions and merges to pass exactly through them, instead of overwriting
+    the operator's work with a fresh guess.
+
+    Args:
+        corrections: A point's correction layer, in order. Disabled entries are
+            skipped, so toggling a fix off also retires the anchor it implied.
+
+    Returns:
+        One :class:`~stable.core.types.Query` per frame, sorted by frame. Where
+        several corrections land on the same frame the last one wins, matching
+        the order :func:`apply_corrections` applies them in.
+    """
+    by_frame: dict[int, Query] = {}
+    for correction in corrections:
+        if not correction.enabled or correction.kind not in GROUND_TRUTH_KINDS:
+            continue
+        if not isinstance(correction, ReplaceCorrection | RetrackCorrection):
+            continue  # pragma: no cover - a third-party subclass reusing the kind
+        frame = int(correction.frame)
+        by_frame[frame] = Query(frame=frame, x=float(correction.x), y=float(correction.y))
+    return [by_frame[frame] for frame in sorted(by_frame)]
 
 
 RetrackResolver = Callable[["RetrackCorrection"], PointTrack | None]

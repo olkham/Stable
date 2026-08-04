@@ -62,7 +62,10 @@ BOOTSTAPIR = register_model(
         key="bootstapir",
         url="https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt",
         filename="bootstapir_checkpoint_v2.pt",
-        sha256=None,  # unpinned: see CONTRIBUTING.md "Pinning a checkpoint"
+        # Pinned from a real download verified against a real inference run (see
+        # CONTRIBUTING.md "Pinning a checkpoint"); 208 MiB, 218886140 bytes.
+        sha256="8493c7a69e02c85b9382fbb3c7b8b539b36bc08ede744b9e99feb739a0129f4b",
+        size_bytes=218886140,
         license="Apache-2.0",
         non_commercial=False,
         notes="BootsTAPIR v2 PyTorch checkpoint from DeepMind's tapnet release.",

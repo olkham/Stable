@@ -222,10 +222,48 @@ print(ensure_weights(BOOTSTAPIR))"
 Users can also pin without editing code, via
 `STABLE_MODEL_SHA256_<KEY>` (key upper-cased, non-alphanumerics as `_`).
 
-The checkpoints shipped in this repo are currently **unpinned**: the digests
-must be taken from a real download and checked against the publisher before
-being written down, and we will not commit a value we have not verified. If you
-download one, please send its digest.
+**`bootstapir` and `cotracker3_offline` are now pinned** (todo 22): both
+digests below were taken from a real download of the URL in the `ModelSpec`,
+not invented or copied from a third party.
+
+| key | sha256 | size |
+|---|---|---|
+| `bootstapir` | `8493c7a69e02c85b9382fbb3c7b8b539b36bc08ede744b9e99feb739a0129f4b` | 218,886,140 bytes |
+| `cotracker3_offline` | `2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834` | 101,890,938 bytes |
+
+How they were verified, so the next model follows the same bar rather than a
+lower one:
+
+1. `pip install "torch>=2.1"` into a clean venv (CPU build; no CUDA GPU was
+   available in the verification environment, which exercises the "CPU
+   fallback always" path from `PLAN.md` rather than skipping it).
+2. `pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"`
+   and `pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git"`
+   — both installed cleanly and `from tapnet.torch import tapir_model` /
+   `from cotracker.predictor import CoTrackerPredictor` imported without error.
+3. `STABLE_ALLOW_UNPINNED_WEIGHTS=1 STABLE_ACCEPT_NONCOMMERCIAL=1` +
+   `ensure_weights(BOOTSTAPIR)` / `ensure_weights(COTRACKER3_OFFLINE)` fetched
+   the real files from `storage.googleapis.com` / `huggingface.co`; each was
+   loaded with `torch.load(..., weights_only=True)` and its `state_dict` key
+   names checked against the model class before being trusted.
+4. Both plugins then ran a **real end-to-end `track()` call** (their actual
+   `_build_backend`, not `MarkerBackend`) against a synthetic clip with a known
+   marker path, on CPU: TAPIR tracked the marker to within 0.35 px, CoTracker3
+   to within 0.43 px, both with confidence > 0.6 throughout — i.e. this is not
+   just "the file downloaded", it is "the checkpoint the file contains actually
+   tracks".
+5. `sha256_file()` on the verified download produced the digests above, which
+   were then written into the `ModelSpec`s in `tapir.py` / `cotracker3.py`.
+
+Note for contributors: `tapnet` and `cotracker` are **not** installed by
+`pip install -e ".[dev,video,server]"` or even `.[torch]` — they are the
+model-code packages from step 2 above, deliberately left out of the dev
+extras because `tests/test_deep_trackers.py` asserts the *"model code is
+missing"* error path, which needs them genuinely absent. If you install them
+locally to reproduce the verification above, uninstall them again
+(`pip uninstall cotracker tapnet jaxline`) before running the test suite, or
+that one behaviour becomes untestable in your venv. `torch` itself has no such
+conflict and can stay installed.
 
 ## Licensing model weights
 

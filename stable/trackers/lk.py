@@ -9,6 +9,24 @@ it started is the FB error. A small FB error means the flow is self-consistent
 (reliable); a large one — the classic signature of occlusion or the point
 leaving frame — drives confidence toward zero and ``visible`` to ``False``,
 without needing OpenCV to report outright failure.
+
+Optional feature (re)selection (see :mod:`stable.trackers.klt`)
+-----------------------------------------------------------------
+Plain LK, as implemented here by default, blindly follows the optical-flow
+solution from wherever the previous frame put it — it has no notion of
+whether that pixel is actually a *good* feature to track (Shi & Tomasi's
+minimum-eigenvalue criterion, the "T" in "KLT"), so small numerical drift
+compounds silently on a feature that is not a strong corner. Setting
+:attr:`LKTracker.redetect_interval` above ``0`` turns on periodic re-detection:
+every ``redetect_interval`` frames, ``cv2.goodFeaturesToTrack`` looks for the
+strongest corner within :attr:`LKTracker.redetect_search_radius` pixels of the
+current tracked position, and — only if one exists within
+:attr:`LKTracker.redetect_max_shift` pixels — the tracked position (and the
+seed LK continues from) snaps to it. This never touches a query's own anchor
+frame (the contract's exact-passthrough guarantee is unaffected), only the
+frames in between. It is off by default (``redetect_interval=0``) so plain
+``lk`` is unchanged; :class:`~stable.trackers.klt.KLTTracker` is this same
+class with it turned on, registered under its own name.
 """
 
 from __future__ import annotations
@@ -56,6 +74,21 @@ class LKTracker(TrackerPlugin):
         fb_threshold: Forward-backward error, in pixels, at which confidence
             reaches zero. Confidence falls off linearly from ``1.0`` at
             ``fb_error == 0`` to ``0.0`` at ``fb_error >= fb_threshold``.
+        redetect_interval: Frames between Shi-Tomasi corner re-detection
+            attempts; ``0`` (the default) disables it entirely, so plain
+            ``lk`` behaves exactly as before. See the module docstring and
+            :mod:`stable.trackers.klt`, which enables this by default.
+        redetect_search_radius: Half-size, in pixels, of the neighbourhood
+            searched for a stronger corner around the current position.
+        redetect_quality_level: ``cv2.goodFeaturesToTrack``'s ``qualityLevel``
+            — corners weaker than this fraction of the neighbourhood's best
+            corner response are not considered at all.
+        redetect_min_distance: ``cv2.goodFeaturesToTrack``'s minimum
+            separation between reported corners, in pixels.
+        redetect_max_shift: How far, in pixels, a re-detected corner may be
+            from the current position before it is trusted. Keeps
+            re-detection a *drift correction* — snapping to a nearby stronger
+            corner — rather than letting it jump to an unrelated feature.
     """
 
     name = "lk"
@@ -71,6 +104,11 @@ class LKTracker(TrackerPlugin):
         max_iterations: int = 30,
         epsilon: float = 0.01,
         fb_threshold: float = 2.0,
+        redetect_interval: int = 0,
+        redetect_search_radius: int = 15,
+        redetect_quality_level: float = 0.1,
+        redetect_min_distance: float = 3.0,
+        redetect_max_shift: float = 4.0,
     ) -> None:
         """Create an LK tracker; see the class docstring for the arguments."""
         super().__init__()
@@ -79,6 +117,11 @@ class LKTracker(TrackerPlugin):
         self.max_iterations = int(max_iterations)
         self.epsilon = float(epsilon)
         self.fb_threshold = float(fb_threshold)
+        self.redetect_interval = int(redetect_interval)
+        self.redetect_search_radius = int(redetect_search_radius)
+        self.redetect_quality_level = float(redetect_quality_level)
+        self.redetect_min_distance = float(redetect_min_distance)
+        self.redetect_max_shift = float(redetect_max_shift)
 
     @classmethod
     def is_available(cls) -> bool:
@@ -214,6 +257,7 @@ class LKTracker(TrackerPlugin):
         """
         prev_gray = gray(query.frame)
         prev_pt = np.array([[list(query.position)]], dtype=np.float32)
+        step = 0
 
         for next_index in indices:
             next_gray = gray(next_index)
@@ -244,8 +288,61 @@ class LKTracker(TrackerPlugin):
                 if math.isinf(fb_error)
                 else max(0.0, min(1.0, 1.0 - fb_error / self.fb_threshold))
             )
+            step += 1
+            if self.redetect_interval > 0 and step % self.redetect_interval == 0 and conf > 0.3:
+                redetected = self._redetect_corner(cv2, next_gray, (x, y))
+                if redetected is not None:
+                    x, y = redetected
+
             points[qi, next_index] = (x, y)
             confidence[qi, next_index] = conf
             visible[qi, next_index] = conf > 0.0
 
-            prev_gray, prev_pt = next_gray, next_pt
+            prev_gray, prev_pt = next_gray, np.array([[[x, y]]], dtype=np.float32)
+
+    def _redetect_corner(
+        self, cv2: Any, gray_frame: np.ndarray, position: tuple[float, float]
+    ) -> tuple[float, float] | None:
+        """Return the strongest Shi-Tomasi corner near ``position``, if one is close enough.
+
+        Searches a :attr:`redetect_search_radius`-sized neighbourhood of
+        ``position`` with ``cv2.goodFeaturesToTrack`` (the minimum-eigenvalue
+        criterion Tomasi added to Lucas-Kanade, hence "KLT") and returns its
+        best corner in absolute frame coordinates, but only if it lies within
+        :attr:`redetect_max_shift` pixels — far enough away and it is almost
+        certainly a different feature, not this one having drifted.
+
+        Args:
+            cv2: The imported ``cv2`` module (passed in, like every other
+                private helper here, rather than importing it again).
+            gray_frame: Full grayscale frame to search within.
+            position: Current tracked position, in absolute frame coordinates.
+
+        Returns:
+            The corrected ``(x, y)``, or ``None`` if no corner qualifies (the
+            neighbourhood has nothing better, or is too close to the frame
+            edge to search at all).
+        """
+        radius = self.redetect_search_radius
+        height, width = gray_frame.shape[:2]
+        cx, cy = int(round(position[0])), int(round(position[1]))
+        x0, y0 = max(cx - radius, 0), max(cy - radius, 0)
+        x1, y1 = min(cx + radius + 1, width), min(cy + radius + 1, height)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return None
+        roi = gray_frame[y0:y1, x0:x1]
+        corners = cv2.goodFeaturesToTrack(
+            roi,
+            maxCorners=5,
+            qualityLevel=self.redetect_quality_level,
+            minDistance=self.redetect_min_distance,
+            blockSize=7,
+        )
+        if corners is None or len(corners) == 0:
+            return None
+        absolute = corners.reshape(-1, 2) + np.array([x0, y0], dtype=np.float32)
+        distances = np.hypot(absolute[:, 0] - position[0], absolute[:, 1] - position[1])
+        best = int(np.argmin(distances))
+        if distances[best] > self.redetect_max_shift:
+            return None
+        return (float(absolute[best, 0]), float(absolute[best, 1]))

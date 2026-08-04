@@ -17,7 +17,18 @@ ever constructs a transform from channels: it goes through
 :meth:`~stable.solver.motion.MotionSolve.transform_at`,
 :meth:`~stable.smoothing.motion.SmoothedMotion.stabilization_transform` and
 :meth:`~stable.render.stabilize.StabilizationPlan.output_transform`, which fold
-the pivot back in themselves.
+the pivot back in themselves. The stabilisation *target* added here obeys the
+same rule: it is resolved to pixel positions from the tracks and turned into a
+translation composed on top of the sanctioned warp, never into channel values.
+
+Render options live beside the project file
+-------------------------------------------
+The v1 project schema is locked, and its ``render`` block is ``border`` /
+``codec`` / ``crf``. The operator's stabilisation target, crop scale and border
+fill are therefore stored in :data:`RENDER_OPTIONS_CACHE`, a sidecar in the
+project directory alongside ``solve.json`` and ``smoothing.json`` — derived
+render state, in the same place as the rest of it, with no invented schema keys
+and nothing for a project-file migration to carry.
 """
 
 from __future__ import annotations
@@ -33,6 +44,7 @@ from ..core.errors import ProjectError
 from ..core.geometry import CHANNELS
 from ..core.project import Project
 from ..core.types import PointTrack
+from ..render.options import RenderOptions, StabilizationTarget, average_positions
 from ..render.stabilize import StabilizationPlan
 from ..smoothing.channels import SmoothingSettings
 from ..smoothing.motion import SmoothedMotion, smooth_motion
@@ -42,12 +54,17 @@ from ..trackers.base import ProgressCallback, noop_progress
 __all__ = [
     "SOLVE_CACHE",
     "SMOOTHING_CACHE",
+    "RENDER_OPTIONS_CACHE",
     "solve_tracks",
     "smooth_solve",
     "solve_to_cache",
     "solve_from_cache",
     "solve_payload",
     "smoothed_payload",
+    "load_render_options",
+    "save_render_options",
+    "resolve_target_positions",
+    "target_choices",
     "build_plan",
     "cached_plan",
     "clear_plan_cache",
@@ -58,6 +75,9 @@ SOLVE_CACHE = "solve.json"
 
 SMOOTHING_CACHE = "smoothing.json"
 """File name of a project's cached smoothed curves."""
+
+RENDER_OPTIONS_CACHE = "render_options.json"
+"""File name of a project's stabilisation target / crop / border-fill choices."""
 
 
 # -- solving ------------------------------------------------------------------
@@ -205,29 +225,148 @@ def smoothed_payload(motion: SmoothedMotion) -> dict[str, Any]:
     }
 
 
+# -- stabilisation options ------------------------------------------------------
+
+
+def options_path(project_dir: Path) -> Path:
+    """Return where a project's render options sidecar lives."""
+    return Path(project_dir) / RENDER_OPTIONS_CACHE
+
+
+def load_render_options(project_dir: Path) -> RenderOptions:
+    """Return a project's stabilisation options, or the defaults if never set.
+
+    A missing or unreadable sidecar is not an error: the defaults are exactly
+    Phase 3's behaviour, so an older project renders as it always did.
+    """
+    try:
+        payload = read_json(options_path(project_dir))
+    except (OSError, ValueError):  # pragma: no cover - corrupt sidecar only
+        return RenderOptions()
+    return RenderOptions.from_dict(payload)
+
+
+def save_render_options(project_dir: Path, options: RenderOptions) -> dict[str, Any]:
+    """Persist stabilisation options and return the JSON payload written."""
+    payload = options.to_dict()
+    write_json(options_path(project_dir), payload)
+    return payload
+
+
+def target_choices(project: Project) -> list[dict[str, Any]]:
+    """Return the points that can serve as a stabilisation target, for the UI.
+
+    Only tracked points qualify — a target with no path cannot pin anything —
+    so the export dialog can offer exactly the choices that will work instead
+    of a list that fails at render time.
+    """
+    from .tracking import load_display_track  # noqa: PLC0415 - avoids an import cycle
+
+    out: list[dict[str, Any]] = []
+    for point in project.points:
+        track = load_display_track(project, point)
+        if track is None:
+            continue
+        out.append(
+            {
+                "id": point.id,
+                "enabled_for_solve": bool(point.enabled_for_solve),
+                "frames": int(np.count_nonzero(track.valid)),
+            }
+        )
+    return out
+
+
+def resolve_target_positions(
+    project: Project, target: StabilizationTarget
+) -> np.ndarray | None:
+    """Turn a :class:`StabilizationTarget` into a ``[T, 2]`` path, or ``None``.
+
+    ``frame`` mode returns ``None`` (nothing extra to hold). ``centroid``
+    averages every solve-enabled point's corrected track, which is what "the
+    average position of all the keypoints" means once manual repairs are taken
+    into account. ``point`` returns that one point's corrected track.
+
+    Args:
+        project: The project holding the tracks.
+        target: The operator's choice.
+
+    Returns:
+        The ``[T, 2]`` path in source pixels, or ``None`` for ``frame`` mode.
+
+    Raises:
+        ProjectError: If the chosen point does not exist or has no track, or no
+            solve-enabled point is tracked for a centroid.
+    """
+    from .tracking import load_display_track  # noqa: PLC0415 - avoids an import cycle
+
+    if not target.is_active:
+        return None
+    if target.mode == "point":
+        point = next((p for p in project.points if p.id == target.point_id), None)
+        if point is None:
+            raise ProjectError(
+                f"stabilisation target names point {target.point_id!r}, which this project "
+                "does not have; pick another target"
+            )
+        track = load_display_track(project, point)
+        if track is None:
+            raise ProjectError(
+                f"stabilisation target point {target.point_id!r} has not been tracked yet"
+            )
+        return np.asarray(track.points, dtype=np.float64)
+
+    paths = [
+        np.asarray(track.points, dtype=np.float64)
+        for track in (
+            load_display_track(project, p) for p in project.points if p.enabled_for_solve
+        )
+        if track is not None
+    ]
+    if not paths:
+        raise ProjectError(
+            "a centroid stabilisation target needs at least one tracked, solve-enabled point"
+        )
+    return average_positions(paths)
+
+
 # -- render planning ------------------------------------------------------------
 
 
 def build_plan(
-    project: Project, motion: SmoothedMotion, *, border: str | None = None
+    project: Project,
+    motion: SmoothedMotion,
+    *,
+    border: str | None = None,
+    options: RenderOptions | None = None,
 ) -> StabilizationPlan:
     """Plan the stabilised render for a project's smoothed motion.
 
     Args:
-        project: The project, for its clip size and border policy.
+        project: The project, for its clip size, border policy and tracks.
         motion: The smoothed solve.
         border: Override for the project's border policy.
+        options: The operator's stabilisation target / crop / fill choices;
+            ``None`` means the defaults, which reproduce Phase 3 exactly.
 
     Returns:
         The :class:`~stable.render.stabilize.StabilizationPlan`.
 
     Raises:
-        stable.core.errors.RenderError: If the border policy is unknown or the
-            warped frames share no common area.
+        stable.core.errors.RenderError: If the border policy is unknown or an
+            automatic crop finds the warped frames share no common area.
+        ProjectError: If the stabilisation target cannot be resolved.
     """
     size = (int(project.video.w), int(project.video.h))
+    chosen = options or RenderOptions()
     return StabilizationPlan.build(
-        motion, source_size=size, border=border or project.render.border
+        motion,
+        source_size=size,
+        border=border or project.render.border,
+        target_positions=resolve_target_positions(project, chosen.target),
+        anchor_frame=chosen.target.anchor_frame,
+        crop=chosen.crop,
+        fill=chosen.fill,
     )
 
 

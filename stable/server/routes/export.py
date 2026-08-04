@@ -3,9 +3,22 @@
 Data export reads the same corrected tracks and solved/smoothed curves the rest
 of the server produces. Video export plans the render with
 :class:`stable.render.StabilizationPlan` — real border policies, exact minimal
-auto-zoom — and streams it through :func:`stable.render.render_stabilized`,
-which hands frames to Phase 1's :func:`stable.video.encode.export_video` with
-the source clip's audio passed through untouched.
+auto-zoom, the operator's stabilisation target / crop / border fill — and
+streams it through :func:`stable.render.render_stabilized`, which hands frames
+to Phase 1's :func:`stable.video.encode.export_video` with the source clip's
+audio passed through untouched.
+
+Refusing a render that would do nothing
+---------------------------------------
+The stabilisation warp is ``smoothed(t) . raw(t)^-1``. A project with no
+smoothing filter enabled and no stabilisation target therefore has a warp of
+exactly the identity on every frame, and the export used to succeed — writing a
+re-encode of the source, reporting ``zoom: 1.0``, and looking to the operator
+exactly like "generating the stabilised output video doesn't work". Unlike
+``stable stabilize``, which applies a default Butterworth when the user does not
+choose one, the server has no default to fall back on. So this route checks the
+plan before it queues one (:attr:`~stable.render.StabilizationPlan.is_no_op`)
+and answers with what to change instead of spending minutes producing a copy.
 """
 
 from __future__ import annotations
@@ -19,7 +32,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 
-from ...core.errors import ProjectError, RenderError
+from ...core.errors import ProjectError, RenderError, StableError
 from ...render.stabilize import render_stabilized
 from .. import motion as motion_glue
 from ..jobs import JobManager, get_job_manager
@@ -29,6 +42,15 @@ from ..tracking import load_display_track
 from . import solve as solve_routes
 
 __all__ = ["router"]
+
+NO_OP_DETAIL = (
+    "this render would not move the picture at all, so it would just re-encode the source: "
+    "the stabilisation warp is 'smoothed motion' minus 'solved motion', and nothing has "
+    "asked them to differ. Enable at least one smoothing filter in the Smoothing panel "
+    "(Butterworth at ~1 Hz is the usual starting point), or set a stabilisation target so a "
+    "tracked point is held still."
+)
+"""Why an all-identity export is refused, and the two ways to fix it."""
 
 router = APIRouter(prefix="/projects/{project_id}/export", tags=["export"])
 
@@ -145,14 +167,20 @@ def export_video_route(
     The whole render is planned before a pixel is read (see
     :class:`stable.render.StabilizationPlan`), because the minimal auto-zoom is
     only knowable once every frame's warp is — then frames are streamed to the
-    encoder one at a time, so clip length is bounded by disk, not memory.
+    encoder one at a time, so clip length is bounded by disk, not memory. It is
+    planned *here*, at submit time, rather than only inside the job: planning is
+    the cheap part (no pixels), and it is what tells us whether the render is
+    worth running at all.
 
     Raises:
-        HTTPException: 400 if the project has not been solved, or if its border
-            policy is ``transparent`` (no codec here carries an alpha channel).
+        HTTPException: 400 if the project has not been solved, if its border
+            policy is ``transparent`` (no codec here carries an alpha channel),
+            if the stabilisation target cannot be resolved, or if the render
+            would be a no-op (see :data:`NO_OP_DETAIL`).
     """
     project = workspace.load_project(project_id)
-    if solve_routes.load_smoothed(workspace, project_id, project) is None:
+    motion = solve_routes.load_smoothed(workspace, project_id, project)
+    if motion is None:
         raise HTTPException(
             status_code=400, detail="run solve and smoothing before exporting a stabilized video"
         )
@@ -164,16 +192,25 @@ def export_video_route(
                 "alpha channel; switch the border policy to 'crop' or 'auto_zoom' to export video"
             ),
         )
+    options = solve_routes.load_options(workspace, project_id)
+    try:
+        planned = motion_glue.build_plan(project, motion, options=options)
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if planned.is_no_op:
+        raise HTTPException(status_code=400, detail=NO_OP_DETAIL)
     filename = body.filename if body.filename.endswith(".mp4") else f"{body.filename}.mp4"
 
     def _run(progress: Any) -> dict[str, Any]:
         proj = workspace.load_project(project_id)
         video = workspace.get_video_source(project_id)
-        motion = solve_routes.load_smoothed(workspace, project_id, proj)
-        if motion is None:  # pragma: no cover - re-checked at submit
+        smoothed = solve_routes.load_smoothed(workspace, project_id, proj)
+        if smoothed is None:  # pragma: no cover - re-checked at submit
             raise ProjectError("solve/smoothing cache missing")
 
-        plan = motion_glue.build_plan(proj, motion)
+        plan = motion_glue.build_plan(
+            proj, smoothed, options=solve_routes.load_options(workspace, project_id)
+        )
         out_dir = workspace.renders_dir(project_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / filename
@@ -193,6 +230,12 @@ def export_video_route(
             "zoom": plan.geometry.zoom,
             "width": plan.geometry.width,
             "height": plan.geometry.height,
+            "crop_scale": plan.geometry.crop_scale,
+            "coverage": plan.geometry.coverage,
+            "gaps": plan.geometry.gaps,
+            "target": plan_target(options),
+            "fill": None if plan.fill is None else plan.fill.mode,
+            "max_displacement": plan.max_displacement,
         }
 
     try:
@@ -200,6 +243,35 @@ def export_video_route(
     except RenderError as exc:  # pragma: no cover - planning happens inside the job
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"job_id": job.id}
+
+
+def plan_target(options: Any) -> str:
+    """Return a short human label for what the render held still."""
+    target = options.target
+    if target.mode == "point":
+        return f"point {target.point_id}"
+    return {"frame": "smoothing only", "centroid": "all points"}.get(target.mode, target.mode)
+
+
+@router.get("/renders")
+def list_renders(
+    project_id: str, workspace: Workspace = Depends(_workspace)
+) -> list[dict[str, Any]]:
+    """List the stabilized videos already rendered for this project, newest first.
+
+    Without this the only route to a finished export is the download link the
+    export dialog holds in memory — close the dialog or reload the page and a
+    perfectly good render becomes unreachable.
+    """
+    directory = workspace.renders_dir(project_id)
+    if not directory.is_dir():
+        return []
+    files = [p for p in directory.iterdir() if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [
+        {"filename": p.name, "bytes": p.stat().st_size, "modified_at": p.stat().st_mtime}
+        for p in files
+    ]
 
 
 @router.get("/download/{filename}")

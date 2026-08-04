@@ -11,13 +11,39 @@ Frames are then produced lazily and handed straight to
 :func:`~stable.video.encode.export_video`, which passes the source clip's audio
 through untouched. Nothing holds more than one frame at a time, so clip length
 is bounded by disk, not memory.
+
+The stabilisation target
+------------------------
+The base warp is ``smoothed(t) . raw(t)^-1``, so a clip with *no* smoothing
+configured produces the identity on every frame — a render that is a re-encode
+of the source and looks, correctly, like nothing happened. That is the whole
+failure mode behind "the stabilised output doesn't work": nothing errors,
+:attr:`OutputGeometry.zoom` comes back as ``1.0``, and the file is just the
+input again.
+
+A :class:`~stable.render.options.StabilizationTarget` is the direct way to ask
+for stabilisation instead of asking for it sideways through the smoothing
+panel. Given the target's tracked position ``p(t)``, the plan holds it still::
+
+    q(t) = W(t) . p(t)                     # where the base warp puts it
+    plan(t) = T(q(anchor) - q(t)) . W(t)   # nail it to its anchor-frame place
+
+``W(t)`` comes from
+:meth:`~stable.smoothing.motion.SmoothedMotion.stabilization_transform`, never
+from raw channel values — the curves are pivot-relative, and rebuilding a
+transform from them is wrong by a rotation about the frame corner. The extra
+term is a pure translation *composed on top*, so that stays true. With no
+smoothing ``W(t)`` is the identity and the target lock is the entire
+stabilisation; with smoothing it removes whatever drift the filters left behind.
+:attr:`StabilizationPlan.max_displacement` reports how much the plan actually
+moves the picture, which is how a caller tells a real render from a no-op.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -29,9 +55,12 @@ from ..core.video import VideoSource
 from ..smoothing.motion import SmoothedMotion
 from ..trackers.base import ProgressCallback, noop_progress
 from ..video.encode import export_video
+from .fill import BorderFill
+from .options import CropSpec, RenderOptions, hold_gaps
 from .warp import OutputGeometry, load_cv2, plan_output, warp_frame
 
 __all__ = [
+    "IDENTITY_TOLERANCE_PX",
     "StabilizationPlan",
     "iter_stabilized_frames",
     "render_stabilized",
@@ -39,6 +68,55 @@ __all__ = [
     "stabilize",
     "stabilized_frame",
 ]
+
+IDENTITY_TOLERANCE_PX = 0.01
+"""Below this much corner movement a plan is a no-op, not a stabilisation.
+
+A hundredth of a pixel is far under anything a viewer or a codec can represent,
+so a plan that moves the frame less than this would render a file identical to
+the source. Callers use it to refuse rather than to spend minutes encoding one.
+"""
+
+
+def _target_transforms(
+    warps: Sequence[SimilarityTransform],
+    positions: np.ndarray,
+    anchor_frame: int,
+) -> list[SimilarityTransform]:
+    """Compose a translation onto each warp that pins ``positions`` to their anchor.
+
+    Args:
+        warps: The base stabilisation warp per frame.
+        positions: ``[T, 2]`` target positions in source pixels, gaps already
+            held (see :func:`~stable.render.options.hold_gaps`).
+        anchor_frame: The frame whose stabilised target position is held.
+
+    Returns:
+        One transform per frame.
+
+    Raises:
+        RenderError: If the positions do not cover the planned frames, or the
+            anchor frame is outside them.
+    """
+    path = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+    if path.shape[0] < len(warps):
+        raise RenderError(
+            f"the stabilisation target covers {path.shape[0]} frames but the render plans "
+            f"{len(warps)}; the target track was made from a different clip"
+        )
+    if not 0 <= anchor_frame < len(warps):
+        raise RenderError(
+            f"stabilisation anchor frame {anchor_frame} is outside the clip [0, {len(warps)})"
+        )
+    held = warps[anchor_frame].apply(path[anchor_frame])
+    out: list[SimilarityTransform] = []
+    for frame, warp in enumerate(warps):
+        moved = warp.apply(path[frame])
+        offset = held - moved
+        out.append(
+            SimilarityTransform(tx=float(offset[0]), ty=float(offset[1])).compose(warp)
+        )
+    return out
 
 
 @dataclass(frozen=True)
@@ -52,6 +130,8 @@ class StabilizationPlan:
         interpolation: Resampling kernel; see
             :data:`~stable.render.warp.INTERPOLATIONS`.
         background: RGB fill for uncovered area (unused for ``transparent``).
+        fill: What goes in the uncovered area. ``None`` means the plain
+            ``background`` colour, which is what Phase 3 always did.
     """
 
     transforms: tuple[SimilarityTransform, ...]
@@ -59,6 +139,7 @@ class StabilizationPlan:
     source_size: tuple[int, int]
     interpolation: str = "linear"
     background: tuple[int, int, int] = (0, 0, 0)
+    fill: BorderFill | None = field(default=None)
 
     @classmethod
     def build(
@@ -70,6 +151,10 @@ class StabilizationPlan:
         max_zoom: float | None = None,
         interpolation: str = "linear",
         background: tuple[int, int, int] = (0, 0, 0),
+        target_positions: np.ndarray | None = None,
+        anchor_frame: int | None = None,
+        crop: CropSpec | None = None,
+        fill: BorderFill | None = None,
     ) -> StabilizationPlan:
         """Plan a render from smoothed motion.
 
@@ -82,23 +167,48 @@ class StabilizationPlan:
             max_zoom: Optional cap on the auto-zoom factor.
             interpolation: Resampling kernel.
             background: RGB fill for uncovered area.
+            target_positions: ``[T, 2]`` source-pixel path of the stabilisation
+                target, or ``None`` for the plain smoothing-only warp. Gaps are
+                held (:func:`~stable.render.options.hold_gaps`) rather than left
+                to make the correction lurch.
+            anchor_frame: Frame whose target position is held; defaults to the
+                solve's reference frame, so the framing does not move.
+            crop: How much of the frame the output keeps; ``None`` is the exact
+                minimal gapless crop.
+            fill: What goes in the uncovered area.
 
         Returns:
             The :class:`StabilizationPlan`.
 
         Raises:
-            RenderError: If the border policy is unknown or the warped frames
-                share no common area.
+            RenderError: If the border policy is unknown, an automatic crop
+                finds the warped frames share no common area, or the target
+                path does not cover the clip.
         """
         width, height = int(source_size[0]), int(source_size[1])
-        transforms = tuple(motion.stabilization_transforms())
-        geometry = plan_output(transforms, width, height, border, max_zoom=max_zoom)
+        warps: Sequence[SimilarityTransform] = motion.stabilization_transforms()
+        target_centre: tuple[float, float] | None = None
+        if target_positions is not None:
+            held_path = hold_gaps(target_positions)
+            frame = motion.reference_frame if anchor_frame is None else int(anchor_frame)
+            warps = _target_transforms(warps, held_path, frame)
+            anchor_point = warps[frame].apply(held_path[frame])
+            target_centre = (float(anchor_point[0]), float(anchor_point[1]))
+        # "Crop around the target" only means anything once the target is pinned:
+        # without a lock its stabilised position moves, and a moving crop centre
+        # would re-frame the shot every frame instead of cropping it.
+        centre = target_centre if (crop is not None and crop.centre == "target") else None
+        transforms = tuple(warps)
+        geometry = plan_output(
+            transforms, width, height, border, max_zoom=max_zoom, centre=centre, crop=crop
+        )
         return cls(
             transforms=transforms,
             geometry=geometry,
             source_size=(width, height),
             interpolation=interpolation,
             background=background,
+            fill=fill,
         )
 
     @classmethod
@@ -108,6 +218,8 @@ class StabilizationPlan:
         settings: RenderSettings,
         *,
         source_size: tuple[int, int],
+        options: RenderOptions | None = None,
+        target_positions: np.ndarray | None = None,
         **overrides: Any,
     ) -> StabilizationPlan:
         """Plan a render from a project file's ``render`` block.
@@ -118,12 +230,27 @@ class StabilizationPlan:
                 — only its border policy is a planning decision; codec and CRF
                 belong to the encode step.
             source_size: ``(width, height)`` of the clip.
+            options: The operator's stabilisation target / crop / fill choices.
+                The *target* is supplied resolved, as ``target_positions``,
+                because turning "the point called p2" into a path needs the
+                tracks and this module deliberately knows nothing about them.
+            target_positions: ``[T, 2]`` path for ``options.target``.
             **overrides: Any other :meth:`build` argument.
 
         Returns:
             The :class:`StabilizationPlan`.
         """
-        return cls.build(motion, source_size=source_size, border=settings.border, **overrides)
+        chosen = options or RenderOptions()
+        return cls.build(
+            motion,
+            source_size=source_size,
+            border=settings.border,
+            target_positions=target_positions,
+            anchor_frame=chosen.target.anchor_frame,
+            crop=chosen.crop,
+            fill=chosen.fill,
+            **overrides,
+        )
 
     @property
     def border(self) -> str:
@@ -139,6 +266,36 @@ class StabilizationPlan:
     def has_alpha(self) -> bool:
         """Whether rendered frames carry an alpha channel (RGBA)."""
         return self.border == "transparent"
+
+    @property
+    def max_displacement(self) -> float:
+        """Largest distance, in source pixels, that any frame corner is moved.
+
+        Measured on the stabilisation warps alone — the crop/zoom fit is
+        framing, not stabilisation, and would make a plain zoom look like
+        motion correction. ``0`` means the render would reproduce the source.
+        """
+        width, height = float(self.source_size[0]), float(self.source_size[1])
+        corners = np.array(
+            [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]], dtype=np.float64
+        )
+        worst = 0.0
+        for transform in self.transforms:
+            moved = np.asarray(transform.apply(corners), dtype=np.float64) - corners
+            worst = max(worst, float(np.hypot(moved[:, 0], moved[:, 1]).max()))
+        return worst
+
+    @property
+    def is_no_op(self) -> bool:
+        """Whether this plan would render the source back unchanged.
+
+        True when nothing asked the picture to move: no smoothing filter is
+        enabled and no stabilisation target is set, so
+        ``smoothed(t) . raw(t)^-1`` is the identity on every frame. Rendering it
+        is minutes of encoding for a copy of the input, which is exactly what
+        "the stabilised output doesn't work" looks like from the outside.
+        """
+        return self.max_displacement < IDENTITY_TOLERANCE_PX
 
     def output_transform(self, frame: int) -> SimilarityTransform:
         """Return the single affine applied to ``frame``.
@@ -163,6 +320,8 @@ class StabilizationPlan:
             "source_size": list(self.source_size),
             "interpolation": self.interpolation,
             "geometry": self.geometry.to_dict(),
+            "max_displacement": self.max_displacement,
+            "fill": None if self.fill is None else self.fill.to_dict(),
         }
 
 
@@ -215,6 +374,7 @@ def iter_stabilized_frames(
             border=plan.border,
             interpolation=plan.interpolation,
             background=plan.background,
+            fill=plan.fill,
             use_gpu=use_gpu,
         )
         progress((offset + 1) / total, f"frame {offset + 1}/{total}")
@@ -358,6 +518,10 @@ def stabilize(
     border: str = "auto_zoom",
     max_zoom: float | None = None,
     interpolation: str = "linear",
+    target_positions: np.ndarray | None = None,
+    anchor_frame: int | None = None,
+    crop: CropSpec | None = None,
+    fill: BorderFill | None = None,
     **kwargs: Any,
 ) -> tuple[str, StabilizationPlan]:
     """Plan and render in one call — the convenience wrapper the CLI uses.
@@ -369,6 +533,10 @@ def stabilize(
         border: One of :data:`~stable.core.project.BORDER_POLICIES`.
         max_zoom: Optional cap on the auto-zoom factor.
         interpolation: Resampling kernel.
+        target_positions: ``[T, 2]`` path of the stabilisation target, if any.
+        anchor_frame: Frame whose target position is held.
+        crop: How much of the frame to keep.
+        fill: What goes in the uncovered area.
         **kwargs: Any other :func:`render_stabilized` argument.
 
     Returns:
@@ -386,6 +554,10 @@ def stabilize(
         border=border,
         max_zoom=max_zoom,
         interpolation=interpolation,
+        target_positions=target_positions,
+        anchor_frame=anchor_frame,
+        crop=crop,
+        fill=fill,
     )
     return render_stabilized(video, plan, out_path, **kwargs), plan
 
@@ -415,5 +587,6 @@ def stabilized_frame(
         border=plan.border,
         interpolation=plan.interpolation,
         background=plan.background,
+        fill=plan.fill,
         use_gpu=use_gpu,
     )

@@ -56,9 +56,15 @@ stable = "stable.cli.main:main"
 [project.entry-points."stable.trackers"]
 dummy = "stable.trackers.dummy:DummyTracker"
 lk = "stable.trackers.lk:LKTracker"
+klt = "stable.trackers.klt:KLTTracker"
 template = "stable.trackers.template:TemplateTracker"
+correlation = "stable.trackers.correlation:CorrelationTracker"
+kalman = "stable.trackers.kalman:KalmanTracker"
+particle = "stable.trackers.particle:ParticleFilterTracker"
+meanshift = "stable.trackers.meanshift:MeanShiftTracker"
 cotracker3 = "stable.trackers.cotracker3:CoTracker3Tracker"
 tapir = "stable.trackers.tapir:TapirTracker"
+raft = "stable.trackers.raft:RaftTracker"
 
 [tool.setuptools.packages.find]
 include = ["stable*"]

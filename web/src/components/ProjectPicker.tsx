@@ -1,12 +1,60 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
-import type { ProjectMeta } from "../types";
+import type { ProjectDetail, ProjectMeta } from "../types";
 import { ModelManager } from "./ModelManager";
+
+/**
+ * Upload a video with real progress (todo 1).
+ *
+ * `api.createProject` (`web/src/api/client.ts`, owned by another workstream)
+ * uses `fetch`, which has no cross-browser upload-progress event, so this
+ * hits the same `POST /api/projects` multipart endpoint directly through
+ * `XMLHttpRequest` instead of widening that file's contract for one caller.
+ * Mirrors `request()`'s error handling: a JSON `detail` field wins, otherwise
+ * the status text does.
+ */
+function uploadProjectWithProgress(
+  file: File,
+  name: string,
+  onProgress: (fraction: number) => void,
+): Promise<ProjectDetail> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    if (name) form.append("name", name);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/projects");
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress(event.loaded / event.total);
+    };
+    xhr.onload = () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        body = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as ProjectDetail);
+      } else {
+        const detail =
+          body && typeof body === "object" && "detail" in body && typeof (body as { detail: unknown }).detail === "string"
+            ? (body as { detail: string }).detail
+            : xhr.statusText || `upload failed (${xhr.status})`;
+        reject(new Error(detail));
+      }
+    };
+    xhr.onerror = () => reject(new Error("upload failed — network error"));
+    xhr.send(form);
+  });
+}
 
 /** Landing screen: open an existing project or upload a video to start a new one. */
 export function ProjectPicker({ onOpen }: { onOpen: (projectId: string) => void }) {
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const [name, setName] = useState("");
@@ -25,9 +73,14 @@ export function ProjectPicker({ onOpen }: { onOpen: (projectId: string) => void 
       return;
     }
     setBusy(true);
+    setProgress(0);
     setError(null);
     try {
-      const project = await api.createProject(file, name || file.name.replace(/\.[^.]+$/, ""));
+      const project = await uploadProjectWithProgress(
+        file,
+        name || file.name.replace(/\.[^.]+$/, ""),
+        setProgress,
+      );
       onOpen(project.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -64,6 +117,17 @@ export function ProjectPicker({ onOpen }: { onOpen: (projectId: string) => void 
         <button onClick={handleUpload} disabled={busy}>
           {busy ? "Uploading…" : "Upload & create"}
         </button>
+        {busy && (
+          <div className="job-progress" style={{ width: "100%" }}>
+            <div className="job-progress__bar" style={{ width: "100%" }}>
+              <div
+                className="job-progress__fill"
+                style={{ width: `${Math.round(progress * 100)}%` }}
+              />
+            </div>
+            <span className="job-progress__label">{Math.round(progress * 100)}%</span>
+          </div>
+        )}
         {error && <div className="error-text">{error}</div>}
       </section>
 

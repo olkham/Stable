@@ -25,6 +25,7 @@ from stable.trackers.deep import (
     is_out_of_memory,
     resize_frames,
 )
+from stable.trackers.raft import RaftTracker, _pad_to_multiple, _sample_bilinear
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.weights import ENV_MODEL_DIR, ModelSpec
 
@@ -476,7 +477,7 @@ def test_cotracker_reports_missing_torch(monkeypatch):
         CoTracker3Tracker()._build_backend("cpu", "weights.pth")
 
 
-@pytest.mark.parametrize("plugin_class", [CoTracker3Tracker, TapirTracker])
+@pytest.mark.parametrize("plugin_class", [CoTracker3Tracker, TapirTracker, RaftTracker])
 def test_a_missing_model_package_is_reported_before_any_download(
     plugin_class, cache, monkeypatch
 ):
@@ -560,6 +561,72 @@ def test_availability_needs_both_torch_and_the_model_package(monkeypatch):
     assert TapirTracker.is_available() is True
     monkeypatch.setattr(TapirTracker, "_implementation_available", classmethod(lambda cls: False))
     assert TapirTracker.is_available() is False
+
+
+# -- RAFT specifics ---------------------------------------------------------
+
+
+def test_raft_declares_its_licence_and_defaults():
+    assert RaftTracker.license == "BSD-3-Clause"
+    assert RaftTracker.model_spec.non_commercial is False
+    assert RaftTracker.default_model_resolution == (128, 128)
+
+
+def test_raft_is_unavailable_without_torch(monkeypatch):
+    monkeypatch.setattr("stable.trackers.deep.torch_module", lambda: None)
+    assert RaftTracker.is_available() is False
+
+
+def test_raft_reports_a_missing_model_package(monkeypatch):
+    monkeypatch.setattr("stable.trackers.raft.torch_module", lambda: object())
+    with pytest.raises(TrackerError, match="torchvision"):
+        RaftTracker()._build_backend("cpu", "weights.pt")
+
+
+def test_raft_reports_missing_torch(monkeypatch):
+    monkeypatch.setattr("stable.trackers.raft.torch_module", lambda: None)
+    with pytest.raises(TrackerError, match="PyTorch"):
+        RaftTracker()._build_backend("cpu", "weights.pt")
+
+
+def test_raft_confidence_normalises_the_lone_flow_consistency_signal():
+    # RAFT has no second head the way CoTracker3/TAPIR do; normalize_confidence
+    # must still behave (combine_scores tolerates a single array).
+    plugin = RaftTracker(backend=MarkerBackend(), confidence_range=(0.2, 0.8))
+    prediction = BackendPrediction(
+        points=np.zeros((1, 3, 2), dtype=np.float32),
+        visibility=np.array([[0.9, 0.5, 0.1]], dtype=np.float32),
+    )
+    confidence, visible = plugin.normalize_confidence(prediction)
+    assert confidence[0] == pytest.approx([1.0, 0.5, 0.0], abs=1e-6)
+    # visible_threshold is "at or above" (see visibility_from_confidence), so
+    # exactly 0.5 counts as visible.
+    assert visible[0].tolist() == [True, True, False]
+
+
+def test_pad_to_multiple_only_pads_when_it_must():
+    import torch
+
+    unpadded = torch.zeros(1, 3, 128, 128)
+    assert _pad_to_multiple(unpadded, 8).shape == unpadded.shape
+
+    ragged = torch.zeros(1, 3, 97, 131)
+    padded = _pad_to_multiple(ragged, 8)
+    assert padded.shape[-2] % 8 == 0
+    assert padded.shape[-1] % 8 == 0
+    assert padded.shape[-2] >= 97
+    assert padded.shape[-1] >= 131
+
+
+def test_sample_bilinear_interpolates_and_clamps_out_of_bounds_points():
+    # A flow field that is a pure horizontal gradient: sampling at a half-pixel
+    # x should average its two neighbouring columns exactly.
+    flow = np.zeros((4, 4, 2), dtype=np.float64)
+    flow[..., 0] = np.arange(4)[None, :]  # dx == column index
+    samples = _sample_bilinear(flow, np.array([[1.5, 0.0], [-5.0, -5.0], [50.0, 50.0]]))
+    assert samples[0, 0] == pytest.approx(1.5)
+    # Out-of-bounds points are clamped into the field rather than raising.
+    assert np.isfinite(samples).all()
 
 
 # -- prediction contract --------------------------------------------------

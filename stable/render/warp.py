@@ -29,6 +29,17 @@ that quad — a linear-programming question with four constraints per edge that
 has a closed form — and takes the tightest answer over the whole clip. The
 zoom is the reciprocal. Because it is exact rather than iterative, "minimal
 zoom covering all frames" is a guarantee, not a search that might stop early.
+
+Choosing the crop yourself
+--------------------------
+That minimal answer is the *default*, not the only one. A
+:class:`~stable.render.options.CropSpec` overrides it with an explicit scale,
+in either direction: tighter than necessary (a safety margin), or looser — in
+which case the output deliberately includes area no frame covers, and
+:class:`~stable.render.fill.BorderFill` decides what goes there. The geometry
+reports both numbers (``coverage`` measured, ``crop_scale`` requested) and sets
+:attr:`OutputGeometry.gaps` when the second exceeds the first, so nobody has to
+guess whether the fill will be visible.
 """
 
 from __future__ import annotations
@@ -42,6 +53,8 @@ import numpy as np
 from ..core.errors import RenderError
 from ..core.geometry import SimilarityTransform
 from ..core.project import BORDER_POLICIES
+from .fill import BorderFill, composite_fill
+from .options import CropSpec
 
 __all__ = [
     "INTERPOLATIONS",
@@ -125,9 +138,17 @@ class OutputGeometry:
             exactly one affine per frame.
         coverage: Largest fraction of the frame, in ``(0, 1]``, that every
             stabilised frame covers. ``1.0`` means no zoom or crop was needed.
-        zoom: The scale factor ``fit`` applies; ``1 / coverage`` for auto-zoom.
+            This is *measured*, not requested — compare it with ``crop_scale``.
+        zoom: The scale factor ``fit`` applies; ``1 / crop_scale`` for auto-zoom.
         border: The policy this geometry implements.
         clamped: True when ``max_zoom`` capped the zoom, so gaps may remain.
+        crop_scale: The fraction of the frame actually kept. Equals ``coverage``
+            for an automatic crop; an explicit
+            :class:`~stable.render.options.CropSpec` overrides it.
+        centre: Where the output rectangle is centred, in warped coordinates.
+        gaps: True when the output includes area no frame covers, so the border
+            fill will be visible. Honest rather than implied: an explicit crop
+            or a capped zoom can both leave uncovered edges on purpose.
     """
 
     width: int
@@ -137,6 +158,9 @@ class OutputGeometry:
     zoom: float
     border: str
     clamped: bool = False
+    crop_scale: float = 1.0
+    centre: tuple[float, float] = (0.0, 0.0)
+    gaps: bool = False
 
     @property
     def size(self) -> tuple[int, int]:
@@ -152,6 +176,9 @@ class OutputGeometry:
             "coverage": self.coverage,
             "zoom": self.zoom,
             "clamped": self.clamped,
+            "crop_scale": self.crop_scale,
+            "centre": list(self.centre),
+            "gaps": self.gaps,
             "fit": self.fit.to_dict(),
         }
 
@@ -276,6 +303,8 @@ def plan_output(
     border: str = "auto_zoom",
     *,
     max_zoom: float | None = None,
+    centre: tuple[float, float] | None = None,
+    crop: CropSpec | None = None,
 ) -> OutputGeometry:
     """Work out the output size and fit transform for a border policy.
 
@@ -288,18 +317,30 @@ def plan_output(
             than this, the zoom stops there and the result is marked
             :attr:`OutputGeometry.clamped` — visible gaps, but the user keeps
             the framing they asked for rather than losing half the frame.
+        centre: Where the output rectangle sits in warped coordinates; defaults
+            to the frame centre. Pass the stabilisation target's held position
+            to crop around it instead.
+        crop: How much of the frame to keep. ``None`` (or an ``auto``
+            :class:`~stable.render.options.CropSpec`) reproduces the exact
+            minimal gapless crop; an explicit ``scale`` overrides it and may
+            leave uncovered edges for the border fill to handle.
 
     Returns:
         The :class:`OutputGeometry`.
 
     Raises:
-        RenderError: If the policy is unknown, the size is not positive, or the
-            frames share no common area (crop and auto-zoom only).
+        RenderError: If the policy is unknown, the size is not positive, or an
+            automatic crop finds the frames share no common area.
     """
     if border not in BORDER_POLICIES:
         raise RenderError(f"unknown border policy {border!r}; expected {list(BORDER_POLICIES)}")
     if width <= 0 or height <= 0:
         raise RenderError(f"frame size must be positive, got {width}x{height}")
+    spec = crop or CropSpec()
+    origin = (width / 2.0, height / 2.0) if centre is None else (
+        float(centre[0]),
+        float(centre[1]),
+    )
 
     if border == "transparent":
         # Nothing is hidden, so nothing needs measuring: the gaps become alpha.
@@ -310,22 +351,31 @@ def plan_output(
             coverage=1.0,
             zoom=1.0,
             border=border,
+            crop_scale=1.0,
+            centre=(width / 2.0, height / 2.0),
         )
 
-    coverage = coverage_scale(transforms, width, height)
-    if coverage <= 0.0:
-        raise RenderError(
-            "the stabilised frames share no common area, so there is nothing to crop to; "
-            "reduce the smoothing strength, disable a channel, or use the 'transparent' border"
-        )
+    coverage = coverage_scale(transforms, width, height, centre=origin)
+    if spec.is_auto:
+        if coverage <= 0.0:
+            raise RenderError(
+                "the stabilised frames share no common area, so there is nothing to crop to; "
+                "reduce the smoothing strength, disable a channel, set an explicit crop scale "
+                "with a border fill, or use the 'transparent' border"
+            )
+        requested = coverage
+    else:
+        requested = float(spec.scale or 1.0)
+    gaps = requested > coverage + 1e-9
 
-    centre = (width / 2.0, height / 2.0)
     if border == "crop":
-        crop_w = _even(int(coverage * width))
-        crop_h = _even(int(coverage * height))
+        crop_w = _even(int(requested * width))
+        crop_h = _even(int(requested * height))
+        # Put the requested centre at the middle of the output rectangle; with
+        # the default centre this is exactly Phase 3's symmetric offset.
         offset = SimilarityTransform(
-            tx=-(width - crop_w) / 2.0,
-            ty=-(height - crop_h) / 2.0,
+            tx=crop_w / 2.0 - origin[0],
+            ty=crop_h / 2.0 - origin[1],
         )
         return OutputGeometry(
             width=crop_w,
@@ -334,22 +384,30 @@ def plan_output(
             coverage=coverage,
             zoom=1.0,
             border=border,
+            crop_scale=requested,
+            centre=origin,
+            gaps=gaps,
         )
 
-    zoom = 1.0 / coverage
+    zoom = 1.0 / requested
     clamped = False
     if max_zoom is not None and zoom > float(max_zoom):
         if float(max_zoom) < 1.0:
             raise RenderError(f"max_zoom must be >= 1, got {max_zoom}")
         zoom, clamped = float(max_zoom), True
+        gaps = gaps or zoom * coverage < 1.0 - 1e-9
+    recentre = SimilarityTransform(tx=width / 2.0 - origin[0], ty=height / 2.0 - origin[1])
     return OutputGeometry(
         width=int(width),
         height=int(height),
-        fit=SimilarityTransform.about_pivot(centre, scale=zoom),
+        fit=recentre.compose(SimilarityTransform.about_pivot(origin, scale=zoom)),
         coverage=coverage,
         zoom=zoom,
         border=border,
         clamped=clamped,
+        crop_scale=requested,
+        centre=origin,
+        gaps=gaps,
     )
 
 
@@ -377,6 +435,7 @@ def warp_frame(
     border: str = "crop",
     interpolation: str = "linear",
     background: tuple[int, int, int] = (0, 0, 0),
+    fill: BorderFill | None = None,
     use_gpu: bool = False,
 ) -> np.ndarray:
     """Apply one stabilisation affine to one frame.
@@ -388,9 +447,14 @@ def warp_frame(
             exactly one resample happens.
         size: Output ``(width, height)``; defaults to the source size.
         border: ``"transparent"`` returns RGBA with alpha 0 in the uncovered
-            area; any other policy fills it with ``background``.
+            area; any other policy fills it with ``background`` or ``fill``.
         interpolation: One of :data:`INTERPOLATIONS`.
-        background: RGB fill for uncovered area when not using alpha.
+        background: RGB fill for uncovered area when not using alpha. Ignored
+            when ``fill`` is given.
+        fill: What to put in the uncovered area — solid colour, stretched or
+            mirrored edge, blur, or a combination (see
+            :class:`~stable.render.fill.BorderFill`). ``None`` keeps the plain
+            constant-colour behaviour, which stays a single ``warpAffine``.
         use_gpu: Try OpenCV's CUDA warp first, falling back to the CPU silently.
 
     Returns:
@@ -411,6 +475,14 @@ def warp_frame(
     out_size = (int(width), int(height)) if size is None else (int(size[0]), int(size[1]))
     flag = _interpolation_flag(cv2, interpolation)
     matrix = transform.to_matrix()
+
+    # Alpha is itself an answer to "what goes in the gap", so a fill only
+    # applies to the policies that have to put real pixels there.
+    if fill is not None and border != "transparent":
+        if fill.is_plain:
+            background = fill.color
+        else:
+            return composite_fill(cv2, source, matrix, out_size, flag=flag, fill=fill)
 
     if border == "transparent":
         alpha = np.full((height, width, 1), 255, dtype=np.uint8)

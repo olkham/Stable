@@ -120,14 +120,13 @@ stable models download bootstapir                       # Apache-2.0, no opt-in 
 stable models download cotracker3_offline --accept-noncommercial
 ```
 
-Both checkpoints currently ship **unpinned** (no verified sha256 yet — see
-[CONTRIBUTING.md](../CONTRIBUTING.md#pinning-a-checkpoint)), so a plain
-download is refused until you either pass `--allow-unpinned` / check the box
-in the UI, or set `STABLE_ALLOW_UNPINNED_WEIGHTS=1` for the session:
-
-```powershell
-$env:STABLE_ALLOW_UNPINNED_WEIGHTS = "1"
-```
+Both checkpoints now ship **pinned** (a verified sha256 is checked into
+`stable/trackers/tapir.py` / `cotracker3.py` — see
+[CONTRIBUTING.md](../CONTRIBUTING.md#pinning-a-checkpoint) for how and when
+they were verified), so a plain download just works and is checked against
+that digest; `--allow-unpinned` / `STABLE_ALLOW_UNPINNED_WEIGHTS=1` is only
+needed if you point a `ModelSpec` at a *different* file (a mirror, a newer
+release) that has no pinned digest yet.
 
 CoTracker3's weights are additionally CC-BY-NC (non-commercial); the
 `--accept-noncommercial` flag above (or `STABLE_ACCEPT_NONCOMMERCIAL=1`, or

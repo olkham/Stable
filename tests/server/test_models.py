@@ -72,7 +72,8 @@ def test_lists_the_shipped_checkpoints_with_their_trackers(client: TestClient) -
     assert rows["cotracker3_offline"]["non_commercial"] is True
     assert rows["cotracker3_offline"]["license"] == "CC-BY-NC-4.0"
     assert rows["cotracker3_offline"]["trackers"] == ["cotracker3"]
-    assert rows["cotracker3_offline"]["pinned"] is False  # Phase 2's documented deviation
+    # Pinned in W5 (todo 22); see CONTRIBUTING.md "Pinning a checkpoint".
+    assert rows["cotracker3_offline"]["pinned"] is True
     assert rows["cotracker3_offline"]["downloaded"] is False
 
     assert rows["bootstapir"]["non_commercial"] is False
