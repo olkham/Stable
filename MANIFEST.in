@@ -1,0 +1,13 @@
+# Non-package files worth keeping in a source distribution (`python -m build --sdist`).
+# Wheel contents are governed by [tool.setuptools.package-data] in pyproject.toml,
+# not by this file -- see stable/examples and stable/server package-data entries
+# for the bundled sample clip and the packaged frontend snapshot.
+include LICENSE
+include README.md
+include CONTRIBUTING.md
+include PLAN.md
+include pyproject.toml
+recursive-include docs *.md *.gif
+recursive-include scripts *.py
+graft stable/server/webdist
+global-exclude *.map

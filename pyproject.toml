@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stable-tracker"
+version = "0.1.0.dev0"
+description = "Open-source point tracking and 2D stabilization (a free alternative to Resolve's point tracker)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Stable contributors" }]
+keywords = ["tracking", "stabilization", "video", "computer-vision", "point-tracker"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+# Phase 1: decode / proxies / encode / classic CV trackers.
+video = ["av>=12", "opencv-python>=4.9"]
+# Phase 2: SOTA deep-learning trackers. Installed by the user; never a hard dep.
+# CUDA wheels need torch's own index (see docs/windows-gpu-setup.md); this pulls
+# whatever PyPI's default index resolves (typically CPU-only on Windows).
+torch = ["torch>=2.1"]
+# Phase 4: local server.
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "websockets>=12", "python-multipart>=0.0.9"]
+# Everything needed for the full `pip install stable-tracker[all]` / `stable serve` happy path
+# except torch (its CUDA build is install-order-sensitive; see docs/windows-gpu-setup.md).
+all = ["stable-tracker[video,server]"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.5", "mypy>=1.10", "httpx2"]
+
+[project.urls]
+Homepage = "https://github.com/stable-tracker/stable"
+Documentation = "https://github.com/stable-tracker/stable/blob/main/README.md"
+Issues = "https://github.com/stable-tracker/stable/issues"
+
+[project.scripts]
+stable = "stable.cli.main:main"
+
+# Third-party trackers install as pip packages advertising this entry-point group.
+# See stable/trackers/registry.py and CONTRIBUTING.md (Phase 2 deliverable).
+# lk/template are first-party but deliberately use the *same* discovery mechanism
+# as a third-party plugin would (rather than the hardcoded builtin path used only
+# by `dummy`, which exists to test that path itself) — their real dependencies
+# (opencv-python) are optional, so they must not be imported eagerly.
+[project.entry-points."stable.trackers"]
+dummy = "stable.trackers.dummy:DummyTracker"
+lk = "stable.trackers.lk:LKTracker"
+template = "stable.trackers.template:TemplateTracker"
+cotracker3 = "stable.trackers.cotracker3:CoTracker3Tracker"
+tapir = "stable.trackers.tapir:TapirTracker"
+
+[tool.setuptools.packages.find]
+include = ["stable*"]
+
+[tool.setuptools.package-data]
+stable = ["py.typed"]
+# The bundled ~5s sample clip (stable/examples) -- see that module's docstring:
+# used by `stable sample`, tests/test_cli_sample.py, and CI's headless
+# integration check. Never model weights (those download separately; see
+# stable/trackers/weights.py) and never real footage.
+"stable.examples" = ["data/*.mp4", "data/*.json"]
+# A pre-built frontend snapshot (see scripts/build_frontend.py and
+# stable/server/app.py:web_dist_dir), so `pip install stable-tracker` ships a
+# working UI with no Node.js needed on the end user's machine. Source maps are
+# excluded to keep the wheel small; they stay in the repo copy for local
+# debugging via `stable serve`.
+"stable.server" = ["webdist/*.html", "webdist/assets/*.js", "webdist/assets/*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:stable.*"]
+markers = [
+    "integration: exercises the full CLI pipeline against the bundled ~5s sample clip (CI's headless integration check; see tests/test_cli_sample.py)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's own recommended pattern is `param: T = Depends(...)`; the call is
+# evaluated once per request by FastAPI's DI system, not a mutable default.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Body", "fastapi.File", "fastapi.Form"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+# Route handler docstrings document behaviour, not FastAPI's injected
+# plumbing params (workspace/jobs/project_id are the same on every endpoint).
+"stable/server/routes/*" = ["D417"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["stable"]
+ignore_missing_imports = true

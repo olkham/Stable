@@ -1,0 +1,36 @@
+1. add and upload progress bar
+2. fill the canvas with the frame
+3. make the canvas zoomable
+4. live updates of the track processing
+5. make proxy frames faster, it currently flickers black when navigating
+6. use more system resouces, threads and GPU. It barely uses 25% of the CPU and 0% of the GPU. It should be able to use all available resources to speed up processing.
+7. toggle tracks on/off to better see the frame behind
+8. when we're editing a point we should just be able to click the new location rather than drag, it would be much faster. The user should select an active point/track, then when they're on a frame clicking will move the point to that new location.
+9. add keyboard controls for next/prev frame
+10. add options to show/hide UI componenets like the dotted lines, they can make the display very cluttered quickly
+11. whenever the user makes a manual correction this should automatically be added to a ground truth keyframe, so when retracking forwards/backwards these are new anchors that will not get overridden but will improve the track
+12. add option to track forwards to next keyframe or backwards to previous keyframe
+13. [Bug] the manualy specified anchors at the start are being ignored by the tracking that we performed from the start. Whenever the tracking is processing and it encounters a frame with a keypoint that doesn't agree with the track it should stop.
+14. when using template matching the user should be able to specify the size of the template and see the template patch. When the user sets multiple keyframes with templates they should all be visisble in the side panel as a grid of thumbnails. 
+15. When multiple keyframes are set the user will have the option to track them all forwards and backwards. The track graphs should all intersect with a successful track. Any that don't need to be flagged for manual review / low confidence (red colour on the timeline)
+16. Let the user step through frame by frame while the tracker is running so they can see it perfrom, rather than having to run it all and wait to review
+
+17. [bug] generating the stabilised output video doesn't work. The user needs more options.
+    - where the stabilistion should be centered on i.e. the target position we want to move the frame towards so that it's stable. This could be the average position of all the keypoints, or a specific keypoint that the user selects.
+    - the crop size around the target position, i.e. how much of the frame should be cropped to remove the black borders that will appear when the frame is moved to the target position.
+    - the background fill colour for the black borders that will appear when the frame is moved to the target position. This could be a solid colour, or a blurred version of the frame, or a stretched version of the frame, or a combination of these. The user should be able to select which option they want to use.
+
+18. Add an option to export the tracked data in various formats (e.g., CSV, JSON) for further analysis or use in other applications.
+19. Implement a feature to allow users to save and load their tracking sessions, so they can pause and resume work without losing progress.
+
+20. when retracking forwards/backwards, the user should have the option to specify for how many frames to retrack, rather than having to retrack the entire sequence. This would allow for more efficient corrections and adjustments.
+
+21. Improve the smoothing charts, we can currently click on them to jump to a frame however if the user holds and drags the mouse across the chart it should scrub through the frames in real time, allowing for a more interactive review of the smoothing process like we have with the main video timeline
+
+22. Implement the CoTracker3 and TAPIR
+23. Implement a correlation tracker
+24. Implment a Kalman filter tracker
+25. Implement a particle filter tracker
+26. Implement a mean-shift tracker
+27. Implement a KLT tracker
+28. Implement a deep learning-based tracker (e.g., using a pre-trained model for object tracking)

@@ -1,0 +1,21 @@
+# Keep the Docker build context small; the image only needs pyproject.toml,
+# README.md, LICENSE and stable/ (see Dockerfile).
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+tests
+web
+docs
+scripts
+CONTRIBUTING.md
+PLAN.md
+MANIFEST.in
+*.egg-info
+build
+dist
+.venv
+venv

@@ -1,0 +1,264 @@
+# Stable — open-source point tracking & 2D stabilization
+
+[![CI](https://github.com/stable-tracker/stable/actions/workflows/ci.yml/badge.svg)](https://github.com/stable-tracker/stable/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+A free alternative to Resolve's point tracker / Studio's IntelliTrack. Track
+user-defined points with swappable SOTA deep-learning trackers, solve
+X/Y/Rotation/Scale motion, edit the tracks, smooth the curves, and export
+tracking data or a stabilized video. 2D similarity only — no planar, no 3D.
+
+![Stable: tracked points, the X/Y/R/S curve editor, the stabilized preview, and the model manager](docs/demo.gif)
+
+> **Status: feature-complete through Phase 6.** Decode, proxies, four
+> trackers (`lk`, `template`, `cotracker3`, `tapir`) with multi-anchor
+> merging, a weighted Umeyama solve with RANSAC, six smoothing filters, a
+> stabilized render with crop / auto-zoom / transparent borders and audio
+> passthrough, a web UI with on-frame track editing and a full undo/redo
+> curve editor, a model-checkpoint download manager, one-command
+> `stable serve`, pip packaging, a CUDA Dockerfile, and CI. See `PLAN.md` for
+> the full roadmap and phase-by-phase acceptance criteria.
+
+## Quickstart
+
+```bash
+pip install "stable-tracker[server,video]"
+stable serve
+```
+
+`stable serve` builds the frontend if it isn't already built (only relevant
+running from a source checkout — a real `pip install` ships it pre-built),
+starts the local server, and opens your browser. From there: upload a clip,
+place a few points, track, solve, smooth, and export — or try it without your
+own footage first:
+
+```bash
+stable sample          # writes ./stable-sample/{clip.mp4, tracks.json, curves.csv, stabilized.mp4}
+```
+
+`stable sample` runs the bundled ~5s synthetic clip through the real
+`track` → `solve` → `stabilize` pipeline with the classic (`lk`) tracker —
+no GPU, no model download, nothing to configure — so there is something
+concrete to look at within seconds of installing.
+
+## Install
+
+```bash
+pip install -e .                        # core contracts, NumPy only
+pip install -e ".[dev]"                  # + pytest / ruff / mypy
+pip install -e ".[video]"                # + PyAV & OpenCV      (classic trackers)
+pip install -e ".[server]"               # + FastAPI & uvicorn  (the web UI)
+pip install -e ".[video,server]"         # + both -- what `stable serve` needs
+pip install -e ".[torch]"                # + PyTorch (CPU by default; see below for CUDA)
+```
+
+(Drop `-e .` for the last argument once installing a released version, e.g.
+`pip install "stable-tracker[server,video]"`.)
+
+The deep trackers also need their model *code*, which is not ours to vendor:
+
+```bash
+pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"          # tapir
+pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git"  # cotracker3
+```
+
+**GPU on Windows:** `pip install stable-tracker[torch]` alone gives you a
+CPU-only PyTorch build. See **[docs/windows-gpu-setup.md](docs/windows-gpu-setup.md)**
+for installing the matching CUDA wheel, verifying it with `stable devices`,
+and the model-download opt-ins the next section explains. On headless Linux,
+see the CUDA `Dockerfile` at the repo root instead.
+
+## Model checkpoints — download manager and fail-closed weights
+
+Deep trackers need checkpoints too large to ship in the package, so they
+download on first use to `~/.stable/models` (override with
+`STABLE_MODEL_DIR`). Two things are deliberate, not bugs:
+
+- **Both shipped checkpoints are unpinned** (no verified sha256 yet) — a
+  digest nobody has checked against the publisher would be a lie, so a
+  download **fails closed** rather than trusting the network silently.
+  Unblock it per-download (a checkbox in the model manager, or
+  `--allow-unpinned` on the CLI) or globally with
+  `STABLE_ALLOW_UNPINNED_WEIGHTS=1`. See CONTRIBUTING.md "Pinning a
+  checkpoint" if you want to verify and pin one for good.
+- **CoTracker3's weights are CC-BY-NC (non-commercial)** and are never
+  bundled or downloaded silently either — opt in with the model manager's
+  checkbox, `--accept-noncommercial`, or `STABLE_ACCEPT_NONCOMMERCIAL=1`.
+  TAPIR/BootsTAP's weights are Apache-2.0 and need no licence opt-in, just
+  the unpinned one above.
+
+In the browser, click **Models** (top-right in a project, or from the
+project list) to see every checkpoint's cache/licence state and download or
+delete it, with live progress. Headlessly:
+
+```bash
+stable models                                              # list, with cache/pin/licence state
+stable models download bootstapir                          # Apache-2.0, no opt-in needed
+stable models download cotracker3_offline --accept-noncommercial
+stable models remove bootstapir                             # free the disk space back
+```
+
+## CLI walkthrough
+
+```bash
+stable trackers   # list installed tracker plugins
+stable devices    # show what Stable will run on (cuda -> cpu)
+stable filters    # list the smoothing filters and their parameters
+stable models     # list model checkpoints and their cache state
+
+# 1. track some points
+stable track clip.mp4 --point 120.5,80@0 --point 640,360@0 \
+    --tracker lk --out tracks.json
+
+# 2. export the solved X/Y/R/S curves
+stable solve tracks.json --out curves.csv --video clip.mp4
+
+# 3. or go straight to a stabilized video (audio passed through)
+stable stabilize clip.mp4 --tracks tracks.json --out stable.mp4 \
+    --smooth butterworth:cutoff_hz=1.0 --border auto_zoom
+
+stable stabilize clip.mp4 --tracks tracks.json --out locked.mp4 --tripod
+stable stabilize clip.mp4 --tracks tracks.json --out frames/ --border transparent
+
+# 4. or the whole pipeline as one command, against the bundled sample clip
+stable sample ./my-sample --tracker lk --border auto_zoom
+
+# 5. the web UI, built (if needed), served, and opened for you
+stable serve
+```
+
+## Docker (CUDA)
+
+For a headless Linux GPU box (on Windows, run natively — see the GPU setup
+doc above, which is also simpler since it lets `stable serve` reach your
+browser):
+
+```bash
+docker build -t stable-tracker:cuda .
+docker run --rm -it --gpus all -p 8000:8000 \
+    -v stable-workspace:/root/.stable/projects \
+    -v stable-models:/root/.stable/models \
+    stable-tracker:cuda
+```
+
+Then open <http://localhost:8000>. See the `Dockerfile` for what it installs
+(CUDA 12.4 base, Python 3.11, PyTorch's matching CUDA wheel, both deep
+trackers' model code) — the frontend is already built into the package
+(`stable/server/webdist`), so the image never needs Node.js.
+
+## What exists today
+
+| Module | Contents |
+|---|---|
+| `stable.core.types` | `Query`, `TrackResult`, `PointTrack` — the universal tracking contract |
+| `stable.core.geometry` | `SimilarityTransform` — the 4-DoF motion model (X, Y, R, S) |
+| `stable.core.corrections` | The typed, non-destructive manual-edit layer |
+| `stable.core.project` | Project file schema v1: load / save / migrate |
+| `stable.core.device` | `select_device()` — CUDA when available, CPU always works |
+| `stable.trackers.base` | `TrackerPlugin` — the swappability core |
+| `stable.trackers.registry` | Entry-point discovery of third-party trackers |
+| `stable.trackers.merge` | Multi-anchor merging: confidence blend, anchor falloff, disagreement |
+| `stable.trackers.dummy` | A deterministic tracker so everything is testable |
+| `stable.trackers.lk` | Pyramidal Lucas-Kanade with forward-backward confidence |
+| `stable.trackers.template` | NCC template matching with adaptive template update |
+| `stable.trackers.deep` | Chunked inference, GPU→CPU fallback, the model backend seam |
+| `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
+| `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
+| `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |
+| `stable.trackers.cotracker3` | CoTracker3 (Meta) — CC-BY-NC weights, opt-in |
+| `stable.trackers.tapir` | TAPIR / BootsTAP (DeepMind) — Apache-2.0 weights |
+| `stable.video.source` | `PyAVVideoSource` — real, random-access video decode |
+| `stable.video.proxy` | Half/quarter-res JPEG proxy generation + disk-backed serving |
+| `stable.video.encode` | FFmpeg export via PyAV, with audio passthrough |
+| `stable.solver.similarity` | Confidence-weighted Umeyama fit, with lockable degrees of freedom |
+| `stable.solver.ransac` | Outlier rejection from minimal samples, deterministic |
+| `stable.solver.motion` | Per-clip solve: X/Y/R/S curves, residuals, graceful degradation |
+| `stable.smoothing.dsp` | Butterworth / filtfilt / Savitzky-Golay / spline, in pure NumPy |
+| `stable.smoothing.filters` | The six-filter catalogue, its schema and the strength blend |
+| `stable.smoothing.channels` | Per-channel enable & strength, round-tripped through the project file |
+| `stable.smoothing.motion` | Smoothing a solve into a stabilization warp |
+| `stable.smoothing.edit` | Curve-editor operations: sub-range blend, pin |
+| `stable.render.warp` | The per-frame affine and the three border policies |
+| `stable.render.stabilize` | Planning a render, streaming it to a file or PNG sequence |
+| `stable.server.app` | The FastAPI app: routing, static frontend, packaged-vs-source dist resolution |
+| `stable.server.jobs` | The background job queue + WebSocket progress, incl. model downloads |
+| `stable.server.routes.models` | Model checkpoint list / download / delete, the UI's model manager backend |
+| `stable.server.history` | Undo/redo over the corrections layer |
+| `stable.examples` | The bundled ~5s sample clip (`stable sample`, CI's integration test) |
+| `stable.cli.track` | The `stable track` subcommand |
+| `stable.cli.solve` | The `stable solve` subcommand — curve export as CSV/JSON |
+| `stable.cli.stabilize` | The `stable stabilize` subcommand — the whole pipeline |
+| `stable.cli.models` | The `stable models` subcommand — list / download / remove checkpoints |
+| `stable.cli.serve` | The `stable serve` subcommand — build, serve, open the browser |
+| `stable.cli.sample` | The `stable sample` subcommand — the bundled clip end to end |
+
+## Design invariants
+
+* **One result type.** Every tracker returns a `TrackResult`; nothing downstream
+  knows which model produced it. That is what makes swapping in the next SOTA
+  tracker a packaging problem, not a code change.
+* **Absolute frame indices.** Track arrays span the whole clip (`T =
+  video.frame_count`); untracked frames are `NaN`. No range offsets anywhere.
+* **Raw output is immutable.** Track arrays are read-only. Manual edits are a
+  typed correction layer applied on top, so undo is "drop a correction" and
+  re-tracking never destroys the user's work.
+* **Multi-anchor by default.** A point holds several anchor keyframes; runs go
+  bidirectionally from each and are merged tracker-agnostically. The merged
+  track passes through every anchor exactly, and disagreement between
+  overlapping runs lowers confidence — that dip is the UI's "fix this" signal.
+* **One confidence scale.** Every plugin normalises its scores to *P(this
+  position is accurate to within a few pixels)*, so the solver can weight a
+  transformer and an optical-flow tracker with the same arithmetic.
+* **Degrade, don't die.** No GPU, a GPU that won't load the model, or a window
+  that blows out VRAM mid-job all fall back to the CPU and finish. The solver
+  does the same with data: three points get RANSAC, one point gets X/Y only,
+  none gets interpolated — and every frame records which happened, so the UI
+  can flag the ones worth looking at instead of silently guessing.
+* **Smoothing is the stabilization.** The warp is `smoothed(t) ∘ raw(t)⁻¹`, so a
+  channel that is not smoothed is not stabilized — exactly, not approximately.
+  "Off" and "strength 0" are bit-for-bit bypasses.
+* **NumPy only.** The filter designs, `filtfilt`, Savitzky-Golay and the
+  smoothing spline are implemented here rather than pulled from SciPy, so the
+  stabilizer never fails to run because a scientific stack is missing.
+* **Weights fail closed, not silently.** An unpinned checksum or a
+  non-commercial licence blocks a download until an explicit opt-in — never a
+  workaround, always a visible choice (in the model manager UI, the CLI, or
+  an environment variable).
+
+## Adding a tracker
+
+Publish a package advertising the `stable.trackers` entry-point group:
+
+```toml
+[project.entry-points."stable.trackers"]
+my_tracker = "my_package.tracker:MyTracker"
+```
+
+Subclass `stable.trackers.TrackerPlugin`, implement `track()`, done — it shows
+up in `stable trackers` and in the UI's picker. For a deep tracker, subclass
+`DeepTrackerPlugin` instead and you inherit chunked inference, resolution
+scaling, CPU fallback and checksummed weight download; you supply the model and
+what its scores mean. **See [CONTRIBUTING.md](CONTRIBUTING.md) for the full
+guide**, including confidence calibration and weight licensing.
+
+## Tests
+
+```bash
+python -m pytest                    # everything, including the headless integration check
+python -m pytest -m "not integration"   # unit + component tests only (fast)
+python -m pytest -m integration         # the bundled-clip CLI pipeline check, on its own
+python -m ruff check . && python -m mypy
+cd web && npm run build             # tsc --noEmit + vite build
+```
+
+CI (`.github/workflows/ci.yml`) runs all of the above — lint, unit tests, the
+headless integration check, the frontend build — plus a packaging job that
+builds a real wheel and installs it into a clean virtualenv on both Ubuntu
+and Windows runners to prove `pip install` → `stable serve` actually works
+with nothing else on disk.
+
+## License
+
+MIT for this code. Model weights carry their own licenses — CoTracker is
+CC-BY-NC (non-commercial), TAPIR is Apache-2.0. Non-commercial weights are
+opt-in downloads and are never bundled.

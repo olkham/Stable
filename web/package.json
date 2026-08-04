@@ -1,0 +1,25 @@
+{
+  "name": "stable-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "React + TypeScript + Vite frontend for Stable (Phase 4). Talks to the local FastAPI server (stable/server) over HTTP + WebSocket.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}
