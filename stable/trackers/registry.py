@@ -247,19 +247,32 @@ class TrackerRegistry:
 
         Returns:
             One dict per tracker with keys ``name``, ``display_name``,
-            ``requires_gpu``, ``license`` and ``available``.
+            ``requires_gpu``, ``license``, ``available`` and
+            ``unavailable_reason`` — the last being ``None`` when the tracker
+            can run, and otherwise what to do about it. A plugin that raises
+            while answering either question is reported as unavailable rather
+            than being allowed to break the whole list.
         """
         self.discover()
-        return [
-            {
-                "name": plugin.name,
-                "display_name": plugin.display_name or plugin.name,
-                "requires_gpu": bool(plugin.requires_gpu),
-                "license": plugin.license,
-                "available": plugin.is_available(),
-            }
-            for _, plugin in self.items()
-        ]
+        rows: list[dict[str, Any]] = []
+        for _, plugin in self.items():
+            try:
+                available = bool(plugin.is_available())
+                reason = None if available else plugin.unavailable_reason()
+            except Exception as exc:  # noqa: BLE001 - one bad plugin must not hide the rest
+                logger.debug("tracker %s failed its availability check: %s", plugin.name, exc)
+                available, reason = False, f"{plugin.name} failed its availability check: {exc}"
+            rows.append(
+                {
+                    "name": plugin.name,
+                    "display_name": plugin.display_name or plugin.name,
+                    "requires_gpu": bool(plugin.requires_gpu),
+                    "license": plugin.license,
+                    "available": available,
+                    "unavailable_reason": reason,
+                }
+            )
+        return rows
 
     def __contains__(self, name: object) -> bool:
         """Whether a tracker with this name is registered (no discovery)."""

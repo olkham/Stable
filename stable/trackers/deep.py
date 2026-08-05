@@ -301,6 +301,26 @@ class DeepTrackerPlugin(TrackerPlugin):
         """Whether the third-party package holding the model code is importable."""
         return True
 
+    @classmethod
+    def unavailable_reason(cls) -> str | None:
+        """Say which of the two prerequisites is missing, and how to get it.
+
+        These plugins are unavailable far more often than the classic-CV ones —
+        they need PyTorch *and* a model package Stable does not vendor — so
+        "unavailable" on its own leaves the operator with no way forward. The
+        same two conditions :meth:`is_available` checks are reported here, in
+        the same order, with the command that fixes each.
+        """
+        if torch_module() is None:
+            return (
+                f"{cls.name} needs PyTorch: pip install stable-tracker[torch] "
+                "(see docs/windows-gpu-setup.md for the CUDA build)"
+            )
+        if not cls._implementation_available():
+            hint = cls.install_hint or "See docs/windows-gpu-setup.md."
+            return f"{cls.name} needs its model code, which Stable does not vendor. {hint}"
+        return None
+
     def _require_implementation(self) -> None:
         """Fail fast if this plugin cannot possibly run in this environment.
 

@@ -154,7 +154,56 @@ def test_describe_is_ui_ready(reg):
     assert rows["dummy"]["license"] == "MIT"
     assert rows["dummy"]["available"] is True
     assert rows["unavailable"]["available"] is False
-    assert set(rows["dummy"]) == {"name", "display_name", "requires_gpu", "license", "available"}
+    assert set(rows["dummy"]) == {
+        "name",
+        "display_name",
+        "requires_gpu",
+        "license",
+        "available",
+        "unavailable_reason",
+    }
+
+
+def test_an_available_tracker_has_nothing_to_explain(reg):
+    rows = {row["name"]: row for row in reg.describe()}
+    assert rows["dummy"]["unavailable_reason"] is None
+
+
+def test_an_unavailable_tracker_says_what_would_fix_it(reg):
+    """ "Unavailable" alone is indistinguishable from "broken"."""
+
+    class NeedsSomething(ThirdPartyTracker):
+        name = "needs_something"
+
+        @classmethod
+        def is_available(cls) -> bool:
+            return False
+
+        @classmethod
+        def unavailable_reason(cls) -> str:
+            return "needs_something needs widgets: pip install widgets"
+
+    reg.discover(entry_points=[FakeEntryPoint("needs_something", NeedsSomething)])
+    row = {r["name"]: r for r in reg.describe()}["needs_something"]
+    assert row["available"] is False
+    assert "pip install widgets" in row["unavailable_reason"]
+
+
+def test_one_exploding_plugin_does_not_hide_the_others(reg):
+    """A bad plugin must cost its own row, not the whole list."""
+
+    class Exploding(ThirdPartyTracker):
+        name = "exploding"
+
+        @classmethod
+        def is_available(cls) -> bool:
+            raise RuntimeError("boom")
+
+    reg.discover(entry_points=[FakeEntryPoint("exploding", Exploding)])
+    rows = {row["name"]: row for row in reg.describe()}
+    assert rows["dummy"]["available"] is True
+    assert rows["exploding"]["available"] is False
+    assert "boom" in rows["exploding"]["unavailable_reason"]
 
 
 def test_lookup_triggers_discovery_lazily(reg):

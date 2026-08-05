@@ -2,12 +2,26 @@ import { useState } from "react";
 import * as api from "../api/client";
 import { pointColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
-import type { Query, TrackData } from "../types";
+import type { Query, TrackData, TrackerInfo } from "../types";
 import { JobProgress } from "./JobProgress";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 
 /** How far a keyframe may be from where a run landed before it is flagged. */
 const FLAGGED_ANCHOR_COLOR = "#ff3b30";
+
+/**
+ * Why the tracker a point is *already set to* cannot run here, if it cannot.
+ *
+ * A point can carry a tracker that has since become unavailable — a project
+ * made on a machine with PyTorch, opened on one without. The dropdown greys
+ * that option out, which is silent about the point that is using it, so the
+ * row says so too.
+ */
+function unavailableReason(trackers: TrackerInfo[], name: string): string | null {
+  const match = trackers.find((t) => t.name === name);
+  if (!match || match.available) return null;
+  return match.unavailable_reason ?? `${name} is not available in this environment`;
+}
 
 /** One keyframe a tracking run reached and disagreed with. */
 interface AnchorViolation {
@@ -183,12 +197,28 @@ export function PointsPanel() {
                   onChange={(e) => handleTrackerChange(point.id, e.target.value)}
                 >
                   {trackers.map((t) => (
-                    <option key={t.name} value={t.name} disabled={!t.available}>
+                    <option
+                      key={t.name}
+                      value={t.name}
+                      disabled={!t.available}
+                      // A disabled option with no explanation is
+                      // indistinguishable from a broken one; the server says
+                      // what to install, so pass it straight through.
+                      title={t.unavailable_reason ?? undefined}
+                    >
                       {t.display_name}
                       {!t.available ? " (unavailable)" : ""}
                     </option>
                   ))}
                 </select>
+                {unavailableReason(trackers, point.tracker) && (
+                  <span
+                    className="points-list__warning"
+                    title={unavailableReason(trackers, point.tracker) ?? undefined}
+                  >
+                    ⚠ not installed
+                  </span>
+                )}
                 <label className="points-list__enabled" onClick={(e) => e.stopPropagation()}>
                   <input
                     type="checkbox"

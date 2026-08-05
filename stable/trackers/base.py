@@ -126,6 +126,25 @@ class TrackerPlugin(ABC):
         """
         return True
 
+    @classmethod
+    def unavailable_reason(cls) -> str | None:
+        """Why :meth:`is_available` said no, and what would fix it.
+
+        A greyed-out tracker with no explanation is indistinguishable from a
+        broken one: the operator cannot tell whether to install something, wait
+        for a download, or pick a different plugin. Overriding this turns "not
+        available" into an instruction.
+
+        Keep it to one sentence, name the command where there is one, and do not
+        touch the network — this is called to render a list.
+
+        Returns:
+            ``None`` when the plugin is available (the default, so a plugin that
+            is always available need not override it), otherwise a short
+            human-readable reason.
+        """
+        return None
+
     # -- the one method that matters -------------------------------------
 
     @abstractmethod

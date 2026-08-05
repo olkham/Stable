@@ -31,7 +31,14 @@ video = ["av>=12", "opencv-python>=4.9"]
 # Phase 2: SOTA deep-learning trackers. Installed by the user; never a hard dep.
 # CUDA wheels need torch's own index (see docs/windows-gpu-setup.md); this pulls
 # whatever PyPI's default index resolves (typically CPU-only on Windows).
-torch = ["torch>=2.1"]
+#
+# torchvision carries the RAFT architecture *and* its published weights, so it
+# is what makes the `raft` tracker (todo 28) reachable at all. Unlike
+# CoTracker3 and TAPIR — whose model code only exists on GitHub and so stays a
+# documented manual step — this one is an ordinary PyPI package, and leaving it
+# out meant `pip install stable-tracker[torch]` produced a tracker that was
+# registered, listed, and permanently greyed out.
+torch = ["torch>=2.1", "torchvision>=0.16"]
 # Phase 4: local server.
 server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "websockets>=12", "python-multipart>=0.0.9"]
 # Everything needed for the full `pip install stable-tracker[all]` / `stable serve` happy path

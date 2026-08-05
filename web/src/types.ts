@@ -250,6 +250,13 @@ export interface TrackerInfo {
   requires_gpu: boolean;
   license: string;
   available: boolean;
+  /**
+   * Null when the tracker can run; otherwise what to install to make it,
+   * straight from the plugin (`TrackerPlugin.unavailable_reason`). Shown as the
+   * tooltip on the greyed-out option, because "unavailable" alone is
+   * indistinguishable from "broken".
+   */
+  unavailable_reason: string | null;
 }
 
 export interface DeviceInfo {

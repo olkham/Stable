@@ -18,9 +18,18 @@ def test_trackers_lists_builtins(client: TestClient) -> None:
     assert response.status_code == 200
     names = {row["name"] for row in response.json()}
     assert {"dummy", "lk", "template"} <= names
-    # Every entry is UI-ready: greys out unavailable trackers rather than 500ing.
+    # Every entry is UI-ready: greys out unavailable trackers rather than 500ing,
+    # and says what would make an unavailable one work.
     for row in response.json():
-        assert set(row) == {"name", "display_name", "requires_gpu", "license", "available"}
+        assert set(row) == {
+            "name",
+            "display_name",
+            "requires_gpu",
+            "license",
+            "available",
+            "unavailable_reason",
+        }
+        assert (row["unavailable_reason"] is None) == row["available"]
 
 
 def test_devices(client: TestClient) -> None:
