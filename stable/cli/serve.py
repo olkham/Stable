@@ -242,7 +242,10 @@ def run_serve(args: argparse.Namespace) -> int:
         )
 
     url = f"http://{args.host}:{port}/"
-    print(f"Stable is running at {url}  (Ctrl+C to stop)")
+    # Flushed explicitly: Python block-buffers stdout when it is not a terminal,
+    # so piping or redirecting `stable serve` would otherwise withhold the one
+    # line the user is waiting for until the process exits.
+    print(f"Stable is running at {url}  (Ctrl+C to stop)", flush=True)
 
     if not args.no_browser:
 
