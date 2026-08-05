@@ -481,7 +481,9 @@ def test_cotracker_is_unavailable_without_torch(monkeypatch):
 
 
 def test_cotracker_reports_a_missing_model_package(monkeypatch):
+    """Simulated: `cotracker` is installable, so its absence cannot be assumed."""
     monkeypatch.setattr("stable.trackers.cotracker3.torch_module", lambda: object())
+    _hide_module(monkeypatch, "cotracker")
     plugin = CoTracker3Tracker()
     with pytest.raises(TrackerError, match="cotracker package"):
         plugin._build_backend("cpu", "weights.pth")
@@ -565,7 +567,9 @@ def test_tapir_declares_a_commercially_usable_licence():
 
 
 def test_tapir_reports_a_missing_model_package(monkeypatch):
+    """Simulated: `tapnet` is installable, so its absence cannot be assumed."""
     monkeypatch.setattr("stable.trackers.tapir.torch_module", lambda: object())
+    _hide_module(monkeypatch, "tapnet")
     with pytest.raises(TrackerError, match="tapnet"):
         TapirTracker()._build_backend("cpu", "weights.pt")
 
