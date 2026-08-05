@@ -36,6 +36,7 @@ from ...core.errors import ProjectError, RenderError, StableError
 from ...core.project import Project
 from ...core.trackdata import AE_FORMAT, after_effects_keyframes
 from ...render.stabilize import render_stabilized
+from ...video.encode import AudioPlan, plan_audio
 from .. import motion as motion_glue
 from ..jobs import JobManager, get_job_manager
 from ..schemas import ExportVideoRequest
@@ -260,13 +261,18 @@ def export_video_route(
         out_dir = workspace.renders_dir(project_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / filename
+        source_clip = proj.resolve_path(proj.video.path)
+        # Asked here as well as inside the encoder so the answer can be reported:
+        # a clip whose audio had to be converted should say so rather than leave
+        # the operator to notice it in the file (see stable/video/encode.py).
+        audio = plan_audio(source_clip, out_path) if source_clip else AudioPlan("none")
         render_stabilized(
             video,
             plan,
             out_path,
             codec=body.codec,
             crf=body.crf,
-            audio_source=proj.resolve_path(proj.video.path),
+            audio_source=source_clip,
             frame_range=(0, min(plan.n_frames, video.frame_count)),
             progress=progress,
         )
@@ -282,6 +288,8 @@ def export_video_route(
             "target": plan_target(options),
             "fill": None if plan.fill is None else plan.fill.mode,
             "max_displacement": plan.max_displacement,
+            "audio": audio.mode,
+            "audio_note": audio.reason,
         }
 
     try:

@@ -444,6 +444,9 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
                 {typeof job.result.zoom === "number" ? ` · ${job.result.zoom.toFixed(3)}× zoom` : ""}
                 {job.result.target ? ` · held ${job.result.target}` : ""}
                 {job.result.gaps ? ` · edges filled (${job.result.fill})` : ""}
+                {/* Audio only gets a mention when something happened to it —
+                    a plain passthrough is the expected case and says nothing. */}
+                {job.result.audio_note ? ` · ${job.result.audio_note}` : ""}
               </p>
             )}
 
@@ -466,8 +469,9 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
 
             <p className="modal__hint">
               The stabilized render applies the solved + smoothed curves as one similarity per
-              frame, with the source clip's audio passed through untouched. Every option here also
-              drives the stabilized preview, so what you see is what you get.
+              frame, with the source clip's audio passed through untouched — or re-encoded to AAC
+              when the container cannot store it, which it will tell you about. Every option here
+              also drives the stabilized preview, so what you see is what you get.
             </p>
           </div>
         )}
