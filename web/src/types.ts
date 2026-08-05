@@ -161,29 +161,44 @@ export interface FilterInfo {
   params: FilterParamInfo[];
 }
 
-/** One keyframe in the template grid, and whether a patch fits at it. */
-export interface TemplateAnchor {
+/** One patch in the grid: where it is, and whether it fits inside the frame. */
+export interface PointPatch {
   frame: number;
   x: number;
   y: number;
+  /** `keyframe` is a position you set; `tracked` is where the tracker put it. */
+  kind: "keyframe" | "tracked";
   /** False when the patch would fall off the edge of the frame at this size. */
   available: boolean;
 }
 
-/** `GET .../points/{id}/template` — everything the template panel draws (todo 14). */
-export interface TemplateOptions {
+/** `GET .../points/{id}/patches` — everything the patch panel draws (todo 14). */
+export interface PointPatches {
   point_id: string;
   tracker: string;
+  /** Half-size of the region this point's tracker actually matches. */
+  radius: number;
+  /** Side of the square patch in pixels, i.e. `2 * radius + 1`. */
+  patch_size: number;
+  /**
+   * Which constructor argument `radius` came from (`template_radius`,
+   * `win_size`, …), or null when the tracker has no local window at all and
+   * the size is only a preview.
+   */
+  radius_source: string | null;
+  /** Whether the size slider would actually change what the next run matches. */
+  adjustable: boolean;
   template_radius: number;
   search_radius: number;
-  /** Side of the square patch in pixels, i.e. `2 * template_radius + 1`. */
-  patch_size: number;
   defaults: { template_radius: number; search_radius: number };
   template_radius_range: [number, number];
   search_radius_range: [number, number];
   /** Whether anything has been overridden, i.e. whether "reset" does anything. */
   custom: boolean;
-  anchors: TemplateAnchor[];
+  /** One entry per keyframe. */
+  patches: PointPatch[];
+  /** The frame being viewed, when the point has a position there. */
+  current: PointPatch | null;
 }
 
 export type JobStatus = "queued" | "running" | "done" | "error" | "cancelled";

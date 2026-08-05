@@ -41,11 +41,13 @@ from ..core.project import PointSpec
 __all__ = [
     "TRACKER_OPTIONS_CACHE",
     "TEMPLATE_RADIUS_RANGE",
+    "WINDOW_ATTRIBUTES",
     "load_tracker_options",
     "point_options",
     "save_point_options",
     "template_patch",
     "patch_bounds",
+    "tracker_window",
 ]
 
 TRACKER_OPTIONS_CACHE = "tracker_options.json"
@@ -199,3 +201,69 @@ def effective_radius(project_dir: Path, point: PointSpec, default: int) -> int:
         return int(stored) if stored is not None else int(default)
     except (TypeError, ValueError):  # pragma: no cover - hand-edited sidecar
         return int(default)
+
+
+WINDOW_ATTRIBUTES: tuple[tuple[str, float], ...] = (
+    ("template_radius", 1.0),
+    ("patch_radius", 1.0),
+    ("window_radius", 1.0),
+    ("win_size", 0.5),
+)
+"""Constructor arguments that describe the region a tracker looks at, and the
+factor turning each into a *radius*.
+
+Every classic-CV tracker in this project matches a small neighbourhood of the
+point, but they do not agree on what to call it — ``template_radius`` (template,
+kalman, particle), ``patch_radius`` (correlation), ``window_radius`` (meanshift)
+or ``win_size`` (lk, klt, which state a full side length, hence the 0.5). Rather
+than teach the panel about each plugin, the effective radius is read from
+whichever of these the plugin declares, in this order. A tracker declaring none
+of them has no local window at all — the deep trackers see whole frames — and
+:func:`tracker_window` says so instead of inventing a number.
+"""
+
+DEFAULT_PREVIEW_RADIUS = 16
+"""Patch half-size previewed for a tracker that has no window of its own."""
+
+
+def tracker_window(
+    tracker_name: str, options: dict[str, Any] | None = None
+) -> tuple[int, str | None]:
+    """Return the half-size of the region ``tracker_name`` actually matches.
+
+    Args:
+        tracker_name: Registered plugin name.
+        options: The point's stored overrides, which win over the plugin's
+            defaults exactly as they do when a run is created.
+
+    Returns:
+        ``(radius, attribute)`` — the radius in source pixels and the
+        constructor argument it came from, or ``(DEFAULT_PREVIEW_RADIUS, None)``
+        when the tracker has no local window (or cannot be inspected, e.g. a
+        plugin whose optional dependency is missing). The radius is still
+        useful in that case: it is the size of the *preview*, which is honest
+        as long as the caller reports that it is not the tracker's own.
+    """
+    import inspect  # noqa: PLC0415 - only needed on this path
+
+    from ..trackers.registry import get_tracker  # noqa: PLC0415 - avoids an import cycle
+
+    try:
+        plugin_cls = get_tracker(tracker_name)
+        parameters = inspect.signature(plugin_cls.__init__).parameters
+    except Exception:  # noqa: BLE001 - an unknown tracker just has no window
+        return DEFAULT_PREVIEW_RADIUS, None
+
+    stored = options or {}
+    for name, factor in WINDOW_ATTRIBUTES:
+        if name not in parameters:
+            continue
+        raw = stored.get(name, parameters[name].default)
+        if raw is inspect.Parameter.empty or raw is None:
+            continue
+        try:
+            radius = int(round(float(raw) * factor))
+        except (TypeError, ValueError):  # pragma: no cover - hand-edited sidecar
+            continue
+        return max(1, radius), name
+    return DEFAULT_PREVIEW_RADIUS, None

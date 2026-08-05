@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   color-scheme: dark;
   --bg: #16181d;
   --panel: #1e2127;
@@ -907,9 +907,9 @@ button:disabled {
   color: var(--danger);
 }
 
-/* -- template matching panel (todo 14) ------------------------------------- */
+/* -- tracked patches panel (todo 14) ------------------------------------- */
 
-.template-panel {
+.patch-panel {
   margin: 8px 0 4px;
   padding: 8px;
   border: 1px solid var(--border);
@@ -917,7 +917,7 @@ button:disabled {
   background: rgba(255, 255, 255, 0.02);
 }
 
-.template-panel__controls {
+.patch-panel__controls {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -925,30 +925,30 @@ button:disabled {
   font-size: 0.8rem;
 }
 
-.template-panel__controls label {
+.patch-panel__controls label {
   display: flex;
   align-items: center;
   gap: 6px;
   color: var(--text-dim);
 }
 
-.template-panel__size {
+.patch-panel__size {
   min-width: 84px;
   font-variant-numeric: tabular-nums;
 }
 
-.template-panel__pending {
+.patch-panel__pending {
   color: var(--text-dim);
 }
 
-.template-panel__grid {
+.patch-panel__grid {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
 }
 
-.template-thumb {
+.patch-thumb {
   margin: 0;
   text-align: center;
   cursor: pointer;
@@ -957,17 +957,17 @@ button:disabled {
   line-height: 0;
 }
 
-.template-thumb--current {
+.patch-thumb--current {
   border-color: var(--accent, #4da3ff);
 }
 
-.template-thumb img {
+.patch-thumb img {
   display: block;
   border-radius: 2px;
   background: #000;
 }
 
-.template-thumb__missing {
+.patch-thumb__missing {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -977,16 +977,59 @@ button:disabled {
   font-size: 1.2rem;
 }
 
-.template-thumb figcaption {
+.patch-thumb figcaption {
   font-size: 0.7rem;
   color: var(--text-dim);
   line-height: 1.6;
   font-variant-numeric: tabular-nums;
 }
 
-.template-panel__empty,
-.template-panel__warning {
+.patch-panel__empty,
+.patch-panel__warning {
   margin: 8px 0 0;
   font-size: 0.75rem;
   color: var(--text-dim);
+}
+
+.patch-panel__label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  margin: 8px 0 4px;
+}
+
+.patch-panel__now {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.patch-panel__now .patch-panel__label {
+  margin: 0;
+}
+
+/* A keyframe patch is what the operator stated; a tracked one is what the
+   tracker decided. Different things, so they do not look the same. */
+.patch-thumb--keyframe img {
+  outline: 1px solid rgba(255, 209, 102, 0.75);
+  outline-offset: -1px;
+}
+
+.patch-strip {
+  padding: 0 8px 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+}
+
+.patch-strip__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.patch-strip .patch-thumb figcaption {
+  font-weight: 600;
 }

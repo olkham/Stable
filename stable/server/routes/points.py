@@ -5,10 +5,11 @@ keyframes plus a tracker choice. Placing more anchors on the timeline (pins) is
 what feeds :mod:`stable.trackers.merge`'s multi-anchor blend — this module is
 the HTTP surface for that, plus submitting the actual tracking job.
 
-Template matching (todo 14) adds two routes on top: the per-point tracker
-settings (``/template``) and the patch itself at any one keyframe
-(``/template/patch``), rendered on demand — see
+Todo 14 adds two routes on top: what patches a point has (``/patches``) and the
+pixels of one of them (``/patches/image``), rendered on demand — see
 :mod:`stable.server.tracker_options` for why nothing about a patch is stored.
+Both work for *any* tracker, not only template matching; see the section
+comment above them.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from ..tracker_options import (
     point_options,
     save_point_options,
     template_patch,
+    tracker_window,
 )
 from ..tracking import (
     effective_anchors,
@@ -317,7 +319,15 @@ def get_track(
     return payload
 
 
-# -- template matching (todo 14) ---------------------------------------------
+# -- tracked patches (todo 14) ------------------------------------------------
+#
+# "See the template patch" is the *template* tracker's phrasing of a need every
+# tracker has: show me the pixels being matched. So this is not gated on the
+# template tracker — every point gets a patch grid, sized from whatever window
+# its own plugin declares (:func:`stable.server.tracker_options.tracker_window`).
+# Only the size *control* is template-specific, because only that plugin takes
+# its window from a stored setting; for the others the size is reported as the
+# tracker's own and the panel says so rather than pretending it is adjustable.
 
 
 def _template_defaults() -> tuple[int, int]:
@@ -326,123 +336,186 @@ def _template_defaults() -> tuple[int, int]:
     return plugin.template_radius, plugin.search_radius
 
 
-@router.get("/{point_id}/template")
-def get_template_options(
-    project_id: str, point_id: str, workspace: Workspace = Depends(_workspace)
-) -> dict[str, Any]:
-    """Return the template settings in force for a point, and where its patches are.
-
-    Everything the panel needs to draw itself in one call: the effective radii
-    (stored, or the plugin's own defaults), the range the sliders may cover, and
-    one entry per keyframe saying whether a patch can actually be built there.
-    A keyframe too close to the frame edge is reported rather than 404-ing
-    later, so the grid can show *why* a thumbnail is missing.
-    """
-    project = workspace.load_project(project_id)
+def _point_or_404(project: Project, point_id: str) -> PointSpec:
+    """Return a point, or raise the 404 every route in this section wants."""
     try:
-        point = project.point(point_id)
+        return project.point(point_id)
     except StableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    default_radius, default_search = _template_defaults()
+
+def _patch_position(
+    project: Project, point: PointSpec, frame: int
+) -> tuple[tuple[float, float], str] | None:
+    """Where a point is on ``frame``, and whether that is stated or tracked.
+
+    A keyframe wins over the track: on a frame the operator has pinned, the
+    patch they want to see is the one at the position they stated, which is also
+    what a run would build its template from.
+
+    Returns:
+        ``((x, y), kind)`` with ``kind`` in ``{"keyframe", "tracked"}``, or
+        ``None`` if the point has neither there.
+    """
+    for anchor in effective_anchors(point):
+        if anchor.frame == frame:
+            return (anchor.x, anchor.y), "keyframe"
+    track = load_display_track(project, point)
+    if track is None or not 0 <= frame < track.n_frames:
+        return None
+    position = track.position_at(frame)
+    return (position, "tracked") if position is not None else None
+
+
+@router.get("/{point_id}/patches")
+def get_point_patches(
+    project_id: str,
+    point_id: str,
+    frame: int | None = None,
+    workspace: Workspace = Depends(_workspace),
+) -> dict[str, Any]:
+    """Describe every patch this point has, so the panel can draw itself in one call.
+
+    Args:
+        frame: The frame being viewed, added to the list as a ``"tracked"``
+            entry when the point has a position there and it is not already a
+            keyframe. This is what makes the panel show the region being
+            followed *now*, not only where it was pinned.
+
+    Returns:
+        The effective window radius and where it came from, the template-size
+        control's range (whether or not it applies), and one entry per patch
+        with ``available`` saying whether it can actually be built — a keyframe
+        too close to the frame edge is reported rather than 404-ing later, so
+        the grid can show *why* a thumbnail is missing.
+    """
+    project = workspace.load_project(project_id)
+    point = _point_or_404(project, point_id)
+
     stored = point_options(workspace.project_dir(project_id), point_id)
-    radius = int(stored.get("template_radius", default_radius))
-    search = int(stored.get("search_radius", default_search))
+    radius, source_attribute = tracker_window(point.tracker, stored)
+    default_radius, default_search = _template_defaults()
 
     video = workspace.get_video_source(project_id)
-    anchors = [
-        {
-            "frame": q.frame,
-            "x": q.x,
-            "y": q.y,
-            "available": patch_bounds((q.x, q.y), radius, video.width, video.height) is not None,
+
+    def entry(position: tuple[float, float], at: int, kind: str) -> dict[str, Any]:
+        return {
+            "frame": at,
+            "x": position[0],
+            "y": position[1],
+            "kind": kind,
+            "available": patch_bounds(position, radius, video.width, video.height) is not None,
         }
-        for q in effective_anchors(point)
-    ]
+
+    patches = [entry((q.x, q.y), q.frame, "keyframe") for q in effective_anchors(point)]
+    current: dict[str, Any] | None = None
+    if frame is not None:
+        found = _patch_position(project, point, frame)
+        if found is not None:
+            current = entry(found[0], frame, found[1])
+
     return {
         "point_id": point_id,
         "tracker": point.tracker,
-        "template_radius": radius,
-        "search_radius": search,
+        "radius": radius,
         "patch_size": radius * 2 + 1,
+        # Which constructor argument the radius came from, or null when the
+        # tracker has no local window at all (the deep trackers see whole
+        # frames) and this is only a preview size.
+        "radius_source": source_attribute,
+        "adjustable": "template_radius" in point_options_schema(point.tracker),
+        "template_radius": int(stored.get("template_radius", default_radius)),
+        "search_radius": int(stored.get("search_radius", default_search)),
         "defaults": {"template_radius": default_radius, "search_radius": default_search},
         "template_radius_range": list(TEMPLATE_RADIUS_RANGE),
         "search_radius_range": list(SEARCH_RADIUS_RANGE),
         "custom": bool(stored),
-        "anchors": anchors,
+        "patches": patches,
+        "current": current,
     }
 
 
-@router.put("/{point_id}/template")
-def set_template_options(
+def point_options_schema(tracker_name: str) -> set[str]:
+    """Return the constructor arguments ``tracker_name`` accepts.
+
+    Used to decide whether the size slider does anything for this tracker: a
+    control that silently fails to change a run is worse than no control.
+    """
+    import inspect  # noqa: PLC0415 - only needed on this path
+
+    from ...trackers.registry import get_tracker  # noqa: PLC0415 - avoids an import cycle
+
+    try:
+        return set(inspect.signature(get_tracker(tracker_name).__init__).parameters)
+    except Exception:  # noqa: BLE001 - an unknown tracker accepts nothing
+        return set()
+
+
+@router.put("/{point_id}/patches")
+def set_point_patch_options(
     project_id: str,
     point_id: str,
     body: TemplateOptionsUpdate,
     workspace: Workspace = Depends(_workspace),
 ) -> dict[str, Any]:
-    """Set (or clear) a point's template settings.
+    """Set (or clear) a point's template sizes.
 
     A ``null`` for either radius restores the plugin's own default, which is
     what the panel's "reset" does — storing the default explicitly would freeze
     it against any later change to the tracker.
     """
     project = workspace.load_project(project_id)
-    try:
-        project.point(point_id)
-    except StableError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _point_or_404(project, point_id)
 
     payload = body.model_dump(exclude_unset=True)
     try:
         save_point_options(workspace.project_dir(project_id), point_id, payload)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return get_template_options(project_id, point_id, workspace)
+    return get_point_patches(project_id, point_id, None, workspace)
 
 
-@router.get("/{point_id}/template/patch")
-def get_template_patch(
+@router.get("/{point_id}/patches/image")
+def get_point_patch_image(
     project_id: str,
     point_id: str,
     frame: int,
     radius: int | None = None,
     workspace: Workspace = Depends(_workspace),
 ) -> Response:
-    """Return the template patch at one keyframe as a PNG.
+    """Return the patch at one frame as a PNG — a keyframe's, or the tracked one.
 
     Args:
-        frame: Which keyframe to show. Any frame works, but the panel asks for
-            the point's anchors.
-        radius: Override the stored radius, so the grid can preview a size the
-            slider is still being dragged through without saving it first.
+        frame: Any frame the point has a position on, pinned or tracked.
+        radius: Override the effective radius, so the grid can preview a size
+            the slider is still being dragged through without saving it first.
 
     Raises:
-        HTTPException: 404 if the point or frame does not exist, 400 if the
-            patch would fall outside the frame.
+        HTTPException: 404 if the point does not exist or has no position on
+            that frame, 400 if the patch would fall outside the frame.
     """
     project = workspace.load_project(project_id)
-    try:
-        point = project.point(point_id)
-    except StableError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    point = _point_or_404(project, point_id)
 
-    default_radius, _ = _template_defaults()
     stored = point_options(workspace.project_dir(project_id), point_id)
-    size = int(radius if radius is not None else stored.get("template_radius", default_radius))
+    effective, _source = tracker_window(point.tracker, stored)
+    size = int(radius if radius is not None else effective)
     low, high = TEMPLATE_RADIUS_RANGE
     if not low <= size <= high:
         raise HTTPException(status_code=400, detail=f"radius must lie in [{low}, {high}]")
 
-    position = next(((q.x, q.y) for q in effective_anchors(point) if q.frame == frame), None)
-    if position is None:
-        raise HTTPException(status_code=404, detail=f"point has no keyframe at frame {frame}")
+    found = _patch_position(project, point, frame)
+    if found is None:
+        raise HTTPException(
+            status_code=404, detail=f"point {point_id!r} has no position on frame {frame}"
+        )
 
     video = workspace.get_video_source(project_id)
-    patch = template_patch(video, frame, position, size)
+    patch = template_patch(video, frame, found[0], size)
     if patch is None:
         raise HTTPException(
             status_code=400,
-            detail=f"a {size * 2 + 1}px template at frame {frame} falls outside the frame",
+            detail=f"a {size * 2 + 1}px patch at frame {frame} falls outside the frame",
         )
     return Response(content=_encode_png(patch), media_type="image/png")
 

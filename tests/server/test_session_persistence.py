@@ -57,7 +57,7 @@ def test_a_whole_session_survives_the_server_being_thrown_away(tmp_path, tiny_cl
         )
         ok(
             client.put(
-                f"/api/projects/{project_id}/points/p1/template", json={"template_radius": 6}
+                f"/api/projects/{project_id}/points/p1/patches", json={"template_radius": 6}
             )
         )
         submitted = ok(client.post(f"/api/projects/{project_id}/points/p1/track", json={}))
@@ -97,7 +97,7 @@ def test_a_whole_session_survives_the_server_being_thrown_away(tmp_path, tiny_cl
         assert after["x"][3] == 12.5
 
         # Per-point tracker settings live in a sidecar, and came back too.
-        template = client.get(f"/api/projects/{project_id}/points/p1/template").json()
+        template = client.get(f"/api/projects/{project_id}/points/p1/patches").json()
         assert template["template_radius"] == 6
 
         # And the proxy frames are still servable without regenerating them.

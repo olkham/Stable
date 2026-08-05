@@ -16,8 +16,8 @@ import type {
   RenderSettings,
   SmoothingFilter,
   SmoothingResponse,
+  PointPatches,
   SolveResponse,
-  TemplateOptions,
   TrackData,
   TrackerInfo,
 } from "../types";
@@ -181,33 +181,43 @@ export const trackPoint = (
 ): Promise<{ job_id: string }> =>
   postJson(`/api/projects/${projectId}/points/${pointId}/track`, opts);
 
-// -- template matching (todo 14) ---------------------------------------------
+// -- tracked patches (todo 14) -----------------------------------------------
 
-export const getTemplateOptions = (
+/** `frame` adds the position the tracker has *now* to the returned list. */
+export const getPointPatches = (
   projectId: string,
   pointId: string,
-): Promise<TemplateOptions> => request(`/api/projects/${projectId}/points/${pointId}/template`);
+  frame?: number,
+): Promise<PointPatches> =>
+  request(
+    `/api/projects/${projectId}/points/${pointId}/patches` +
+      (frame === undefined ? "" : `?frame=${frame}`),
+  );
 
-export const updateTemplateOptions = (
+export const updatePointPatches = (
   projectId: string,
   pointId: string,
   body: { template_radius?: number | null; search_radius?: number | null },
-): Promise<TemplateOptions> =>
-  putJson(`/api/projects/${projectId}/points/${pointId}/template`, body);
+): Promise<PointPatches> =>
+  putJson(`/api/projects/${projectId}/points/${pointId}/patches`, body);
 
 /**
- * URL of the template patch at one keyframe. `radius` previews a size that has
- * not been saved yet, so dragging the slider updates the grid live; without it
- * the stored radius is used.
+ * URL of the patch at one frame — a keyframe's, or wherever the tracker put it.
+ *
+ * `radius` previews a size that has not been saved yet, so dragging the slider
+ * updates the grid live. `rev` busts the browser cache: the pixels change when
+ * an edit moves the track, and that alone would not change the URL.
  */
-export function templatePatchUrl(
+export function pointPatchUrl(
   projectId: string,
   pointId: string,
   frame: number,
   radius?: number,
+  rev?: number,
 ): string {
   const size = radius === undefined ? "" : `&radius=${radius}`;
-  return `/api/projects/${projectId}/points/${pointId}/template/patch?frame=${frame}${size}`;
+  const revision = rev === undefined ? "" : `&rev=${rev}`;
+  return `/api/projects/${projectId}/points/${pointId}/patches/image?frame=${frame}${size}${revision}`;
 }
 
 export const getTrack = (projectId: string, pointId: string): Promise<TrackData> =>

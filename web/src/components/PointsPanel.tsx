@@ -4,7 +4,7 @@ import { pointColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackData } from "../types";
 import { JobProgress } from "./JobProgress";
-import { TemplatePanel } from "./TemplatePanel";
+import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 
 /** How far a keyframe may be from where a run landed before it is flagged. */
 const FLAGGED_ANCHOR_COLOR = "#ff3b30";
@@ -153,6 +153,10 @@ export function PointsPanel() {
         <p className="panel__empty">No points yet. Click "Add point" then click on the video.</p>
       )}
 
+      {/* Every point's patch on this frame, so "which one has drifted" is one
+          glance rather than one click per point (todo 14). */}
+      <AllPatchesStrip />
+
       <ul className="points-list">
         {project.points.map((point) => {
           const trackJob = latestJobFor("track", point.id);
@@ -255,12 +259,12 @@ export function PointsPanel() {
                 </button>
               </div>
 
-              {/* Template matching gets its own controls, and only when it is
-                  the tracker actually in use — the patch grid is meaningless
-                  for LK or a deep tracker (todo 14). */}
-              {point.tracker === "template" && isSelected && (
-                <TemplatePanel pointId={point.id} />
-              )}
+              {/* The patches this point is tracked on (todo 14). Shown for
+                  every tracker, not just template matching: "what does the
+                  tracker see here" is the same question whatever is doing the
+                  looking. Only for the selected point, so the list stays
+                  scannable when a shot has a dozen points. */}
+              {isSelected && <PatchPanel pointId={point.id} />}
 
               <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                 <button onClick={() => handleTrack(point.id)}>
