@@ -18,12 +18,29 @@ thin dev/test runner, deliberately leaving this command for Phase 6). It:
    package-data and ``scripts/build_frontend.py``), so this path is a source-
    checkout convenience — an end user with no Node.js installed never needs it.
 #. Starts uvicorn and, once the port answers, opens the default browser.
+
+Binding, and why this module does it itself
+-------------------------------------------
+``stable serve`` used to print its URL and *then* hand the port to uvicorn,
+which meant the one line the user is told to click was printed before anything
+had been bound — and was simply wrong if the bind then failed. On Windows the
+default port 8000 is routinely held by ``iphlpsvc`` (Microsoft's IP Helper
+service reserves ranges around it), so "wrong" is the common case, not the
+exotic one, and what the user saw was a correct-looking URL followed by a
+traceback.
+
+So the socket is bound *here*, before anything is printed: the requested port
+first, then the next few, then whatever the OS hands out. Uvicorn is then given
+the already-bound socket to serve on, which is exactly what it does with its
+own internally-bound one. Nothing is printed until that succeeded, and what is
+printed is the port actually held — not the port that was asked for.
 """
 
 from __future__ import annotations
 
 import argparse
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -34,6 +51,14 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["add_serve_parser", "run_serve"]
+
+PORT_SCAN_RANGE = 10
+"""How many ports past the requested one to try before asking the OS to choose.
+
+Enough to step over a couple of neighbouring services (or another copy of
+Stable) while keeping the port predictable; past that, a port the OS picks is
+more useful than a tenth guess.
+"""
 
 
 def add_serve_parser(subparsers: Any) -> argparse.ArgumentParser:
@@ -108,6 +133,46 @@ def _build_frontend(web_dir: Path) -> bool:
     return subprocess.run([npm, "run", "build"], cwd=str(web_dir)).returncode == 0
 
 
+def _bind_listener(host: str, port: int) -> tuple[socket.socket, int]:
+    """Bind a listening socket on ``host``, falling back to a free port.
+
+    Tries the requested port, then the next :data:`PORT_SCAN_RANGE`, then port
+    ``0`` (any free port the OS chooses). The socket is returned still bound and
+    listening, so the port cannot be taken by anything else between choosing it
+    and serving on it.
+
+    Args:
+        host: Interface to bind.
+        port: Preferred port; ``0`` asks the OS to choose immediately.
+
+    Returns:
+        ``(socket, port)`` — the listening socket and the port it actually holds.
+
+    Raises:
+        OSError: If even an OS-assigned port could not be bound, which means
+            something is wrong with the interface rather than with the port.
+    """
+    candidates = [port, *range(port + 1, port + 1 + PORT_SCAN_RANGE), 0] if port else [0]
+    last_error: OSError | None = None
+    for candidate in candidates:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # Deliberately *not* SO_REUSEADDR: on Linux it would let this bind
+            # succeed while another process is still listening on the same port,
+            # which would turn "the port is busy" into two servers splitting the
+            # user's requests. Windows' SO_REUSEADDR is worse still (it steals
+            # the port outright).
+            sock.bind((host, candidate))
+            sock.listen(2048)
+        except OSError as exc:
+            sock.close()
+            last_error = exc
+            continue
+        return sock, sock.getsockname()[1]
+    assert last_error is not None  # noqa: S101 - the loop always tries port 0
+    raise last_error
+
+
 def _wait_until_serving(url: str, *, timeout: float = 20.0) -> bool:
     """Poll ``url`` until it answers or ``timeout`` elapses.
 
@@ -136,7 +201,7 @@ def run_serve(args: argparse.Namespace) -> int:
 
     Returns:
         Process exit code: ``0`` on a normal shutdown (Ctrl+C), ``1`` if the
-        'server' extra is missing.
+        'server' extra is missing or no port could be bound at all.
     """
     try:
         import uvicorn  # noqa: PLC0415 - optional 'server' extra
@@ -165,8 +230,19 @@ def run_serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    url = f"http://{args.host}:{args.port}/"
-    print(f"starting Stable at {url}  (Ctrl+C to stop)")
+    try:
+        listener, port = _bind_listener(args.host, args.port)
+    except OSError as exc:
+        print(f"error: cannot listen on {args.host}: {exc}", file=sys.stderr)
+        return 1
+    if port != args.port:
+        print(
+            f"note: port {args.port} is in use; serving on {port} instead",
+            file=sys.stderr,
+        )
+
+    url = f"http://{args.host}:{port}/"
+    print(f"Stable is running at {url}  (Ctrl+C to stop)")
 
     if not args.no_browser:
 
@@ -177,13 +253,21 @@ def run_serve(args: argparse.Namespace) -> int:
         threading.Thread(target=_open_when_ready, daemon=True).start()
 
     if args.reload:
+        # The reload supervisor runs the app in child processes that inherit
+        # their own socket, so this one is handed back before uvicorn rebinds
+        # the port we just proved is free.
+        listener.close()
         uvicorn.run(
             "stable.server.app:create_app",
             factory=True,
             host=args.host,
-            port=args.port,
+            port=port,
             reload=True,
         )
     else:
-        uvicorn.run(create_app(), host=args.host, port=args.port)
+        config = uvicorn.Config(create_app(), host=args.host, port=port)
+        try:
+            uvicorn.Server(config).run(sockets=[listener])
+        finally:
+            listener.close()
     return 0

@@ -85,6 +85,14 @@ class PyAVVideoSource:
     :class:`~stable.video.pool.PooledVideoSource` gives each one its own decoder
     over a shared cache instead.
 
+    :meth:`close` is part of that contract, and the sharp edge of it: the server
+    hands one source to background jobs *and* to request threads (see
+    :meth:`stable.server.storage.Workspace.get_video_source`), so a shutdown can
+    land while a job is mid-decode. Freeing an FFmpeg container out from under a
+    live decoder is a use-after-free, not an exception — so :meth:`close` takes
+    the same lock the decode path holds, and every later call raises
+    :class:`~stable.core.errors.VideoError` instead of touching freed memory.
+
     Args:
         path: Path to a video file FFmpeg can demux and decode.
         cache_size: Maximum number of decoded frames kept in the LRU cache.
@@ -111,6 +119,12 @@ class PyAVVideoSource:
         self._cache = cache if cache is not None else FrameCache(max_frames=self._cache_size)
         self._owns_cache = cache is None
         self._lock = threading.RLock()
+        # Set before anything can fail, so a half-built source is still safe for
+        # `close()` (which `__del__` calls) to look at.
+        self._container: Any = None
+        self._decoder: Iterator[Any] | None = None
+        self._decoder_next_index = 0
+        self._closed = False
         try:
             self._container = av.open(self._path)
         except Exception as exc:
@@ -128,8 +142,6 @@ class PyAVVideoSource:
         if not self._pts_list:
             raise VideoError(f"{self._path!r} decoded zero frames")
         self._fps = self._compute_fps()
-        self._decoder: Iterator[Any] | None = None
-        self._decoder_next_index = 0
 
     # -- construction helpers ---------------------------------------------
 
@@ -273,7 +285,8 @@ class PyAVVideoSource:
 
         Raises:
             IndexError: If ``index`` is out of range.
-            VideoError: If the decoder cannot reach ``index``.
+            VideoError: If the decoder cannot reach ``index``, or the source has
+                been closed.
         """
         if not 0 <= index < self.frame_count:
             raise IndexError(f"frame {index} out of range for T={self.frame_count}")
@@ -282,9 +295,12 @@ class PyAVVideoSource:
             note_frame(index)
             return cached
         with self._lock:
-            # Another thread may have decoded it while we waited for the lock.
+            # Another thread may have decoded it while we waited for the lock --
+            # including the thread that closed this source, which is why the
+            # closed check happens *inside* the lock rather than before it.
             cached = self._cache.get(index)
             if cached is None:
+                self._require_open()
                 if self._decoder is None or index < self._decoder_next_index:
                     self._reseek(index)
                 while (cached := self._cache.get(index)) is None:
@@ -334,6 +350,37 @@ class PyAVVideoSource:
 
     # -- decode machinery ---------------------------------------------------
 
+    def _require_open(self) -> Any:
+        """Return the live container, refusing to touch a closed one.
+
+        Returns:
+            The open PyAV container.
+
+        Raises:
+            VideoError: If :meth:`close` has already run.
+        """
+        container = self._container
+        if self._closed or container is None:
+            raise VideoError(f"video source for {self._path!r} is closed")
+        return container
+
+    def _drop_decoder(self) -> None:
+        """Close and forget the live decode generator, if there is one.
+
+        PyAV's ``decode()`` generator holds FFmpeg state tied to the stream, so
+        an abandoned one is closed explicitly rather than left for the garbage
+        collector to finalise at an arbitrary later moment — which, on another
+        thread, would be finalising it *beside* its replacement.
+        """
+        decoder, self._decoder = self._decoder, None
+        close = getattr(decoder, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - teardown must not mask the real error
+            logger.debug("closing decoder for %r failed: %s", self._path, exc)
+
     def _reseek(self, index: int) -> None:
         """Seek the container so decoding can reach frame ``index``.
 
@@ -341,9 +388,11 @@ class PyAVVideoSource:
         live decoder; the frame the seek actually lands on is cached
         immediately since it was decoded "for free".
         """
+        container = self._require_open()
         target_pts = self._pts_list[index]
-        self._container.seek(target_pts, stream=self._stream, any_frame=False, backward=True)
-        self._decoder = self._container.decode(self._stream)
+        self._drop_decoder()
+        container.seek(target_pts, stream=self._stream, any_frame=False, backward=True)
+        self._decoder = container.decode(self._stream)
         try:
             first = next(self._decoder)
         except StopIteration as exc:  # pragma: no cover - malformed file only
@@ -357,8 +406,10 @@ class PyAVVideoSource:
         """Pull the next frame from the live decoder, cache it, and return it.
 
         Raises:
-            VideoError: If the decoder is exhausted before it should be.
+            VideoError: If the decoder is exhausted before it should be, or the
+                source was closed.
         """
+        self._require_open()
         assert self._decoder is not None  # noqa: S101 - internal invariant
         try:
             raw = next(self._decoder)
@@ -376,13 +427,25 @@ class PyAVVideoSource:
     # -- lifecycle ------------------------------------------------------
 
     def close(self) -> None:
-        """Release the underlying PyAV container. Safe to call more than once."""
-        container = getattr(self, "_container", None)
-        if container is not None:
-            container.close()
-            self._container = None
-            self._decoder = None
-        if getattr(self, "_owns_cache", False):
+        """Release the underlying PyAV container. Safe to call more than once.
+
+        Blocks until any decode in progress on another thread has finished, so
+        the container is never freed while FFmpeg is still reading through it.
+        The wait is bounded by one frame's decode (at worst one group of
+        pictures, when a seek has just landed), and a decode already waiting on
+        the lock finds the source closed and raises rather than resuming.
+        """
+        if getattr(self, "_closed", True):
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._drop_decoder()
+            container, self._container = self._container, None
+            if container is not None:
+                container.close()
+        if self._owns_cache:
             self._cache.clear()
 
     def __enter__(self) -> PyAVVideoSource:

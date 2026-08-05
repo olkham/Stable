@@ -280,9 +280,17 @@ class Workspace:
             return meta
 
     def delete_project(self, project_id: str) -> None:
-        """Delete a project directory and evict any cached runtime objects."""
+        """Delete a project directory and evict any cached runtime objects.
+
+        The cached video source is *closed*, not merely dropped: it holds an
+        open handle on the clip inside the directory being removed, and Windows
+        refuses to delete an open file — so evicting it alone would leave the
+        video behind and ``ignore_errors=True`` would hide that it had.
+        """
         with self._lock:
-            self._video_cache.pop(project_id, None)
+            source = self._video_cache.pop(project_id, None)
+            if source is not None:
+                source.close()
             for key in [k for k in self._proxy_cache if k[0] == project_id]:
                 self._proxy_cache.pop(key, None)
             directory = self._require_dir(project_id)

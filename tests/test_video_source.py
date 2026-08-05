@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -121,3 +124,68 @@ def test_repr_is_informative(tiny_clip):
         text = repr(video)
         assert "PyAVVideoSource" in text
         assert str(video.frame_count) in text
+
+
+# -- close() while another thread is decoding --------------------------------
+#
+# The server shares one source between background jobs and request threads
+# (`Workspace.get_video_source`), so shutdown *does* race a live decode. Freeing
+# an FFmpeg container under a running decoder is a use-after-free: before the
+# fix these two tests did not fail, they killed the interpreter with an access
+# violation, which is how the whole `tests/server` suite was crashing.
+
+
+def test_a_closed_source_refuses_to_decode_rather_than_touching_freed_memory(tiny_clip):
+    path, _source = tiny_clip
+    video = PyAVVideoSource(path)
+    video.get_frame(0)
+    video.close()
+
+    with pytest.raises(VideoError, match="closed"):
+        video.get_frame(1)
+    # Range checks still come first: a closed source is not a broken one.
+    with pytest.raises(IndexError):
+        video.get_frame(video.frame_count)
+
+
+def test_close_waits_for_a_decode_running_on_another_thread(tiny_clip):
+    path, _source = tiny_clip
+    # A cache of one forces a reseek on almost every read, which is where the
+    # container is most dangerous to free (mid-`next()` on a live decoder).
+    video = PyAVVideoSource(path, cache_size=1)
+    last = video.frame_count - 1
+    failures: list[BaseException] = []
+    reading = threading.Event()
+
+    def hammer() -> None:
+        reading.set()
+        try:
+            for _ in range(60):
+                for index in (0, last, 1, last - 1):
+                    video.get_frame_view(index)
+        except VideoError:
+            pass  # the expected outcome once close() lands
+        except BaseException as exc:  # noqa: BLE001 - anything else is the bug
+            failures.append(exc)
+
+    thread = threading.Thread(target=hammer, daemon=True)
+    thread.start()
+    reading.wait(timeout=5)
+    time.sleep(0.05)  # let it get properly into the decode loop
+    video.close()
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    assert failures == []
+
+
+def test_close_is_idempotent_and_survives_a_failed_construction(tmp_path, tiny_clip):
+    path, _source = tiny_clip
+    video = PyAVVideoSource(path)
+    video.close()
+    video.close()  # must not raise, and must not double-free
+
+    # A source that never finished __init__ is still safe to finalise, which is
+    # what __del__ does to it.
+    broken = PyAVVideoSource.__new__(PyAVVideoSource)
+    broken.close()
