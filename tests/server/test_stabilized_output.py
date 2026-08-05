@@ -45,9 +45,7 @@ def solved_project(client: TestClient, workspace, tmp_path, warped_clip):
     wait_job(client, project_id, detail["proxy_job_id"], timeout=60)
 
     features = warped_clip.feature_points(6)
-    point_ids = seed_tracks(
-        workspace, project_id, warped_clip.true_tracks(features).tracks()
-    )
+    point_ids = seed_tracks(workspace, project_id, warped_clip.true_tracks(features).tracks())
     submitted = client.post(f"/api/projects/{project_id}/solve")
     job = wait_job(client, project_id, submitted.json()["job_id"], timeout=60)
     assert job["status"] == "done", job
@@ -83,9 +81,7 @@ def test_export_refuses_a_render_that_would_change_nothing(client, solved_projec
     """The reported bug: a solved project with no smoothing exported a copy."""
     project_id, _clip, _points = solved_project
 
-    response = client.post(
-        f"/api/projects/{project_id}/export/video", json={"filename": "out.mp4"}
-    )
+    response = client.post(f"/api/projects/{project_id}/export/video", json={"filename": "out.mp4"})
     assert response.status_code == 400, response.text
     detail = response.json()["detail"]
     # The message has to name both ways out, or it is just a different dead end.
@@ -111,9 +107,7 @@ def test_disabled_smoothing_filters_still_count_as_no_smoothing(client, solved_p
         },
     )
     assert smoothing.status_code == 200, smoothing.text
-    response = client.post(
-        f"/api/projects/{project_id}/export/video", json={"filename": "out.mp4"}
-    )
+    response = client.post(f"/api/projects/{project_id}/export/video", json={"filename": "out.mp4"})
     assert response.status_code == 400
     assert "re-encode the source" in response.json()["detail"]
 
@@ -259,9 +253,7 @@ def test_border_fill_replaces_the_black_edge_in_the_preview(client, solved_proje
     assert letterboxed > 200, letterboxed
 
     for mode in ("mirror", "stretch", "blur"):
-        client.put(
-            f"/api/projects/{project_id}/render/options", json={"fill": {"mode": mode}}
-        )
+        client.put(f"/api/projects/{project_id}/render/options", json={"fill": {"mode": mode}})
         filled = max(black_pixels(f) for f in (5, 20, 35))
         assert filled < letterboxed / 10, (mode, letterboxed, filled)
 
@@ -307,7 +299,7 @@ def test_options_round_trip_and_offer_the_valid_choices(client, solved_project):
     project_id, _clip, point_ids = solved_project
     fetched = client.get(f"/api/projects/{project_id}/render/options").json()
     assert fetched["options"]["target"]["mode"] == "frame"
-    assert fetched["target_modes"] == ["frame", "centroid", "point"]
+    assert fetched["target_modes"] == ["frame", "centroid", "point", "map"]
     assert fetched["fill_modes"] == ["solid", "stretch", "mirror", "blur"]
     # Only tracked points can be a target, so the UI cannot offer a broken one.
     assert [p["id"] for p in fetched["points"]] == point_ids

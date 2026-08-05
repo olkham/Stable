@@ -5,6 +5,7 @@ import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackData, TrackerInfo } from "../types";
 import { JobProgress } from "./JobProgress";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
+import { OVERLAY_LABELS } from "./Viewer";
 
 /** How far a keyframe may be from where a run landed before it is flagged. */
 const FLAGGED_ANCHOR_COLOR = "#ff3b30";
@@ -74,16 +75,22 @@ function submitBoundedRun(projectId: string, pointId: string, body: BoundedRunBo
 }
 
 /**
- * Point list: tracker picker, anchor pins, "track" trigger with live progress,
- * bounded forward/backward retracking, and the per-point confidence /
- * disagreement summary that tells the user which point needs another anchor.
+ * One card per track: what it is, what it sees, what it drew, and what it shows.
+ *
+ * This was a list of *points*, which is how the data model thinks but not how
+ * the work does. The unit an operator handles is a track — its tracker, its
+ * keyframes, its patches, its runs, and (todo 9) which of its overlays are on
+ * the canvas. Putting the visibility toggles on the card is the whole point of
+ * the change: with several tracks up, "hide the dotted trails" almost always
+ * means *that* track's trails, and the global checkboxes above the canvas could
+ * only ever mean all of them.
  *
  * Keyframes are ground truth. A pin the tracker could not reconcile with what it
  * saw is listed in red here and on the timeline rather than being quietly
  * averaged away, and a run started from one is bounded — to the next keyframe,
  * or to a number of frames — instead of always ploughing to the end of the clip.
  */
-export function PointsPanel() {
+export function TracksPanel() {
   const {
     project,
     trackers,
@@ -99,6 +106,10 @@ export function PointsPanel() {
     latestJobFor,
     tracks,
     invalidateTrack,
+    overlays,
+    overlaysFor,
+    setTrackOverlay,
+    trackOverrides,
   } = useProjectContext();
 
   const [runLimit, setRunLimit] = useState<RunLimit>("keyframe");
@@ -122,6 +133,11 @@ export function PointsPanel() {
 
   async function handleDelete(pointId: string) {
     await api.deletePoint(project.id, pointId);
+    // Drop the cached track with it. Without this the path stayed in state and
+    // was drawn again the moment a new point took the same id — the client half
+    // of "when I delete a point and add a new one back it restores the previous
+    // track". The server sweeps its files; this sweeps ours.
+    invalidateTrack(pointId);
     if (selectedPointId === pointId) setSelectedPointId(null);
     await refresh();
   }
@@ -159,17 +175,17 @@ export function PointsPanel() {
   return (
     <div className="panel points-panel">
       <div className="panel__header">
-        <h3>Points</h3>
+        <h3>Tracks</h3>
         <button
           className={placingMode === "new-point" ? "button--active" : ""}
           onClick={() => setPlacingMode(placingMode === "new-point" ? "none" : "new-point")}
         >
-          {placingMode === "new-point" ? "Click video to place…" : "+ Add point"}
+          {placingMode === "new-point" ? "Click video to place…" : "+ Add track"}
         </button>
       </div>
 
       {project.points.length === 0 && (
-        <p className="panel__empty">No points yet. Click "Add point" then click on the video.</p>
+        <p className="panel__empty">No tracks yet. Click "Add track" then click on the video.</p>
       )}
 
       {/* Every point's patch on this frame, so "which one has drifted" is one
@@ -307,6 +323,37 @@ export function PointsPanel() {
                 >
                   + anchor
                 </button>
+              </div>
+
+              {/* What this track draws on the canvas (todo 9). The row above
+                  the canvas sets the defaults; these override them for this
+                  track alone, which is what makes a busy shot readable. A
+                  toggle showing the default is not "off", it is "same as
+                  everyone" — hence the tri-state title. */}
+              <div className="track-overlays" onClick={(e) => e.stopPropagation()}>
+                {OVERLAY_LABELS.map(([key, label, help]) => {
+                  const override = trackOverrides[point.id]?.[key];
+                  const active = overlaysFor(point.id)[key];
+                  return (
+                    <button
+                      key={key}
+                      className={`track-overlay ${active ? "track-overlay--on" : ""} ${
+                        override === undefined ? "" : "track-overlay--set"
+                      }`}
+                      title={`${help}
+${
+                        override === undefined
+                          ? `Following the default (${overlays[key] ? "shown" : "hidden"}) — click to override`
+                          : "Overridden for this track — click again to follow the default"
+                      }`}
+                      onClick={() =>
+                        setTrackOverlay(point.id, key, override === undefined ? !overlays[key] : null)
+                      }
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
 
               {/* The patches this point is tracked on (todo 14). Shown for

@@ -42,8 +42,6 @@ export function EditPanel() {
     selectedPointId,
     setSelectedPointId,
     tracks,
-    editing,
-    setEditing,
     dragMode,
     setDragMode,
     falloff,
@@ -155,16 +153,14 @@ export function EditPanel() {
 
       {editError && <div className="error-text">{editError}</div>}
 
-      <label className="channel-check edit-panel__toggle">
-        <input type="checkbox" checked={editing} onChange={(e) => setEditing(e.target.checked)} />
-        Click or drag points on the frame to correct them
-      </label>
-      {editing && (
-        <p className="modal__hint">
-          Select a point, then click its new location on the frame to move it there — or drag it
-          directly. Both apply the same correction below.
-        </p>
-      )}
+      {/* There is no edit *mode* any more (todo 25): the selected track is
+          always draggable and always click-to-move. What stays here is the
+          genuine choice — what a move means — plus undo, which is what makes
+          "always on" safe. */}
+      <p className="modal__hint">
+        Select a track, then click its new location on the frame to move it there — or drag it
+        directly. Both apply the correction below; Ctrl+Z undoes it.
+      </p>
 
       <div className="field-row">
         <label>Drag makes</label>

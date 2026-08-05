@@ -12,6 +12,7 @@ import * as api from "../api/client";
 import { useJobsSocket } from "../hooks/useJobsSocket";
 import { useLiveTracking, type LiveTracking } from "../hooks/useLiveTracking";
 import type {
+  ClipRangeInfo,
   Correction,
   HistoryStatus,
   JobEvent,
@@ -23,6 +24,45 @@ import type {
 export type PlacingMode = "none" | "new-point" | "add-anchor";
 
 /**
+ * Which overlay elements are drawn for a track.
+ *
+ * These used to be five global checkboxes above the canvas, which is the wrong
+ * granularity once a shot has several tracks: "hide the dotted trails" is
+ * usually "hide *that* track's trails", and hiding everything to see the frame
+ * loses the one track being worked on too. So the checkboxes remain as the
+ * defaults, and each track card can override them for itself.
+ */
+export interface Overlays {
+  /** The trail through the whole clip. */
+  paths: boolean;
+  /** Where the point is on this frame — independent of the trail. */
+  markers: boolean;
+  /** Anchor keyframe pins. */
+  anchors: boolean;
+  /** The before/after ghost a correction leaves. */
+  ghost: boolean;
+  /** The pattern and search boxes (selected track only). */
+  windows: boolean;
+}
+
+export const ALL_OVERLAYS: Overlays = {
+  paths: true,
+  markers: true,
+  anchors: true,
+  ghost: true,
+  windows: true,
+};
+
+/** Every overlay off — what "hide this track" resolves to. */
+export const NO_OVERLAYS: Overlays = {
+  paths: false,
+  markers: false,
+  anchors: false,
+  ghost: false,
+  windows: false,
+};
+
+/**
  * What a drag on the frame means.
  *
  * `offset` nudges the track and blends the nudge out over `falloff` frames
@@ -32,6 +72,19 @@ export type PlacingMode = "none" | "new-point" | "add-anchor";
  * is only which one gets appended.
  */
 export type DragMode = "offset" | "replace";
+
+/**
+ * What the canvas colours a track's path and current-frame marker by.
+ *
+ * The paths were always confidence-coloured, which is a genuinely useful signal
+ * — green means trust it, red means go and look — but it means every track on
+ * the frame is drawn from the same ramp and none of them can be told apart.
+ * Each point already *has* a colour (`pointColor`, used for its anchor pins,
+ * its timeline pins and its panel swatch); this is the switch that lets the
+ * path use it. The timeline's heat strip stays confidence-coloured either way,
+ * so the signal is never entirely given up.
+ */
+export type PathColor = "confidence" | "track";
 
 const EMPTY_HISTORY: HistoryStatus = {
   can_undo: false,
@@ -56,6 +109,34 @@ interface ProjectContextValue {
   setCurrentFrame: (frame: number) => void;
   isPlaying: boolean;
   setIsPlaying: (playing: boolean) => void;
+  /** Playback speed as a multiple of the clip's own frame rate (todo 3). */
+  playbackRate: number;
+  setPlaybackRate: (rate: number) => void;
+
+  // -- the working range: In/Out markers (todo 1) --
+  /** What tracking and export are limited to, or null before it has loaded. */
+  clipRange: ClipRangeInfo | null;
+  setRangeMarker: (marker: "in" | "out", frame: number) => Promise<void>;
+  clearRange: () => Promise<void>;
+  /**
+   * Jump the playhead to a marker.
+   *
+   * "out" lands on `out - 1`, the last frame *inside* the range: `out` is
+   * exclusive and names a frame that will be neither tracked nor exported,
+   * which is not where "go to the out point" means to land. Does nothing when
+   * no range is set — there is no marker to go to.
+   */
+  goToMarker: (marker: "in" | "out") => void;
+
+  // -- watching a run (todo 15) --
+  /**
+   * Whether the viewer follows a running tracker's cursor.
+   *
+   * It releases the moment the operator scrubs: a view that fights the pointer
+   * is worse than one that does not follow at all.
+   */
+  followTracker: boolean;
+  setFollowTracker: (on: boolean) => void;
 
   selectedPointId: string | null;
   setSelectedPointId: (id: string | null) => void;
@@ -77,14 +158,40 @@ interface ProjectContextValue {
   stabilizedPreview: boolean;
   setStabilizedPreview: (on: boolean) => void;
 
+  // -- overlay visibility (todos 7, 10; per track, todo 9) --
+  /** The defaults every track uses unless it says otherwise. */
+  overlays: Overlays;
+  setOverlays: (next: Overlays) => void;
+  /** Master switch: no track draws anything while this is off. */
+  overlaysEnabled: boolean;
+  setOverlaysEnabled: (on: boolean) => void;
+  /** What to draw for one track, after its own overrides and the master switch. */
+  overlaysFor: (pointId: string) => Overlays;
+  /** Override one element for one track (`null` restores the default). */
+  setTrackOverlay: (pointId: string, element: keyof Overlays, value: boolean | null) => void;
+  /** Whether a track has any override of its own, i.e. whether "reset" does anything. */
+  trackOverrides: Record<string, Partial<Overlays>>;
+  /**
+   * What colours a track's path and marker on the canvas.
+   *
+   * `confidence` is the red→amber→green quality ramp, which answers "is this
+   * track any good" but paints every track the same. `track` uses the point's
+   * own colour, which is the only way to tell several tracks apart on one
+   * frame. Both are wanted; neither can be both (todo 5, second round).
+   */
+  pathColor: PathColor;
+  setPathColor: (mode: PathColor) => void;
+
   tracks: Record<string, TrackData>;
   loadTrack: (pointId: string) => Promise<void>;
   invalidateTrack: (pointId: string) => void;
 
   // -- manual editing (Phase 5) --
-  /** Whether dragging a point on the frame edits it (vs. only scrubbing). */
-  editing: boolean;
-  setEditing: (on: boolean) => void;
+  //
+  // There is no `editing` flag: correcting a track used to be a mode you had to
+  // enter, which meant the commonest action in the app was two actions (todo
+  // 25). The selected track is now always editable, and undo is what makes that
+  // safe. What remains is *what a move means*.
   dragMode: DragMode;
   setDragMode: (mode: DragMode) => void;
   /** Frames an offset correction blends out over, either side of its keyframe. */
@@ -126,15 +233,35 @@ export function ProjectProvider({
 }) {
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [trackers, setTrackers] = useState<TrackerInfo[]>([]);
-  const [currentFrame, setCurrentFrame] = useState(0);
+  const [currentFrame, setCurrentFrameState] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [clipRange, setClipRange] = useState<ClipRangeInfo | null>(null);
+  const [followTracker, setFollowTracker] = useState(true);
+  // Set by the follow-the-tracker effect so the setter below can tell its own
+  // scrubbing from the operator's (see `setCurrentFrame`).
+  const followingRef = useRef(false);
+
+  /**
+   * Move the playhead, and stop following the tracker if it was the operator
+   * who moved it. Everything scrubs through here, so "following releases on
+   * the first manual scrub" is one rule in one place rather than a flag every
+   * caller has to remember.
+   */
+  const setCurrentFrame = useCallback((frame: number) => {
+    if (!followingRef.current) setFollowTracker(false);
+    setCurrentFrameState(frame);
+  }, []);
   const [selectedPointId, setSelectedPointId] = useState<string | null>(null);
   const [placingMode, setPlacingMode] = useState<PlacingMode>("none");
   const [stabilizedPreview, setStabilizedPreview] = useState(false);
+  const [overlays, setOverlays] = useState<Overlays>(ALL_OVERLAYS);
+  const [overlaysEnabled, setOverlaysEnabled] = useState(true);
+  const [trackOverrides, setTrackOverrides] = useState<Record<string, Partial<Overlays>>>({});
+  const [pathColor, setPathColor] = useState<PathColor>("confidence");
   const [tracks, setTracks] = useState<Record<string, TrackData>>({});
   const trackRequests = useRef(new Set<string>());
 
-  const [editing, setEditing] = useState(false);
   const [dragMode, setDragMode] = useState<DragMode>("offset");
   const [falloff, setFalloff] = useState(8);
   const [history, setHistory] = useState<HistoryStatus>(EMPTY_HISTORY);
@@ -252,6 +379,93 @@ export function ProjectProvider({
   const undo = useCallback(() => step("undo"), [step]);
   const redo = useCallback(() => step("redo"), [step]);
 
+  // -- the working range (todo 1) ---------------------------------------------
+
+  const reloadRange = useCallback(async () => {
+    try {
+      setClipRange(await api.getClipRange(projectId));
+    } catch {
+      setClipRange(null);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void reloadRange();
+  }, [reloadRange]);
+
+  const setRangeMarker = useCallback(
+    async (marker: "in" | "out", frame: number) => {
+      setEditError(null);
+      try {
+        setClipRange(await api.updateClipRange(projectId, { [marker]: frame }));
+      } catch (err) {
+        setEditError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [projectId],
+  );
+
+  const clearRange = useCallback(async () => {
+    setEditError(null);
+    try {
+      setClipRange(await api.updateClipRange(projectId, { in: null, out: null }));
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : String(err));
+    }
+  }, [projectId]);
+
+  const goToMarker = useCallback(
+    (marker: "in" | "out") => {
+      if (!clipRange || clipRange.whole_clip) return;
+      setCurrentFrame(marker === "in" ? clipRange.in : Math.max(clipRange.in, clipRange.out - 1));
+    },
+    [clipRange, setCurrentFrame],
+  );
+
+  // -- following a run (todo 15) ----------------------------------------------
+  //
+  // The live cursor is already published (`useLiveTracking`); this is the
+  // viewer keeping up with it. Scrubbing manually turns it off — see
+  // `setCurrentFrame`, which is the only place that distinction is made.
+  useEffect(() => {
+    if (!followTracker) return;
+    const cursor = Object.values(liveTracking)
+      .map((live) => live.frame)
+      .filter((frame): frame is number => frame != null);
+    if (cursor.length === 0) return;
+    followingRef.current = true;
+    setCurrentFrameState(Math.max(...cursor));
+    // Cleared after the state update so a scrub in the same tick still counts
+    // as the operator's.
+    const id = setTimeout(() => {
+      followingRef.current = false;
+    }, 0);
+    return () => clearTimeout(id);
+  }, [followTracker, liveTracking]);
+
+  const overlaysFor = useCallback(
+    (pointId: string): Overlays => {
+      if (!overlaysEnabled) return NO_OVERLAYS;
+      return { ...overlays, ...(trackOverrides[pointId] ?? {}) };
+    },
+    [overlays, overlaysEnabled, trackOverrides],
+  );
+
+  const setTrackOverlay = useCallback(
+    (pointId: string, element: keyof Overlays, value: boolean | null) => {
+      setTrackOverrides((prev) => {
+        const current = { ...(prev[pointId] ?? {}) };
+        if (value === null) delete current[element];
+        else current[element] = value;
+        const next = { ...prev };
+        if (Object.keys(current).length === 0) delete next[pointId];
+        else next[pointId] = current;
+        return next;
+      });
+    },
+    [],
+  );
+
   // -- anchors ----------------------------------------------------------------
   //
   // Adding an anchor goes through `settle`, not a bare `refresh`. The pins live
@@ -344,6 +558,18 @@ export function ProjectProvider({
       } else if (event.key === "End") {
         event.preventDefault();
         setCurrentFrame(lastFrame);
+      } else if (event.key === "i" || event.key === "I") {
+        // In/Out from the playhead (todo 1) — the pair of keys every NLE uses.
+        // Shifted, they *go to* the marker instead of setting it, which is the
+        // same NLE convention and the answer to "where did I put the in point
+        // on this ten-minute take" (todo 3, second round).
+        event.preventDefault();
+        if (event.shiftKey) goToMarker("in");
+        else void setRangeMarker("in", currentFrame);
+      } else if (event.key === "o" || event.key === "O") {
+        event.preventDefault();
+        if (event.shiftKey) goToMarker("out");
+        else void setRangeMarker("out", currentFrame + 1);
       } else if (event.key === "a" || event.key === "A") {
         // Pin the selected point on this frame. Where it already has a
         // position that needs no aiming, so plain `A` just does it; with
@@ -390,6 +616,8 @@ export function ProjectProvider({
     tracks,
     placingMode,
     addAnchorHere,
+    setRangeMarker,
+    goToMarker,
     setCurrentFrame,
     setIsPlaying,
   ]);
@@ -441,6 +669,14 @@ export function ProjectProvider({
       setCurrentFrame,
       isPlaying,
       setIsPlaying,
+      playbackRate,
+      setPlaybackRate,
+      clipRange,
+      setRangeMarker,
+      clearRange,
+      goToMarker,
+      followTracker,
+      setFollowTracker,
       selectedPointId,
       setSelectedPointId,
       placingMode,
@@ -449,11 +685,18 @@ export function ProjectProvider({
       addAnchorAt,
       stabilizedPreview,
       setStabilizedPreview,
+      overlays,
+      setOverlays,
+      overlaysEnabled,
+      setOverlaysEnabled,
+      overlaysFor,
+      setTrackOverlay,
+      trackOverrides,
+      pathColor,
+      setPathColor,
       tracks,
       loadTrack,
       invalidateTrack,
-      editing,
-      setEditing,
       dragMode,
       setDragMode,
       falloff,
@@ -475,16 +718,28 @@ export function ProjectProvider({
     latestJobFor,
     liveTracking,
     currentFrame,
+    setCurrentFrame,
     isPlaying,
+    playbackRate,
+    clipRange,
+    setRangeMarker,
+    clearRange,
+    goToMarker,
+    followTracker,
     selectedPointId,
     placingMode,
     addAnchorHere,
     addAnchorAt,
     stabilizedPreview,
+    overlays,
+    overlaysEnabled,
+    overlaysFor,
+    setTrackOverlay,
+    trackOverrides,
+    pathColor,
     tracks,
     loadTrack,
     invalidateTrack,
-    editing,
     dragMode,
     falloff,
     history,

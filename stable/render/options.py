@@ -49,13 +49,14 @@ __all__ = [
     "TARGET_MODES",
     "CROP_CENTRES",
     "StabilizationTarget",
+    "TargetPair",
     "CropSpec",
     "RenderOptions",
     "average_positions",
     "hold_gaps",
 ]
 
-TARGET_MODES: tuple[str, ...] = ("frame", "centroid", "point")
+TARGET_MODES: tuple[str, ...] = ("frame", "centroid", "point", "map")
 """What the render holds still.
 
 ``frame``
@@ -64,8 +65,62 @@ TARGET_MODES: tuple[str, ...] = ("frame", "centroid", "point")
 ``centroid``
     The average position of every solve-enabled tracked point.
 ``point``
-    One named point.
+    One named point, held wherever it sat on the anchor frame.
+``map``
+    Named points held at positions the operator *chose* — one pair per point.
+    One pair is "put this feature here" (a translation, and the same thing
+    ``point`` does with the destination picked for you). Two or more are "put
+    this here **and** that there", which a translation cannot do: the fit then
+    uses rotation and scale as well, which is how mapping two tracked points
+    onto two chosen positions compensates for a rotating, zooming camera.
 """
+
+
+@dataclass(frozen=True)
+class TargetPair:
+    """One tracked point and where the output should hold it.
+
+    Args:
+        point_id: The tracked point being mapped.
+        x: Destination x in **output** pixels.
+        y: Destination y in output pixels.
+
+    Raises:
+        RenderError: If the point id is empty or the destination is not finite.
+    """
+
+    point_id: str
+    x: float
+    y: float
+
+    def __post_init__(self) -> None:
+        """Validate the pair (dataclass hook)."""
+        if not self.point_id:
+            raise RenderError("a stabilisation target pair needs a point_id")
+        for name in ("x", "y"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise RenderError(f"target pair {name} must be finite, got {getattr(self, name)!r}")
+            object.__setattr__(self, name, value)
+
+    @property
+    def position(self) -> tuple[float, float]:
+        """The destination as an ``(x, y)`` tuple."""
+        return (self.x, self.y)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe dict form."""
+        return {"point_id": self.point_id, "x": self.x, "y": self.y}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TargetPair:
+        """Rebuild from :meth:`to_dict` output."""
+        return cls(
+            point_id=str(data.get("point_id") or ""),
+            x=float(data.get("x", 0.0)),
+            y=float(data.get("y", 0.0)),
+        )
+
 
 CROP_CENTRES: tuple[str, ...] = ("frame", "target")
 """Where the output rectangle is centred: the frame's centre, or the target's."""
@@ -81,15 +136,18 @@ class StabilizationTarget:
         anchor_frame: The frame whose target position is held. ``None`` uses the
             solve's reference frame, so "stabilise onto this point" keeps the
             framing the operator chose their reference on rather than inventing
-            a new one.
+            a new one. Unused by ``map``, which states its destinations outright.
+        pairs: The point-to-destination pairs, when ``mode`` is ``"map"``.
 
     Raises:
-        RenderError: If the mode is unknown, or ``point`` names no point.
+        RenderError: If the mode is unknown, ``point`` names no point, or
+            ``map`` has no pairs or names the same point twice.
     """
 
     mode: str = "frame"
     point_id: str | None = None
     anchor_frame: int | None = None
+    pairs: tuple[TargetPair, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the mode (dataclass hook)."""
@@ -101,15 +159,42 @@ class StabilizationTarget:
             raise RenderError("stabilisation target 'point' needs a point_id")
         if self.anchor_frame is not None and int(self.anchor_frame) < 0:
             raise RenderError(f"anchor_frame must be >= 0, got {self.anchor_frame}")
+        object.__setattr__(self, "pairs", tuple(self.pairs))
+        if self.mode == "map":
+            if not self.pairs:
+                raise RenderError(
+                    "a 'map' stabilisation target needs at least one point-to-target pair"
+                )
+            ids = [pair.point_id for pair in self.pairs]
+            if len(set(ids)) != len(ids):
+                raise RenderError(
+                    f"each point can be mapped to one target position; got duplicates in {ids}"
+                )
 
     @property
     def is_active(self) -> bool:
         """Whether this target adds anything to the smoothing's own warp."""
         return self.mode != "frame"
 
+    @property
+    def uses_rotation_and_scale(self) -> bool:
+        """Whether this target can rotate/scale the picture, not only shift it.
+
+        One correspondence is a translation however it is solved; two or more
+        are what make a mapping compensate for camera rotation and zoom. The
+        export screen says which of the two the operator has asked for, because
+        the difference is not visible in the controls.
+        """
+        return self.mode == "map" and len(self.pairs) >= 2
+
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-safe dict form."""
-        return {"mode": self.mode, "point_id": self.point_id, "anchor_frame": self.anchor_frame}
+        return {
+            "mode": self.mode,
+            "point_id": self.point_id,
+            "anchor_frame": self.anchor_frame,
+            "pairs": [pair.to_dict() for pair in self.pairs],
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> StabilizationTarget:
@@ -117,10 +202,12 @@ class StabilizationTarget:
         if not data:
             return cls()
         anchor = data.get("anchor_frame")
+        raw_pairs = data.get("pairs") or []
         return cls(
             mode=str(data.get("mode", "frame")),
             point_id=(str(data["point_id"]) if data.get("point_id") else None),
             anchor_frame=(None if anchor is None else int(anchor)),
+            pairs=tuple(TargetPair.from_dict(p) for p in raw_pairs if isinstance(p, dict)),
         )
 
 

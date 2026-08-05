@@ -42,8 +42,10 @@ no GPU, no model download, nothing to configure — so there is something
 concrete to look at within seconds of installing.
 
 In the viewer: `←`/`→` step a frame, space plays, `↑`/`↓` jump between the
-selected point's keyframes, `A` pins it where it is on this frame (`⇧A` to
-click the position instead), `+`/`-`/`0` and the wheel zoom, middle-drag pans.
+selected track's keyframes, `A` pins it where it is on this frame (`⇧A` to
+click the position instead), `I`/`O` set the working range, `+`/`-`/`0` and the
+wheel zoom, middle-drag pans. Correcting a track needs no mode: select it and
+click or drag on the frame (`Ctrl+Z` undoes).
 Each point's **pattern** and **search** sizes are per point, set on the sliders
 beside its patch thumbnails and drawn on the frame as a solid and a dashed box,
 so a feature bigger than the tracker's default window is a slider away rather
@@ -211,6 +213,10 @@ trackers' model code) — the frontend is already built into the package
 | `stable.render.warp` | The per-frame affine and the three border policies |
 | `stable.render.stabilize` | Planning a render, streaming it to a file or PNG sequence |
 | `stable.server.tracker_options` | Per-point pattern/search sizes: which arguments a plugin lets the operator set, in what units |
+| `stable.server.clip_range` | The In/Out markers, bounding both tracking and export |
+| `stable.trackers.frames` | The bounded per-run cache of colour-converted frames |
+| `stable.trackers.features` | SIFT / ORB feature matching — survives an occlusion instead of drifting through it |
+| `stable.trackers.sam3` | SAM 3 (Meta): segments the object and rides the point on it |
 | `stable.server.app` | The FastAPI app: routing, static frontend, packaged-vs-source dist resolution |
 | `stable.server.jobs` | The background job queue + WebSocket progress, incl. model downloads |
 | `stable.server.routes.models` | Model checkpoint list / download / delete, the UI's model manager backend |

@@ -511,12 +511,37 @@ class Project:
         raise ProjectError(f"no point with id {point_id!r}")
 
     def new_point_id(self) -> str:
-        """Return an unused ``pN`` identifier for a newly placed point."""
+        """Return a ``pN`` identifier that this project has not used before.
+
+        Deliberately *not* the lowest free number. Point ids key files on disk
+        (``tracks/p1.npz``, its report, its retrack runs) and caches in the
+        browser, so recycling one meant a newly placed point inherited the dead
+        one's track — which is exactly how it was reported: "when I delete a
+        point and add a new one back it restores the previous track".
+
+        Deleting every artefact is the real fix (see
+        :func:`stable.server.routes.points.delete_point`); counting past the
+        highest id in use is the belt to its braces, and it costs nothing — the
+        first point is still ``p1``, and the numbering only skips where
+        something *was*. The counter is derived rather than stored, so emptying
+        a project does start again at ``p1``; that is safe precisely because
+        deleting a point now takes its files with it.
+        """
         used = {p.id for p in self.points}
-        index = 1
-        while f"p{index}" in used:
+        index = max((self._point_number(p.id) for p in self.points), default=0) + 1
+        while f"p{index}" in used:  # pragma: no cover - only a hand-edited file
             index += 1
         return f"p{index}"
+
+    @staticmethod
+    def _point_number(point_id: str) -> int:
+        """Return the ``N`` in a ``pN`` id, or 0 for an id in any other shape."""
+        if not point_id.startswith("p"):
+            return 0
+        try:
+            return int(point_id[1:])
+        except ValueError:
+            return 0
 
     def validate(self) -> None:
         """Check cross-field invariants that per-field validation cannot see.

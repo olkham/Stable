@@ -113,9 +113,87 @@ def _target_transforms(
     for frame, warp in enumerate(warps):
         moved = warp.apply(path[frame])
         offset = held - moved
-        out.append(
-            SimilarityTransform(tx=float(offset[0]), ty=float(offset[1])).compose(warp)
+        out.append(SimilarityTransform(tx=float(offset[0]), ty=float(offset[1])).compose(warp))
+    return out
+
+
+def _mapped_transforms(
+    warps: Sequence[SimilarityTransform],
+    sources: np.ndarray,
+    destinations: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> list[SimilarityTransform]:
+    """Compose the similarity that puts each tracked point on its chosen target.
+
+    The generalisation of :func:`_target_transforms`, and the reason it is worth
+    having: pinning *one* point can only translate the picture, so a shot that
+    rotates or zooms still rotates and zooms around it. Given two or more
+    point-to-target pairs, the transform that satisfies them **is** the
+    rotation and scale the shot needs::
+
+        q_k(t) = W(t) . p_k(t)                 # where the base warp puts point k
+        S(t)   = argmin_S sum_k w_k |S q_k(t) - g_k|^2
+        plan(t) = S(t) . W(t)
+
+    ``S`` is the weighted Umeyama fit — the same
+    :func:`~stable.solver.similarity.solve_similarity` the camera solve uses,
+    not a second implementation of it — and it is composed **on top of** the
+    sanctioned warp exactly as the single-target lock is, so nothing here
+    reconstructs a transform from channel values.
+
+    With one pair the fit degrades to a pure translation (rotation and scale are
+    unobservable from a single correspondence), which is precisely the
+    single-target behaviour. With three or more it is least-squares: a
+    similarity generally cannot satisfy them all, and the residual per pair is
+    reported rather than hidden — see
+    :func:`stable.server.motion.target_residuals`.
+
+    Args:
+        warps: The base stabilisation warp per frame.
+        sources: ``[K, T, 2]`` tracked paths in source pixels, gaps already held.
+        destinations: ``[K, 2]`` chosen positions in output pixels.
+        weights: Optional ``[K, T]`` per-frame confidences.
+
+    Returns:
+        One transform per frame.
+
+    Raises:
+        RenderError: If the shapes disagree or no pair is given.
+    """
+    from ..solver.similarity import solve_similarity  # noqa: PLC0415 - avoids an import cycle
+
+    src = np.asarray(sources, dtype=np.float64)
+    dst = np.asarray(destinations, dtype=np.float64).reshape(-1, 2)
+    if src.ndim != 3 or src.shape[0] == 0 or src.shape[2] != 2:
+        raise RenderError(f"mapped targets need a [K, T, 2] source array, got {src.shape}")
+    if src.shape[0] != dst.shape[0]:
+        raise RenderError(
+            f"{src.shape[0]} mapped tracks against {dst.shape[0]} target positions; "
+            "every pair needs both halves"
         )
+    if src.shape[1] < len(warps):
+        raise RenderError(
+            f"the stabilisation targets cover {src.shape[1]} frames but the render plans "
+            f"{len(warps)}; the target tracks were made from a different clip"
+        )
+
+    all_weights = None if weights is None else np.asarray(weights, dtype=np.float64)
+    out: list[SimilarityTransform] = []
+    for frame, warp in enumerate(warps):
+        moved = warp.apply(src[:, frame, :])
+        frame_weights: np.ndarray | None = None
+        if all_weights is not None:
+            candidate = all_weights[:, frame]
+            # Confidence weights the fit — except where there is no confidence
+            # to go on. Outside the tracked span every pair scores zero, and a
+            # zero-sum weighting is not "trust nobody", it is "no information":
+            # the plan still has to produce a transform for those frames, so
+            # they fall back to trusting the pairs equally. Without this the
+            # whole render fails on the first untracked frame.
+            if np.isfinite(candidate).all() and candidate.sum() > 0.0:
+                frame_weights = candidate
+        fit = solve_similarity(moved, dst, frame_weights)
+        out.append(fit.compose(warp))
     return out
 
 
@@ -153,6 +231,9 @@ class StabilizationPlan:
         background: tuple[int, int, int] = (0, 0, 0),
         target_positions: np.ndarray | None = None,
         anchor_frame: int | None = None,
+        mapped_sources: np.ndarray | None = None,
+        mapped_destinations: np.ndarray | None = None,
+        mapped_weights: np.ndarray | None = None,
         crop: CropSpec | None = None,
         fill: BorderFill | None = None,
     ) -> StabilizationPlan:
@@ -173,6 +254,13 @@ class StabilizationPlan:
                 to make the correction lurch.
             anchor_frame: Frame whose target position is held; defaults to the
                 solve's reference frame, so the framing does not move.
+            mapped_sources: ``[K, T, 2]`` tracked paths for a ``map`` target,
+                mutually exclusive with ``target_positions``.
+            mapped_destinations: ``[K, 2]`` chosen output positions for those
+                paths. Two or more pairs is what lets the plan use rotation and
+                scale rather than only translation — see
+                :func:`_mapped_transforms`.
+            mapped_weights: Optional ``[K, T]`` confidences for the fit.
             crop: How much of the frame the output keeps; ``None`` is the exact
                 minimal gapless crop.
             fill: What goes in the uncovered area.
@@ -188,7 +276,16 @@ class StabilizationPlan:
         width, height = int(source_size[0]), int(source_size[1])
         warps: Sequence[SimilarityTransform] = motion.stabilization_transforms()
         target_centre: tuple[float, float] | None = None
-        if target_positions is not None:
+        if mapped_sources is not None and mapped_destinations is not None:
+            held_paths = np.stack([hold_gaps(path) for path in np.asarray(mapped_sources)])
+            warps = _mapped_transforms(
+                warps, held_paths, mapped_destinations, weights=mapped_weights
+            )
+            # The destinations are already where the operator wants the picture
+            # framed, so a "crop around the target" centres on them.
+            centroid = np.asarray(mapped_destinations, dtype=np.float64).reshape(-1, 2).mean(axis=0)
+            target_centre = (float(centroid[0]), float(centroid[1]))
+        elif target_positions is not None:
             held_path = hold_gaps(target_positions)
             frame = motion.reference_frame if anchor_frame is None else int(anchor_frame)
             warps = _target_transforms(warps, held_path, frame)
@@ -350,9 +447,13 @@ def iter_stabilized_frames(
     Raises:
         RenderError: If the range is invalid or reaches past the plan.
     """
-    start, end = (0, plan.n_frames) if frame_range is None else (
-        int(frame_range[0]),
-        int(frame_range[1]),
+    start, end = (
+        (0, plan.n_frames)
+        if frame_range is None
+        else (
+            int(frame_range[0]),
+            int(frame_range[1]),
+        )
     )
     if end <= start:
         raise RenderError(f"frame_range must be non-empty, got [{start}, {end})")
@@ -498,7 +599,14 @@ def render_stabilized(
             "border for a video file"
         )
 
-    start, end = (0, plan.n_frames) if frame_range is None else frame_range
+    start, end = (
+        (0, plan.n_frames)
+        if frame_range is None
+        else (
+            int(frame_range[0]),
+            int(frame_range[1]),
+        )
+    )
     return export_video(
         frames,
         target,
@@ -506,8 +614,32 @@ def render_stabilized(
         codec=codec,
         crf=crf,
         audio_source=audio_source,
-        frame_count=int(end) - int(start),
+        audio_range=_audio_window(video, plan, start, end),
+        frame_count=end - start,
     )
+
+
+def _audio_window(
+    video: VideoSource, plan: StabilizationPlan, start: int, end: int
+) -> tuple[float, float] | None:
+    """Return the seconds of source audio a render of ``[start, end)`` should carry.
+
+    ``None`` when the render covers the whole clip, so the untrimmed path stays
+    exactly what it was rather than merely equivalent to it. Anything narrower
+    has to trim: a container's duration is the longer of its streams, so a full
+    audio track behind a partial video one leaves a player holding the last
+    frame for the remainder (see :mod:`stable.video.encode`).
+
+    The window is measured on the *source's* frame rate, since that is the
+    timeline the audio was recorded against — an ``fps`` override changes how
+    fast the output plays, not where the sound was.
+    """
+    fps = float(video.fps)
+    if fps <= 0.0:  # pragma: no cover - a clip with no declared rate
+        return None
+    if start <= 0 and end >= plan.n_frames:
+        return None
+    return (start / fps, end / fps)
 
 
 def stabilize(

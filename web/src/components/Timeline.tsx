@@ -28,6 +28,20 @@ interface AnchorIntegrity {
  * and in red when one reached them and disagreed — "this keyframe was never
  * hit, go look at it".
  */
+/** Playback speeds offered, as multiples of the clip's own frame rate. */
+const PLAYBACK_RATES = [0.25, 0.5, 1, 2, 4];
+
+/**
+ * Why the range and the solve can disagree.
+ *
+ * The solve is measured *from* its reference frame, so a reference frame
+ * outside the In/Out range has no tracked points on it and the solve refuses
+ * (with a message saying so). Surfacing it here is cheaper than discovering it
+ * from a failed job.
+ */
+const RANGE_HELP =
+  "Tracking and export are limited to these frames. Keep the solve's reference frame inside the range, or the solve will have no tracked points to measure from.";
+
 export function Timeline() {
   const {
     project,
@@ -35,6 +49,12 @@ export function Timeline() {
     setCurrentFrame,
     isPlaying,
     setIsPlaying,
+    playbackRate,
+    setPlaybackRate,
+    clipRange,
+    setRangeMarker,
+    clearRange,
+    goToMarker,
     selectedPointId,
     tracks,
     liveTracking,
@@ -43,6 +63,10 @@ export function Timeline() {
   const wrapRef = useRef<HTMLDivElement>(null);
   const frames = Math.max(project.video.frames, 1);
   const selectedTrack = selectedPointId ? tracks[selectedPointId] : undefined;
+  // The range when one is actually in force, else null — "the markers happen to
+  // sit at the ends of the clip" and "there are no markers" are different
+  // states, and only the first has anything to jump to.
+  const ranged = clipRange && !clipRange.whole_clip ? clipRange : null;
 
   // Keyframes per point that no run reached, and the full ground-truth list
   // (pins plus the keyframes manual corrections were promoted to, so a drag
@@ -66,26 +90,40 @@ export function Timeline() {
     return out;
   }, [project.points, tracks]);
 
-  // Playback loop, paced by the source video's fps. Reads the current frame
-  // from a ref (not the `currentFrame` closure) so the interval does not need
-  // to be torn down and rebuilt on every single frame advance.
+  // Playback loop (todo 3). Two changes from the old `setInterval` at the
+  // clip's own fps: the rate is the operator's to choose, and the pacing is
+  // *time-based*. An interval that cannot keep up silently falls behind — at
+  // 2x on a big clip it would claim 48 fps and deliver 20 — so the elapsed time
+  // decides how many frames to advance, dropping frames rather than drifting.
+  // The current frame is read from a ref so the loop is not rebuilt on every
+  // advance.
   const frameRef = useRef(currentFrame);
   frameRef.current = currentFrame;
   useEffect(() => {
     if (!isPlaying) return;
-    const fps = project.video.fps || 24;
-    const id = setInterval(() => {
-      const next = frameRef.current + 1;
-      if (next >= project.video.frames) {
-        setIsPlaying(false);
-        setCurrentFrame(0);
-      } else {
+    const fps = Math.max(1, (project.video.fps || 24) * playbackRate);
+    let raf = 0;
+    let last = performance.now();
+    let carry = 0;
+    const step = (now: number) => {
+      const advance = Math.floor((carry + ((now - last) * fps) / 1000) % 1e6);
+      carry += ((now - last) * fps) / 1000 - advance;
+      last = now;
+      if (advance > 0) {
+        const next = frameRef.current + advance;
+        if (next >= project.video.frames) {
+          setIsPlaying(false);
+          setCurrentFrame(0);
+          return;
+        }
         setCurrentFrame(next);
       }
-    }, 1000 / fps);
-    return () => clearInterval(id);
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, project.video.fps, project.video.frames]);
+  }, [isPlaying, project.video.fps, project.video.frames, playbackRate]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -168,6 +206,27 @@ export function Timeline() {
       }
     }
 
+    // Everything outside the In/Out range is dimmed: it is not going to be
+    // tracked and will not be exported, and that should be visible at a glance
+    // rather than only in a panel.
+    if (clipRange && !clipRange.whole_clip) {
+      ctx.save();
+      ctx.fillStyle = "rgba(0, 0, 0, 0.62)";
+      const inX = (clipRange.in / frames) * width;
+      const outX = (clipRange.out / frames) * width;
+      ctx.fillRect(0, 0, inX, height);
+      ctx.fillRect(outX, 0, width - outX, height);
+      ctx.strokeStyle = "#4da3ff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(inX, 0);
+      ctx.lineTo(inX, height);
+      ctx.moveTo(outX, 0);
+      ctx.lineTo(outX, height);
+      ctx.stroke();
+      ctx.restore();
+    }
+
     // Playhead.
     const px = (currentFrame / frames) * width;
     ctx.strokeStyle = "#fff";
@@ -185,6 +244,7 @@ export function Timeline() {
     flagged,
     anchorFrames,
     liveTracking,
+    clipRange,
   ]);
 
   function seekFromEvent(evt: React.MouseEvent<HTMLDivElement>) {
@@ -210,7 +270,57 @@ export function Timeline() {
             if (!Number.isNaN(v)) setCurrentFrame(Math.max(0, Math.min(frames - 1, v)));
           }}
         />
-        <span className="timeline__fps">{project.video.fps.toFixed(2)} fps</span>
+        <select
+          className="timeline__rate"
+          value={playbackRate}
+          onChange={(e) => setPlaybackRate(Number(e.target.value))}
+          title="Playback speed. The clip's own frame rate is 1x."
+        >
+          {PLAYBACK_RATES.map((rate) => (
+            <option key={rate} value={rate}>
+              {rate}x
+            </option>
+          ))}
+        </select>
+        <span className="timeline__fps">
+          {(project.video.fps * playbackRate).toFixed(1)} fps
+          {playbackRate !== 1 && ` (clip is ${project.video.fps.toFixed(2)})`}
+        </span>
+        {/* In/Out markers (todo 1): what tracking and export are limited to.
+            Setting them was never the hard part — finding them again on a long
+            clip was, so each one also has a "go there" button beside it. */}
+        <span className="timeline__range">
+          <button onClick={() => void setRangeMarker("in", currentFrame)} title="Set the in point to this frame (I)">
+            [ In
+          </button>
+          <button
+            className="timeline__goto"
+            onClick={() => goToMarker("in")}
+            disabled={!ranged}
+            title="Go to the in point (⇧I)"
+          >
+            ⇤
+          </button>
+          <button
+            className="timeline__goto"
+            onClick={() => goToMarker("out")}
+            disabled={!ranged}
+            title="Go to the last frame inside the range (⇧O)"
+          >
+            ⇥
+          </button>
+          <button onClick={() => void setRangeMarker("out", currentFrame + 1)} title="Set the out point to this frame (O)">
+            Out ]
+          </button>
+          <span className="timeline__range-label" title={RANGE_HELP}>
+            {ranged ? `${ranged.in}–${ranged.out - 1} (${ranged.frames}f)` : "whole clip"}
+          </span>
+          {ranged && (
+            <button onClick={() => void clearRange()} title="Track and export the whole clip again">
+              reset
+            </button>
+          )}
+        </span>
       </div>
       <div
         ref={wrapRef}

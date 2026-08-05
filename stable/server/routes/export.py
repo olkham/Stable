@@ -27,8 +27,11 @@ import csv
 import io
 import json
 import math
+import time
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 
@@ -38,6 +41,7 @@ from ...core.trackdata import AE_FORMAT, after_effects_keyframes
 from ...render.stabilize import render_stabilized
 from ...video.encode import AudioPlan, plan_audio
 from .. import motion as motion_glue
+from ..clip_range import effective_range
 from ..jobs import JobManager, get_job_manager
 from ..schemas import ExportVideoRequest
 from ..storage import Workspace, get_workspace
@@ -56,6 +60,41 @@ NO_OP_DETAIL = (
 """Why an all-identity export is refused, and the two ways to fix it."""
 
 router = APIRouter(prefix="/projects/{project_id}/export", tags=["export"])
+
+RENDER_PREFIX = "stabilized"
+"""Stem every auto-named render starts with."""
+
+
+def unique_render_name(directory: Path, requested: str | None) -> str:
+    """Return a render filename that does not already exist in ``directory``.
+
+    Args:
+        directory: The project's ``renders/`` directory (need not exist yet).
+        requested: What the operator asked for, or ``None`` for an automatic
+            ``stabilized-YYYYmmdd-HHMMSS.mp4``.
+
+    Returns:
+        A ``.mp4`` filename, suffixed ``-2``, ``-3``… if that name is taken.
+
+    An export is minutes of work and the thing you compare against the last one,
+    so a name collision must not silently destroy the previous file. Timestamps
+    make that rare; the suffix makes it impossible.
+    """
+    stem = (requested or f"{RENDER_PREFIX}-{time.strftime('%Y%m%d-%H%M%S')}").strip()
+    if stem.endswith(".mp4"):
+        stem = stem[: -len(".mp4")]
+    stem = stem or RENDER_PREFIX
+    candidate = f"{stem}.mp4"
+    index = 2
+    while (directory / candidate).exists():
+        candidate = f"{stem}-{index}.mp4"
+        index += 1
+    return candidate
+
+
+def _render_range(workspace: Workspace, project_id: str, total: int) -> tuple[int, int]:
+    """Return the frames an export should write: the In/Out range, or all of them."""
+    return effective_range(workspace.project_dir(project_id), total)
 
 
 def _workspace() -> Workspace:
@@ -246,7 +285,7 @@ def export_video_route(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if planned.is_no_op:
         raise HTTPException(status_code=400, detail=NO_OP_DETAIL)
-    filename = body.filename if body.filename.endswith(".mp4") else f"{body.filename}.mp4"
+    filename = unique_render_name(workspace.renders_dir(project_id), body.filename)
 
     def _run(progress: Any) -> dict[str, Any]:
         proj = workspace.load_project(project_id)
@@ -258,6 +297,7 @@ def export_video_route(
         plan = motion_glue.build_plan(
             proj, smoothed, options=solve_routes.load_options(workspace, project_id)
         )
+        render_range = _render_range(workspace, project_id, min(plan.n_frames, video.frame_count))
         out_dir = workspace.renders_dir(project_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / filename
@@ -273,11 +313,17 @@ def export_video_route(
             codec=body.codec,
             crf=body.crf,
             audio_source=source_clip,
-            frame_range=(0, min(plan.n_frames, video.frame_count)),
+            # The In/Out markers, or the whole clip when none are set (todo
+            # 1). The plan still covers every frame — the warp for frame N is
+            # the warp for frame N whatever is written out — so this narrows the
+            # *render*, not the stabilisation.
+            frame_range=render_range,
             progress=progress,
         )
         return {
             "filename": filename,
+            "frame_range": list(render_range),
+            "frames": render_range[1] - render_range[0],
             "border": plan.border,
             "zoom": plan.geometry.zoom,
             "width": plan.geometry.width,
@@ -323,9 +369,136 @@ def list_renders(
     files = [p for p in directory.iterdir() if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [
-        {"filename": p.name, "bytes": p.stat().st_size, "modified_at": p.stat().st_mtime}
+        {
+            "filename": p.name,
+            "bytes": p.stat().st_size,
+            "modified_at": p.stat().st_mtime,
+            "url": f"/api/projects/{project_id}/export/download/{p.name}",
+        }
         for p in files
     ]
+
+
+@router.get("/preview")
+def export_preview(
+    project_id: str,
+    frame: int = 0,
+    workspace: Workspace = Depends(_workspace),
+) -> dict[str, Any]:
+    """Describe what the current export settings would produce, without rendering.
+
+    Everything the export screen draws comes from here, and all of it is
+    *planned* rather than rendered — no pixels are touched, so this is cheap
+    enough to re-ask on every drag of a target.
+
+    Returns:
+        ``output``/``source`` sizes; ``rect``, the output rectangle mapped back
+        into source pixels so the screen can draw it over the frame; the
+        measured ``coverage``, requested ``crop_scale`` and whether the fill
+        will be visible (``gaps``); ``max_displacement`` and ``is_no_op``, which
+        say whether this is a stabilisation at all; and ``targets``, one row per
+        mapped point saying where it lands and by how much it misses.
+
+    Raises:
+        HTTPException: 409 if the project has not been solved and smoothed yet
+            (there is nothing to preview), 400 if the options cannot be planned.
+    """
+    project = workspace.load_project(project_id)
+    motion = solve_routes.load_smoothed(workspace, project_id, project)
+    if motion is None:
+        raise HTTPException(
+            status_code=409,
+            detail="solve and smooth this project before previewing the export",
+        )
+    options = solve_routes.load_options(workspace, project_id)
+    try:
+        plan = motion_glue.build_plan(project, motion, options=options)
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    total = len(plan.transforms)
+    index = max(0, min(int(frame), total - 1)) if total else 0
+    geometry = plan.geometry
+    output_transform = plan.output_transform(index)
+    corners = [
+        [0.0, 0.0],
+        [float(geometry.width), 0.0],
+        [float(geometry.width), float(geometry.height)],
+        [0.0, float(geometry.height)],
+    ]
+    # Where the output rectangle sits *on the source frame*: the inverse of the
+    # transform that put the source there. This is what makes the preview an
+    # answer to "what will be kept?" rather than a picture of the same frame.
+    inverse = output_transform.inverse()
+    rect = [[float(x), float(y)] for x, y in inverse.apply(np.asarray(corners))]
+
+    # A mapped target's destination is stated in the space the stabilisation
+    # warp lands in — *before* the crop/zoom fit, which cannot be known until
+    # after the transforms exist. The screen draws and drags in source pixels,
+    # so it needs that warp itself; four numbers describe it exactly, and
+    # sending them beats the screen inferring it from the output rectangle
+    # (which carries the fit, and so would place every crosshair slightly off
+    # whenever the render crops).
+    warp = plan.transforms[index] if plan.transforms else output_transform
+    return {
+        "frame": index,
+        "frames": total,
+        "source": {"width": plan.source_size[0], "height": plan.source_size[1]},
+        "output": {"width": geometry.width, "height": geometry.height},
+        "rect": rect,
+        "warp": {
+            "tx": float(warp.tx),
+            "ty": float(warp.ty),
+            "rotation": float(warp.rotation),
+            "scale": float(warp.scale),
+        },
+        "coverage": float(geometry.coverage),
+        "crop_scale": float(geometry.crop_scale),
+        "zoom": float(geometry.zoom),
+        "gaps": bool(geometry.gaps),
+        "border": geometry.border,
+        "max_displacement": float(plan.max_displacement),
+        "is_no_op": bool(plan.is_no_op),
+        "no_op_detail": NO_OP_DETAIL if plan.is_no_op else None,
+        "target": options.target.to_dict(),
+        # Two or more pairs is what turns a translation into a mapping that can
+        # rotate and scale; the screen says which the operator has asked for.
+        "uses_rotation_and_scale": bool(options.target.uses_rotation_and_scale),
+        "targets": motion_glue.target_residuals(project, plan, options.target, index),
+    }
+
+
+@router.delete("/renders/{filename}")
+def delete_render(
+    project_id: str, filename: str, workspace: Workspace = Depends(_workspace)
+) -> dict[str, str]:
+    """Delete one previously rendered export, freeing the disk space.
+
+    Renders are minutes of encoding and hundreds of megabytes each; now that
+    they are uniquely named rather than overwriting each other, they accumulate,
+    so there has to be a way to remove one from the same list that offers them.
+
+    Raises:
+        HTTPException: 400 if the filename tries to escape the renders
+            directory, 404 if there is no such render.
+    """
+    _reject_path_escape(filename)
+    path = workspace.renders_dir(project_id) / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"no export named {filename!r}")
+    try:
+        path.unlink()
+    except OSError as exc:  # pragma: no cover - a locked file on Windows only
+        raise HTTPException(
+            status_code=409, detail=f"could not delete {filename!r}: {exc}"
+        ) from exc
+    return {"status": "deleted", "filename": filename}
+
+
+def _reject_path_escape(filename: str) -> None:
+    """Raise 400 unless ``filename`` names a file directly inside ``renders/``."""
+    if "/" in filename or "\\" in filename or filename in ("..", "."):
+        raise HTTPException(status_code=400, detail="invalid filename")
 
 
 @router.get("/download/{filename}")
@@ -338,8 +511,7 @@ def download_export(
         HTTPException: 404 if the filename is unknown, or 400 if it tries to
             escape the renders directory.
     """
-    if "/" in filename or "\\" in filename or filename in ("..", "."):
-        raise HTTPException(status_code=400, detail="invalid filename")
+    _reject_path_escape(filename)
     path = workspace.renders_dir(project_id) / filename
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"no export named {filename!r}")

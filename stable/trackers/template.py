@@ -13,6 +13,7 @@ template with what it just failed to find.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -21,6 +22,8 @@ from ..core.errors import TrackerError
 from ..core.types import Query, TrackResult
 from ..core.video import VideoSource
 from .base import Direction, ProgressCallback, TrackerPlugin, noop_progress
+from .frames import converted_frames
+from .progress import RunProgress, planned_steps
 
 __all__ = ["TemplateTracker"]
 
@@ -106,7 +109,8 @@ class TemplateTracker(TrackerPlugin):
             queries: Anchor positions to track, one per point.
             frame_range: ``(start, end)`` half-open absolute frame range.
             direction: ``"fwd"``, ``"bwd"`` or ``"bidir"``.
-            progress: Progress reporter; called once per point plus a final 1.0.
+            progress: Progress reporter; called once per frame stepped,
+                plus a final 1.0.
 
         Returns:
             A :class:`~stable.core.types.TrackResult` with ``N = len(queries)``
@@ -135,14 +139,14 @@ class TemplateTracker(TrackerPlugin):
         confidence = np.zeros((len(queries), n_frames), dtype=np.float32)
         visible = np.zeros((len(queries), n_frames), dtype=bool)
 
-        gray_cache: dict[int, np.ndarray] = {}
+        # Bounded, LRU: an unbounded dict here held the whole clip's grayscale
+        # copy for the length of the run (see stable/trackers/frames.py).
+        gray = converted_frames(video, lambda rgb: cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY))
 
-        def gray(index: int) -> np.ndarray:
-            cached = gray_cache.get(index)
-            if cached is None:
-                cached = cv2.cvtColor(video.get_frame(index), cv2.COLOR_RGB2GRAY)
-                gray_cache[index] = cached
-            return cached
+        # Progress is counted in frames, not in queries: a server-side run has
+        # exactly one query, so reporting per query reported nothing until the
+        # run was over (see stable/trackers/progress.py).
+        reporter = RunProgress(progress, total=planned_steps(queries, (start, end), direction))
 
         for qi, query in enumerate(queries):
             if not start <= query.frame < end:
@@ -167,7 +171,7 @@ class TemplateTracker(TrackerPlugin):
                     qi,
                     query.position,
                     anchor_patch,
-                    range(query.frame + 1, end),
+                    reporter.steps(range(query.frame + 1, end)),
                     points,
                     confidence,
                     visible,
@@ -179,12 +183,11 @@ class TemplateTracker(TrackerPlugin):
                     qi,
                     query.position,
                     anchor_patch,
-                    range(query.frame - 1, start - 1, -1),
+                    reporter.steps(range(query.frame - 1, start - 1, -1)),
                     points,
                     confidence,
                     visible,
                 )
-            progress((qi + 1) / len(queries), f"point {qi + 1}/{len(queries)}")
 
         progress(1.0, "done")
         return TrackResult(points=points, confidence=confidence, visible=visible)
@@ -209,7 +212,7 @@ class TemplateTracker(TrackerPlugin):
         qi: int,
         anchor_position: tuple[float, float],
         anchor_patch: np.ndarray,
-        indices: range,
+        indices: Iterable[int],
         points: np.ndarray,
         confidence: np.ndarray,
         visible: np.ndarray,

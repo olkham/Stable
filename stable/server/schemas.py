@@ -24,6 +24,7 @@ __all__ = [
     "SmoothingUpdate",
     "RenderSettingsUpdate",
     "ExportVideoRequest",
+    "ClipRangeUpdate",
     "ProjectRenameRequest",
     "CorrectionIn",
     "CorrectionUpdate",
@@ -128,11 +129,33 @@ class RenderSettingsUpdate(BaseModel):
 
 
 class ExportVideoRequest(BaseModel):
-    """Body for ``POST /api/projects/{id}/export/video``."""
+    """Body for ``POST /api/projects/{id}/export/video``.
 
-    filename: str = "stabilized.mp4"
+    ``filename`` defaults to ``None``, meaning "name it for me": the route
+    stamps the time so two exports of the same project are two files. It used to
+    default to ``stabilized.mp4``, which silently overwrote the previous render —
+    a re-export with different settings destroyed the version you were comparing
+    it against.
+    """
+
+    filename: str | None = None
     codec: str = "h264"
     crf: int = 18
+
+
+class ClipRangeUpdate(BaseModel):
+    """Body for ``PUT /api/projects/{id}/range``: the In/Out markers (todo 1).
+
+    Both fields are optional *and* nullable, and the two differ: omitted leaves
+    that marker where it is (dragging one handle), while an explicit ``null`` on
+    both clears the range back to the whole clip. Range checking lives in
+    :mod:`stable.server.clip_range` beside the storage.
+    """
+
+    in_: int | None = Field(default=None, alias="in")
+    out: int | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ProjectRenameRequest(BaseModel):

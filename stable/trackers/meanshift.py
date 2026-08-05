@@ -38,6 +38,7 @@ per-pixel error.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -47,6 +48,8 @@ from ..core.types import Query, TrackResult
 from ..core.video import VideoSource
 from .base import Direction, ProgressCallback, TrackerPlugin, noop_progress
 from .confidence import normalize_scores, visibility_from_confidence
+from .frames import converted_frames
+from .progress import RunProgress, planned_steps
 
 __all__ = ["MeanShiftTracker"]
 
@@ -154,7 +157,8 @@ class MeanShiftTracker(TrackerPlugin):
             queries: Anchor positions to track, one per point.
             frame_range: ``(start, end)`` half-open absolute frame range.
             direction: ``"fwd"``, ``"bwd"`` or ``"bidir"``.
-            progress: Progress reporter; called once per point plus a final 1.0.
+            progress: Progress reporter; called once per frame stepped,
+                plus a final 1.0.
 
         Returns:
             A :class:`~stable.core.types.TrackResult` with ``N = len(queries)``
@@ -183,18 +187,19 @@ class MeanShiftTracker(TrackerPlugin):
         raw_confidence = np.zeros((len(queries), n_frames), dtype=np.float32)
         touched = np.zeros((len(queries), n_frames), dtype=bool)
 
-        hsv_cache: dict[int, np.ndarray] = {}
-
-        def hsv(index: int) -> np.ndarray:
-            cached = hsv_cache.get(index)
-            if cached is None:
-                cached = cv2.cvtColor(video.get_frame(index), cv2.COLOR_RGB2HSV)
-                hsv_cache[index] = cached
-            return cached
+        # Bounded, LRU. An HSV frame is three times the size of a grayscale one,
+        # so the unbounded dict this replaces exhausted memory on an ordinary HD
+        # shot long before the other trackers did (see stable/trackers/frames.py).
+        hsv = converted_frames(video, lambda rgb: cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV))
 
         mask_template = self._kernel_mask()
         ranges = [0, 180, 0, 256]
         hist_bins = [self.hue_bins, self.sat_bins]
+
+        # Progress is counted in frames, not in queries: a server-side run has
+        # exactly one query, so reporting per query reported nothing until the
+        # run was over (see stable/trackers/progress.py).
+        reporter = RunProgress(progress, total=planned_steps(queries, (start, end), direction))
 
         for qi, query in enumerate(queries):
             if not start <= query.frame < end:
@@ -224,7 +229,7 @@ class MeanShiftTracker(TrackerPlugin):
                     mask_template,
                     hist_bins,
                     ranges,
-                    range(query.frame + 1, end),
+                    reporter.steps(range(query.frame + 1, end)),
                     points,
                     raw_confidence,
                     touched,
@@ -239,12 +244,11 @@ class MeanShiftTracker(TrackerPlugin):
                     mask_template,
                     hist_bins,
                     ranges,
-                    range(query.frame - 1, start - 1, -1),
+                    reporter.steps(range(query.frame - 1, start - 1, -1)),
                     points,
                     raw_confidence,
                     touched,
                 )
-            progress((qi + 1) / len(queries), f"point {qi + 1}/{len(queries)}")
 
         low, high = self.confidence_range
         confidence = normalize_scores(raw_confidence, low=low, high=high)
@@ -311,7 +315,7 @@ class MeanShiftTracker(TrackerPlugin):
         mask_template: np.ndarray,
         hist_bins: list[int],
         ranges: list[int],
-        indices: range,
+        indices: Iterable[int],
         points: np.ndarray,
         raw_confidence: np.ndarray,
         touched: np.ndarray,

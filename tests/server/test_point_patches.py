@@ -92,7 +92,12 @@ def test_the_patch_is_the_pixels_the_tracker_would_match(client, template_point,
     project_id, _source = template_point
     client.put(f"/api/projects/{project_id}/points/p1/patches", json={"template_radius": 5})
 
-    response = client.get(f"/api/projects/{project_id}/points/p1/patches/image?frame=0")
+    # `source=original` is the panel's own request: 1:1 source pixels, which is
+    # what "the patch the tracker would match" means. (The default is the proxy
+    # tier — same region, cheaper — see test_proxy_patches.py.)
+    response = client.get(
+        f"/api/projects/{project_id}/points/p1/patches/image?frame=0&source=original"
+    )
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
     patch = decode_jpeg(response.content)  # cv2.imdecode handles PNG too
@@ -110,7 +115,9 @@ def test_the_patch_is_the_pixels_the_tracker_would_match(client, template_point,
 def test_the_grid_previews_a_size_before_it_is_saved(client, template_point):
     """Dragging the slider must show the consequence without committing to it."""
     project_id, _source = template_point
-    preview = client.get(f"/api/projects/{project_id}/points/p1/patches/image?frame=0&radius=3")
+    preview = client.get(
+        f"/api/projects/{project_id}/points/p1/patches/image?frame=0&radius=3&source=original"
+    )
     assert preview.status_code == 200
     assert decode_jpeg(preview.content).shape == (7, 7, 3)
     # ...and the stored value is untouched by the preview.

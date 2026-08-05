@@ -3,7 +3,7 @@ import { CurveEditor } from "./components/CurveEditor";
 import { EditPanel } from "./components/EditPanel";
 import { ExportDialog } from "./components/ExportDialog";
 import { ModelManager } from "./components/ModelManager";
-import { PointsPanel } from "./components/PointsPanel";
+import { TracksPanel } from "./components/TracksPanel";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { SmoothingPanel } from "./components/SmoothingPanel";
 import { SolvePanel } from "./components/SolvePanel";
@@ -14,7 +14,7 @@ import { ProjectProvider, useProjectContext } from "./state/ProjectContext";
 type Tab = "points" | "edit" | "solve" | "smoothing";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "points", label: "Points" },
+  { id: "points", label: "Tracks" },
   { id: "edit", label: "Edit" },
   { id: "solve", label: "Solve" },
   { id: "smoothing", label: "Smoothing" },
@@ -105,7 +105,7 @@ function Workspace({ onClose }: { onClose: () => void }) {
               </button>
             ))}
           </nav>
-          {tab === "points" && <PointsPanel />}
+          {tab === "points" && <TracksPanel />}
           {tab === "edit" && <EditPanel />}
           {tab === "solve" && <SolvePanel />}
           {tab === "smoothing" && <SmoothingPanel />}

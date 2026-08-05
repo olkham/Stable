@@ -85,6 +85,7 @@ from ..trackers.merge import (
     plan_anchor_runs,
 )
 from ..trackers.registry import create_tracker
+from .clip_range import effective_range
 from .storage import Workspace
 from .tracker_options import point_options
 
@@ -361,13 +362,20 @@ def run_point_tracking(
     project = workspace.load_project(project_id)
     point = project.point(point_id)
     video = workspace.get_video_source(project_id)
+    # The In/Out markers, or the whole clip when none are set (todo 1). This is
+    # what makes "track the bit I care about" cost what that bit costs.
+    frame_range = effective_range(workspace.project_dir(project_id), video.frame_count)
     # A promoted correction can outlive the clip it was made against (a project
     # re-pointed at a shorter file), and merging rejects an out-of-range anchor.
-    anchors = [q for q in effective_anchors(point) if 0 <= q.frame < video.frame_count]
+    # Anchors outside the working range are skipped for the same reason: a run
+    # cannot start from a frame it is not allowed to read.
+    anchors = [q for q in effective_anchors(point) if frame_range[0] <= q.frame < frame_range[1]]
     if not anchors:
-        raise ProjectError(f"point {point_id!r} has no anchor keyframes to track from")
+        raise ProjectError(
+            f"point {point_id!r} has no anchor keyframes inside frames "
+            f"[{frame_range[0]}, {frame_range[1]}) to track from"
+        )
 
-    frame_range = (0, video.frame_count)
     run_specs = plan_anchor_runs(anchors, frame_range)
     tracker_name = tracker or point.tracker
 

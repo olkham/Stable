@@ -7,6 +7,9 @@ import type { PointPatches, TrackerSetting } from "../types";
 /** Largest a thumbnail is drawn, whatever the patch's own pixel size. */
 const THUMB_PX = 72;
 
+/** How long the frame has to stop moving before the panel re-reads itself. */
+const SETTLE_MS = 150;
+
 /**
  * The pixels a point is actually being tracked on (todo 14).
  *
@@ -51,8 +54,15 @@ export function PatchPanel({ pointId }: { pointId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.id, pointId, currentFrame, editRevision]);
 
+  // Debounced, because this fires on every frame change: dragging the playhead
+  // across a thousand frames used to mean a thousand of these in flight, which
+  // is most of how scrubbing came to a halt. Waiting for the scrub to settle
+  // costs nothing visible — the thumbnails below are a considered look, not a
+  // per-frame readout.
   useEffect(() => {
-    void reload();
+    const timer = setTimeout(() => void reload(), info === null ? 0 : SETTLE_MS);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reload]);
 
   // A different point (or a tracker change) invalidates every pending edit:
@@ -117,7 +127,18 @@ export function PatchPanel({ pointId }: { pointId: string }) {
       >
         {patch.available ? (
           <img
-            src={api.pointPatchUrl(project.id, pointId, patch.frame, previewRadius, rev)}
+            src={api.pointPatchUrl(
+              project.id,
+              pointId,
+              patch.frame,
+              previewRadius,
+              rev,
+              // 1:1 source pixels here: this panel is where the operator judges
+              // whether the patch has enough texture to track, which is exactly
+              // what proxy scaling takes away. It is a handful of URLs for one
+              // point, so the cost is bounded — unlike the strip below.
+              "original",
+            )}
             width={THUMB_PX}
             height={THUMB_PX}
             alt={`Patch at frame ${patch.frame}`}
@@ -206,6 +227,13 @@ export function PatchPanel({ pointId }: { pointId: string }) {
         <div className="patch-panel__now">
           <span className="patch-panel__label">This frame</span>
           {thumb(info.current, "current")}
+          {/* Why this looks bigger than the box on the canvas: it is. A patch is
+              a few dozen pixels drawn at THUMB_PX, and without saying so the two
+              views of the same window look like two different sizes. */}
+          <span className="patch-panel__note">
+            {previewRadius * 2 + 1}px window, shown at{" "}
+            {(THUMB_PX / (previewRadius * 2 + 1)).toFixed(1)}×
+          </span>
         </div>
       )}
 

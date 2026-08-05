@@ -4,9 +4,15 @@ import type { JobEvent } from "../types";
  * A small inline progress bar for one background job (track/solve/proxy/export).
  *
  * When the job publishes a live cursor (`partial`, see stable/server/jobs.py)
- * the bar says which frame is being worked on and how many planned runs are
- * done, rather than only a percentage — on a long track that is the difference
- * between "it is doing something" and "it is on frame 812, run 2 of 4" (todo 4).
+ * the bar says which frame is being worked on rather than only a percentage —
+ * on a long track that is the difference between "it is doing something" and
+ * "it is on frame 812, run 2 of 4" (todo 4).
+ *
+ * The run counter comes from `job.message`, which the tracking job already sets
+ * to "run 2/4" (stable/server/tracking.py). It used to be appended here from
+ * `partial.runs_total` as well, which named the same run twice; the trackers
+ * now report a fraction per *frame* with no message of their own, so the
+ * message is reliably the run counter and the percentage actually moves.
  */
 export function JobProgress({ job }: { job: JobEvent | undefined }) {
   if (!job || job.status === "done") return null;
@@ -17,7 +23,6 @@ export function JobProgress({ job }: { job: JobEvent | undefined }) {
   const partial = job.partial;
   const details: string[] = [];
   if (partial?.frame != null) details.push(`frame ${partial.frame}`);
-  if (partial?.runs_total) details.push(`run ${Math.min(partial.runs_done ?? 0, partial.runs_total) + 1}/${partial.runs_total}`);
 
   return (
     <div className="job-progress">

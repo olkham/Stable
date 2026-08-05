@@ -54,6 +54,21 @@ export interface PointSummary {
   worst_frames: number[];
 }
 
+/**
+ * The In/Out markers: the frames tracking and export are limited to (todo 1).
+ *
+ * `out` is exclusive, like every other range in this codebase. `whole_clip`
+ * distinguishes "no limit set" from "the limits happen to be the ends of the
+ * clip" — the timeline draws them differently.
+ */
+export interface ClipRangeInfo {
+  in: number;
+  out: number;
+  frames: number;
+  clip_frames: number;
+  whole_clip: boolean;
+}
+
 export interface SolveSettings {
   reference_frame: number;
   channels: Record<Channel, boolean>;

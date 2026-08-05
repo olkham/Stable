@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import av
 import numpy as np
 import pytest
@@ -88,6 +90,90 @@ def test_audio_passthrough_survives_export(tmp_path):
     with av.open(str(out_path)) as result:
         assert len(result.streams.audio) == 1
         assert len(result.streams.video) == 1
+
+
+def _audio_seconds(path) -> float:
+    """Return an output's audio duration, measured by decoding it."""
+    with av.open(str(path)) as container:
+        stream = container.streams.audio[0]
+        samples = sum(frame.samples for frame in container.decode(stream))
+        return samples / float(stream.sample_rate)
+
+
+def _video_seconds(path) -> float:
+    """Return an output's video duration, measured by decoding it."""
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        frames = sum(1 for _ in container.decode(stream))
+        return frames / float(stream.average_rate)
+
+
+def test_a_partial_render_trims_the_audio_to_match(tmp_path):
+    """todo 2: a full audio track behind partial video freezes the last frame.
+
+    A container's duration is the longer of its streams, so copying the whole
+    track into a render of ten frames produces a file that *plays* for the
+    length of the source with nothing left to decode — which is exactly what
+    "the exported video was still the full length, and the rest was the last
+    frame repeated" describes.
+    """
+    source = SyntheticVideoSource(frame_count=48, width=32, height=24, fps=24.0)
+    clip = encode_synthetic_clip(source, str(tmp_path / "in.mp4"), with_audio=True)
+    out_path = tmp_path / "part.mp4"
+
+    export_video(
+        itertools.islice(_synthetic_frames(source), 12),
+        out_path,
+        fps=24.0,
+        frame_count=12,
+        audio_source=clip,
+        audio_range=(0.0, 0.5),
+    )
+
+    # One AAC packet is 1024 samples (~21 ms) and passthrough keeps packets
+    # whole, so the trim lands within a packet of the mark rather than on it.
+    assert _audio_seconds(out_path) == pytest.approx(0.5, abs=0.05)
+    assert _video_seconds(out_path) == pytest.approx(0.5, abs=0.01)
+
+
+def test_a_trimmed_range_starts_where_it_was_asked_to(tmp_path):
+    """An In point past zero must skip that much audio, not merely shorten it."""
+    source = SyntheticVideoSource(frame_count=48, width=32, height=24, fps=24.0)
+    clip = encode_synthetic_clip(source, str(tmp_path / "in.mp4"), with_audio=True)
+    out_path = tmp_path / "middle.mp4"
+
+    export_video(
+        itertools.islice(_synthetic_frames(source), 24),
+        out_path,
+        fps=24.0,
+        frame_count=24,
+        audio_source=clip,
+        audio_range=(1.0, 2.0),
+    )
+
+    assert _audio_seconds(out_path) == pytest.approx(1.0, abs=0.05)
+    # Rebased onto the in point: the output's own timeline starts at zero.
+    with av.open(str(out_path)) as container:
+        stream = container.streams.audio[0]
+        first = next(container.decode(stream))
+        assert float(first.time or 0.0) < 0.05
+
+
+def test_without_a_range_the_whole_audio_track_is_still_copied(tmp_path):
+    """The regression that matters: an unranged export is untouched by any of this."""
+    source = SyntheticVideoSource(frame_count=24, width=32, height=24, fps=24.0)
+    clip = encode_synthetic_clip(source, str(tmp_path / "in.mp4"), with_audio=True)
+    out_path = tmp_path / "whole.mp4"
+
+    export_video(
+        _synthetic_frames(source),
+        out_path,
+        fps=24.0,
+        frame_count=24,
+        audio_source=clip,
+    )
+
+    assert _audio_seconds(out_path) == pytest.approx(_audio_seconds(clip), abs=0.05)
 
 
 def test_export_without_audio_source_has_no_audio_stream(tmp_path):

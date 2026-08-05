@@ -329,6 +329,24 @@ def save_point_options(project_dir: Path, point_id: str, options: dict[str, Any]
     return current
 
 
+def forget_point(project_dir: Path, point_id: str) -> bool:
+    """Drop a deleted point's stored settings from the sidecar.
+
+    A point's settings are keyed by its id, so leaving them behind means the
+    next point to be given that id silently inherits a window size nobody chose
+    for it — the same class of bug as its track file outliving it.
+
+    Returns:
+        True if there was anything to remove.
+    """
+    stored = load_tracker_options(project_dir)
+    if point_id not in stored:
+        return False
+    stored.pop(point_id)
+    options_path(project_dir).write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    return True
+
+
 def patch_bounds(
     position: tuple[float, float], radius: int, width: int, height: int
 ) -> tuple[int, int, int, int] | None:
@@ -368,7 +386,51 @@ def template_patch(
     if box is None:
         return None
     x0, y0, x1, y1 = box
-    return np.ascontiguousarray(video.get_frame_view(frame)[y0:y1, x0:x1])
+    view = getattr(video, "get_frame_view", None)
+    frame_pixels = view(frame) if callable(view) else video.get_frame(frame)
+    return np.ascontiguousarray(frame_pixels[y0:y1, x0:x1])
+
+
+def proxy_patch(
+    store: Any, frame: int, position: tuple[float, float], radius: int
+) -> np.ndarray | None:
+    """Crop the same patch from a **proxy** frame instead of the source clip.
+
+    Scrubbing is where this matters. A thumbnail is drawn at 72 px whatever its
+    pixel size, so serving it from the half-resolution proxy costs a JPEG read
+    from disk rather than a full-resolution random-access seek that queues
+    behind the decoder's lock — the difference between a smooth scrub and the
+    UI stalling with a dozen seeks outstanding.
+
+    The *availability* rule stays in source pixels (:func:`patch_bounds`, the
+    tracker's own edge rule); only the pixels come from the proxy. So a patch
+    the grid marks ✕ is still exactly one the tracker would refuse.
+
+    Args:
+        store: A :class:`stable.video.proxy.ProxyStore`.
+        frame: Absolute frame index.
+        position: Patch centre in **source** pixels.
+        radius: Half-size in **source** pixels.
+
+    Returns:
+        The ``uint8`` RGB patch at proxy scale, or ``None`` when the proxy
+        cannot supply it (out of range, or the scaled patch leaves the frame),
+        in which case the caller falls back to the source.
+    """
+    scale = float(getattr(store.manifest, "scale", 1.0) or 1.0)
+    if not 0 <= frame < store.frame_count:
+        return None
+    scaled_radius = max(1, int(round(radius * scale)))
+    centre = (position[0] * scale, position[1] * scale)
+    box = patch_bounds(centre, scaled_radius, store.manifest.width, store.manifest.height)
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    try:
+        pixels = store.get_frame(frame)
+    except Exception:  # noqa: BLE001 - a missing proxy frame just means "use the source"
+        return None
+    return np.ascontiguousarray(pixels[y0:y1, x0:x1])
 
 
 def effective_radius(project_dir: Path, point: PointSpec, default: int) -> int:

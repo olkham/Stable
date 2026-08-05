@@ -39,6 +39,11 @@ video = ["av>=12", "opencv-python>=4.9"]
 # out meant `pip install stable-tracker[torch]` produced a tracker that was
 # registered, listed, and permanently greyed out.
 torch = ["torch>=2.1", "torchvision>=0.16"]
+# SAM 3 (todo 27) ships inside transformers rather than as its own package,
+# so unlike CoTracker3/TAPIR its model code is one ordinary pip install away.
+# The *weights* are a gated Hugging Face repo: accept the licence on the model
+# page and `huggingface-cli login` before the tracker can load them.
+sam3 = ["stable-tracker[torch]", "transformers>=5.14"]
 # Phase 4: local server.
 server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "websockets>=12", "python-multipart>=0.0.9"]
 # Everything needed for the full `pip install stable-tracker[all]` / `stable serve` happy path
@@ -69,9 +74,12 @@ correlation = "stable.trackers.correlation:CorrelationTracker"
 kalman = "stable.trackers.kalman:KalmanTracker"
 particle = "stable.trackers.particle:ParticleFilterTracker"
 meanshift = "stable.trackers.meanshift:MeanShiftTracker"
+sift = "stable.trackers.features:SiftTracker"
+orb = "stable.trackers.features:OrbTracker"
 cotracker3 = "stable.trackers.cotracker3:CoTracker3Tracker"
 tapir = "stable.trackers.tapir:TapirTracker"
 raft = "stable.trackers.raft:RaftTracker"
+sam3 = "stable.trackers.sam3:Sam3Tracker"
 
 [tool.setuptools.packages.find]
 include = ["stable*"]

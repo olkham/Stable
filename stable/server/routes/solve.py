@@ -284,9 +284,7 @@ def _scaled_fill(fill: Any, scale: float) -> Any:
     return replace(fill, blur=fill.blur * scale, feather=fill.feather * scale)
 
 
-def preview_plan(
-    workspace: Workspace, project_id: str, project: Project, motion: SmoothedMotion
-):
+def preview_plan(workspace: Workspace, project_id: str, project: Project, motion: SmoothedMotion):
     """Return the render plan for the preview, memoised on the caches' mtimes.
 
     The same call the export uses, so "what you see is what you get" survives
@@ -311,12 +309,24 @@ def preview_plan(
 # -- stabilisation options (target / crop / fill) -------------------------------
 
 
+class TargetPairIn(BaseModel):
+    """One point-to-destination pair of a ``map`` stabilisation target."""
+
+    point_id: str
+    x: float
+    y: float
+
+
 class TargetUpdate(BaseModel):
     """The ``target`` block of ``PUT /api/projects/{id}/render/options``."""
 
     mode: str | None = None
     point_id: str | None = None
     anchor_frame: int | None = None
+    # Sent whole rather than merged key-by-key: a pair list is a set of
+    # positions the operator has arranged on the canvas, and merging halves of
+    # two arrangements would produce one nobody asked for.
+    pairs: list[TargetPairIn] | None = None
 
 
 class CropUpdate(BaseModel):
@@ -395,7 +405,8 @@ def update_render_options(
         options = RenderOptions.from_dict(current)
         # Fail now, with a message naming the target, rather than inside the
         # export job twenty seconds later.
-        motion_glue.resolve_target_positions(project, options.target)
+        if motion_glue.resolve_mapped_targets(project, options.target) is None:
+            motion_glue.resolve_target_positions(project, options.target)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     motion_glue.save_render_options(workspace.project_dir(project_id), options)

@@ -1,0 +1,31 @@
+Let the user specifically set the first and last point to track from and up to. It's not always the full length of the video we want to track. These In/Out markers can also be used by the export menu to only export a clip range.
+
+Add option to set playback fps rate
+
+Add the ability to preview of what the export option mean for the final rendered video. We need to create a new export screen that shows a frame from the video and a preview of the output frame size and position when changing settings for track target. It should also have an interactive canvas that lets the user set the target point where we want the stabilised point to be glued to i.e. it could be on a 1/3 line to make it aesthetically pleasing. This will also let the user specify multiple target points so they can map multiple tracked points. i.e. Track P1 should be stuck to point A and track P2 stuck to point B this would automatically mean we compensate for scale and rotation in order to map the two tracked points to two target points.
+
+When video exports are generated they should be named with a timestamp and be unique. When we rework the export menu we can add a new list of the previously exported videos that can be downloaded at anytime or deleted to free up space.
+
+When I delete a point and add a new one back it restores the previous track. I think we need to rethink the UI. Rather than have the side panel list points we should be track orientated. Then we can move the visibility toggle to each track card in the panel so we can show/hide UI items for a given track.
+
+It's not clear what the Solve tab does. Either explain it better.
+
+Add shortcut key to add anchor
+
+When the tracker is running we want to see the live progress of the playback and the tracker as it's running
+
+The window size drawn on the canvas is smaller than the patch preview in the side panel, I think this is because the canvas images are proxy images at a different resolution to the underlaying full res image.
+
+When I click add anchor, it now automatically adds it at the current track position.
+
+[bug] The mean shift colour histogram algo uses lots of memory and failed Failed: OpenCV(5.0.0) D:\a\opencv-python\opencv-python\opencv\modules\core\src\alloc.cpp:73: error: (-4:Insufficient memory) Failed to allocate 24883200 bytes in function 'cv::OutOfMemoryError'
+
+[bug] When scrubgging through the video the proxy frames somethimes become stuck, requests become bogged down and the UI becomes unresponsive to updating the frames. We need a more efficient way to handle proxy frame streaming. I think it might be the patches request that's bogging it down. Perhaps we need to cache those.
+
+[improvement] I shouldn't have to enter edit mode, I should be able to add anchors and move them around in playback mode. 
+
+Implement a SAM3 based tracker that can handle occlusions and reappearances of tracked points. This will improve tracking accuracy in complex scenes.
+https://huggingface.co/docs/transformers/en/model_doc/sam3_tracker
+
+Implement a feature based tracker using things like SIFT/SURF/ORB
+

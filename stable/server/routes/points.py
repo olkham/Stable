@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import io
 import math
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from ...core.errors import ProjectError, StableError
 from ...core.project import PointSpec, Project
@@ -34,14 +36,17 @@ from ..schemas import (
     TrackRequest,
 )
 from ..serialize import point_summary
-from ..storage import Workspace, get_workspace
+from ..storage import PROJECT_FILENAME, Workspace, get_workspace
 from ..tracker_options import (
     SEARCH_RADIUS_RANGE,
     TEMPLATE_RADIUS_RANGE,
+    TRACKER_OPTIONS_CACHE,
     constructor_parameters,
+    forget_point,
     load_tracker_options,
     patch_bounds,
     point_options,
+    proxy_patch,
     save_point_options,
     setting_for,
     template_patch,
@@ -134,8 +139,21 @@ def update_point(
 @router.delete("/{point_id}")
 def delete_point(
     project_id: str, point_id: str, workspace: Workspace = Depends(_workspace)
-) -> dict[str, str]:
-    """Delete a point and its cached raw track."""
+) -> dict[str, Any]:
+    """Delete a point and **everything on disk that was keyed by its id**.
+
+    Deleting only ``tracks/<id>.npz`` and its report was the server half of "when
+    I delete a point and add a new one back it restores the previous track": the
+    retrack runs (``tracks/<id>.<correction_id>.npz``), the anchor-violation
+    sidecar and the point's stored tracker settings all survived, and a new
+    point handed the same id inherited them. Ids are no longer recycled either
+    (:meth:`stable.core.project.Project.new_point_id`), but a point's files
+    outliving it is a leak whether or not anything picks them up.
+
+    Returns:
+        The status and the artefacts actually removed, so the caller can see
+        that the sweep did something rather than trusting that it did.
+    """
 
     def _mutate(project: Project) -> None:
         before = len(project.points)
@@ -148,10 +166,24 @@ def delete_point(
     except StableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    npz_path = workspace.tracks_dir(project_id) / f"{point_id}.npz"
-    npz_path.unlink(missing_ok=True)
-    report_path_for(npz_path).unlink(missing_ok=True)
-    return {"status": "deleted"}
+    removed: list[str] = []
+    tracks = workspace.tracks_dir(project_id)
+    if tracks.is_dir():
+        # Everything this point owns is named for it: `p1.npz`, `p1.report.json`,
+        # `p1.<correction>.npz`, `p1.violations.json`. Matching on the id plus a
+        # separator is what stops `p1` from taking `p10`'s files with it.
+        for path in sorted(tracks.iterdir()):
+            if path.is_file() and path.name.startswith(f"{point_id}."):
+                path.unlink(missing_ok=True)
+                removed.append(path.name)
+
+    # ...and the per-point settings sidecar, which is keyed by id but lives
+    # outside tracks/ (see stable/server/tracker_options.py).
+    if forget_point(workspace.project_dir(project_id), point_id):
+        removed.append(f"{TRACKER_OPTIONS_CACHE}:{point_id}")
+
+    clear_patch_cache()
+    return {"status": "deleted", "removed": removed}
 
 
 @router.post("/{point_id}/anchors")
@@ -512,12 +544,83 @@ def set_point_patch_options(
     return get_point_patches(project_id, point_id, None, workspace)
 
 
+# Rendered patches, kept in memory and keyed by everything that can change them.
+#
+# Scrubbing re-asks for the same patches constantly (back and forth over the
+# same frames, one request per point per frame). Rendering them again each time
+# is what made the UI stall: see `PATCH_SOURCES` below and the `stale_key`
+# helper, which is what lets a cached PNG be trusted rather than merely hoped
+# for — an edit, a re-track or a moved anchor changes the key, so a stale patch
+# cannot be served.
+_PATCH_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+_PATCH_CACHE_LOCK = threading.Lock()
+_PATCH_CACHE_BYTES = 64 * 1024 * 1024
+"""Budget for the rendered-patch cache. A 33px PNG is ~2 KB, so this is tens of
+thousands of them — more than a session generates, and bounded regardless."""
+
+PATCH_SOURCES = ("proxy", "original")
+"""Where a patch's pixels may come from.
+
+``proxy`` reads the half-resolution JPEG the timeline already scrubs on: a disk
+read, no video decode, no decoder lock. ``original`` seeks the source clip for
+1:1 pixels. Thumbnails are drawn at 72px whatever they contain, so ``proxy`` is
+the default and ``original`` is for the one panel where texture is being judged.
+"""
+
+
+def _cache_get(key: tuple[Any, ...]) -> bytes | None:
+    with _PATCH_CACHE_LOCK:
+        payload = _PATCH_CACHE.get(key)
+        if payload is not None:
+            _PATCH_CACHE.move_to_end(key)
+        return payload
+
+
+def _cache_put(key: tuple[Any, ...], payload: bytes) -> None:
+    with _PATCH_CACHE_LOCK:
+        _PATCH_CACHE[key] = payload
+        total = sum(len(v) for v in _PATCH_CACHE.values())
+        while total > _PATCH_CACHE_BYTES and len(_PATCH_CACHE) > 1:
+            _key, evicted = _PATCH_CACHE.popitem(last=False)
+            total -= len(evicted)
+
+
+def clear_patch_cache() -> None:
+    """Drop every cached patch (used by tests and by workspace resets)."""
+    with _PATCH_CACHE_LOCK:
+        _PATCH_CACHE.clear()
+
+
+def _stale_key(workspace: Workspace, project_id: str, point_id: str) -> tuple[float, float]:
+    """Return a key that changes whenever a point's patches could have changed.
+
+    The pixels at a frame are a function of *where the point is*, which comes
+    from the project file (anchors) and the cached track (everything else). Two
+    ``stat`` calls therefore answer "is a cached patch still the right answer?"
+    exactly, without the client having to remember to bust anything.
+    """
+
+    def mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    directory = workspace.project_dir(project_id)
+    return (
+        mtime(directory / PROJECT_FILENAME),
+        mtime(workspace.tracks_dir(project_id) / f"{point_id}.npz"),
+    )
+
+
 @router.get("/{point_id}/patches/image")
 def get_point_patch_image(
     project_id: str,
     point_id: str,
     frame: int,
+    request: Request,
     radius: int | None = None,
+    source: str = "proxy",
     workspace: Workspace = Depends(_workspace),
 ) -> Response:
     """Return the patch at one frame as a PNG — a keyframe's, or the tracked one.
@@ -526,11 +629,17 @@ def get_point_patch_image(
         frame: Any frame the point has a position on, pinned or tracked.
         radius: Override the effective radius, so the grid can preview a size
             the slider is still being dragged through without saving it first.
+        source: ``"proxy"`` (default) reads the pixels from the proxy tier the
+            timeline already uses — no video decode, so a scrub does not queue
+            full-resolution seeks behind the decoder's lock. ``"original"``
+            forces 1:1 source pixels for the panel that is judging texture.
 
     Raises:
         HTTPException: 404 if the point does not exist or has no position on
             that frame, 400 if the patch would fall outside the frame.
     """
+    if source not in PATCH_SOURCES:
+        raise HTTPException(status_code=400, detail=f"source must be one of {list(PATCH_SOURCES)}")
     project = workspace.load_project(project_id)
     point = _point_or_404(project, point_id)
 
@@ -541,20 +650,47 @@ def get_point_patch_image(
     if not low <= size <= high:
         raise HTTPException(status_code=400, detail=f"radius must lie in [{low}, {high}]")
 
-    found = _patch_position(project, point, frame)
-    if found is None:
-        raise HTTPException(
-            status_code=404, detail=f"point {point_id!r} has no position on frame {frame}"
-        )
+    key = (project_id, point_id, frame, size, source, _stale_key(workspace, project_id, point_id))
+    etag = f'"{abs(hash(key)):x}"'
+    headers = {
+        # Short and revalidated rather than immutable: the URL does not change
+        # when an edit moves the point, but the ETag does, so a scrub back over
+        # covered frames costs nothing while an edit is still seen immediately.
+        "Cache-Control": "private, max-age=30",
+        "ETag": etag,
+    }
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
 
-    video = workspace.get_video_source(project_id)
-    patch = template_patch(video, frame, found[0], size)
-    if patch is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"a {size * 2 + 1}px patch at frame {frame} falls outside the frame",
-        )
-    return Response(content=_encode_png(patch), media_type="image/png")
+    payload = _cache_get(key)
+    if payload is None:
+        found = _patch_position(project, point, frame)
+        if found is None:
+            raise HTTPException(
+                status_code=404, detail=f"point {point_id!r} has no position on frame {frame}"
+            )
+        patch = None
+        if source == "proxy":
+            try:
+                store = workspace.get_proxy_store(project_id, "half")
+            except StableError:
+                store = None
+            if store is not None:
+                patch = proxy_patch(store, frame, found[0], size)
+        if patch is None:
+            # Either the caller asked for source pixels, or the proxy could not
+            # supply them (not generated yet, or the scaled patch fell off the
+            # edge). The source is always able to answer.
+            patch = template_patch(workspace.get_video_source(project_id), frame, found[0], size)
+        if patch is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"a {size * 2 + 1}px patch at frame {frame} falls outside the frame",
+            )
+        payload = _encode_png(patch)
+        _cache_put(key, payload)
+
+    return Response(content=payload, media_type="image/png", headers=headers)
 
 
 def _encode_png(patch: Any) -> bytes:

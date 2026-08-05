@@ -69,6 +69,17 @@ export function SolvePanel() {
         <h3>Solve</h3>
       </div>
 
+      {/* Todo 11: "it's not clear what the Solve tab does". It is the step
+          between tracking and stabilising, and nothing on screen said so. */}
+      <p className="panel__explainer">
+        <strong>Turns your tracks into one camera move.</strong> Several points
+        moving separately become four curves for the whole shot — how far it
+        panned (X, Y), how much it rotated (R) and zoomed (S) relative to the
+        reference frame. Smoothing then decides which parts of that move to
+        keep, and the export warps each frame by the difference. Without a
+        solve there is nothing to smooth and nothing to stabilise.
+      </p>
+
       <div className="field-row">
         <label>Reference frame</label>
         <input
@@ -80,6 +91,11 @@ export function SolvePanel() {
         />
         <button onClick={() => setReferenceFrame(currentFrame)}>Use current ({currentFrame})</button>
       </div>
+      <p className="field-help">
+        The frame the move is measured <em>from</em>: it is the one that does not
+        move, so the shot is held where it sits here. Pick the framing you want
+        to keep.
+      </p>
 
       <div className="field-row">
         <label>Channels</label>
@@ -96,15 +112,32 @@ export function SolvePanel() {
           ))}
         </div>
       </div>
+      <p className="field-help">
+        Which parts of the move to solve for. Turning <strong>R</strong> or{" "}
+        <strong>S</strong> off <em>constrains the fit</em> — use it when you know
+        the camera did not rotate or zoom, and want the tracks read as pure
+        translation. Turning <strong>X</strong> or <strong>Y</strong> off zeroes
+        that curve instead, holding the shot on that axis.
+      </p>
 
       <button
         className="solve-panel__run"
         onClick={handleSolve}
         disabled={trackedCount === 0}
-        title={trackedCount === 0 ? "Track at least one solve-enabled point first" : undefined}
+        title={
+          trackedCount === 0
+            ? "Track at least one solve-enabled track first — the solve is a fit over tracked points"
+            : `Fit the camera move over ${trackedCount} tracked point(s)`
+        }
       >
-        Solve ({trackedCount} point{trackedCount === 1 ? "" : "s"})
+        Solve ({trackedCount} track{trackedCount === 1 ? "" : "s"})
       </button>
+      {trackedCount === 0 && (
+        <p className="field-help">
+          Nothing to solve yet: track at least one point (and leave its{" "}
+          <em>solve</em> box ticked) on the Tracks tab first.
+        </p>
+      )}
       <JobProgress job={job} />
 
       {curves && (

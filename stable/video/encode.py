@@ -30,6 +30,22 @@ When passthrough is refused the audio is **re-encoded to AAC** rather than
 dropped: silence is a worse answer than a lossy copy for anyone stabilising a
 shot they intend to cut with sound. Passthrough remains what happens whenever
 it can, so the Stack decision holds wherever it is actually applicable.
+
+Audio when only part of the clip is rendered
+--------------------------------------------
+"Copy the audio track" also quietly assumes the render covers the whole clip.
+Once In/Out markers bound an export (:mod:`stable.server.clip_range`) it does
+not, and copying the whole track produces a file whose audio runs far past its
+video: a container's duration is the longer of its streams, so a player that
+has run out of frames holds the last one on screen until the sound stops. That
+is exactly what "the exported video was still the full length, and the rest was
+the last frame repeated" is — the video stream was right all along.
+
+``audio_range`` is therefore the span of *source* audio the output should carry,
+in seconds, and :func:`export_video` trims to it. The trim is **packet**-granular
+for passthrough: an audio packet is 20-40 ms and cutting inside one means
+re-encoding it, which is a worse trade than a frame of slack. So the copied
+track can begin up to one packet late and end up to one packet early.
 """
 
 from __future__ import annotations
@@ -187,6 +203,7 @@ def export_video(
     codec: str = "h264",
     crf: int = 18,
     audio_source: str | os.PathLike[str] | None = None,
+    audio_range: tuple[float, float] | None = None,
     frame_count: int | None = None,
     progress: ProgressCallback = noop_progress,
 ) -> str:
@@ -205,6 +222,11 @@ def export_video(
             container allows it (the "audio passthrough" the Stack section
             requires), re-encoded to :data:`FALLBACK_AUDIO_CODEC` where it does
             not. See the module docstring.
+        audio_range: Half-open ``(start, end)`` span of ``audio_source``, in
+            seconds, to carry into the output — for a render covering only part
+            of the clip. ``None`` copies the whole track, which is only right
+            when the video does too; see the module docstring for why an
+            untrimmed track makes a player freeze on the last frame.
         frame_count: Total frame count, for progress reporting only; if omitted
             progress is reported as ``0`` until the final ``1.0``.
         progress: Progress reporter, called after every frame.
@@ -277,9 +299,13 @@ def export_video(
 
         if audio_in_container is not None and audio_out_stream is not None:
             if plan.mode == "passthrough":
-                _copy_audio(output, audio_in_container, audio_in_stream, audio_out_stream)
+                _copy_audio(
+                    output, audio_in_container, audio_in_stream, audio_out_stream, audio_range
+                )
             else:
-                _transcode_audio(av, output, audio_in_container, audio_in_stream, audio_out_stream)
+                _transcode_audio(
+                    av, output, audio_in_container, audio_in_stream, audio_out_stream, audio_range
+                )
     except VideoError as exc:
         failure = exc
         raise
@@ -327,28 +353,108 @@ def _add_transcoded_audio_stream(output: Any, source_stream: Any) -> Any:
     return stream
 
 
-def _copy_audio(output: Any, container: Any, in_stream: Any, out_stream: Any) -> None:
-    """Remux an audio track verbatim into ``output``."""
+def _seek_to(container: Any, stream: Any, start: float) -> None:
+    """Position ``container`` at or before ``start`` seconds of ``stream``.
+
+    Best-effort: a container that cannot seek is simply read from the beginning
+    and filtered, which costs time but produces the same output.
+    """
+    if start <= 0.0:
+        return
+    try:
+        container.seek(int(start / float(stream.time_base)), stream=stream)
+    except Exception as exc:  # noqa: BLE001 - filtering still gives the right answer
+        logger.debug("audio seek to %.3fs failed, reading from the start: %s", start, exc)
+
+
+def _copy_audio(
+    output: Any,
+    container: Any,
+    in_stream: Any,
+    out_stream: Any,
+    window: tuple[float, float] | None = None,
+) -> None:
+    """Remux an audio track verbatim into ``output``, optionally trimmed.
+
+    Args:
+        output: The container being written.
+        container: The source clip, open for reading.
+        in_stream: The source's audio stream.
+        out_stream: The output's audio stream.
+        window: ``(start, end)`` seconds of the source to keep, or ``None`` for
+            all of it.
+
+    Packets are kept whole — a packet starting before ``start`` is dropped
+    rather than cut, since cutting one means decoding and re-encoding it. The
+    kept packets are rebased onto ``start``, so the output's audio begins at
+    zero however far into the source the range starts.
+    """
+    if window is None:
+        for packet in container.demux(in_stream):
+            if packet.dts is None:
+                continue
+            packet.stream = out_stream
+            output.mux(packet)
+        return
+
+    start, end = window
+    time_base = float(in_stream.time_base)
+    first = int(start / time_base)
+    last = int(end / time_base)
+    _seek_to(container, in_stream, start)
     for packet in container.demux(in_stream):
-        if packet.dts is None:
+        if packet.dts is None or packet.pts is None:
             continue
+        if packet.pts < first:
+            continue  # before the in point (or a backward seek overshot)
+        if packet.pts >= last:
+            break
+        packet.pts -= first
+        packet.dts = packet.pts
         packet.stream = out_stream
         output.mux(packet)
 
 
-def _transcode_audio(av: Any, output: Any, container: Any, in_stream: Any, out_stream: Any) -> None:
+def _transcode_audio(
+    av: Any,
+    output: Any,
+    container: Any,
+    in_stream: Any,
+    out_stream: Any,
+    window: tuple[float, float] | None = None,
+) -> None:
     """Decode, resample and re-encode an audio track into ``output``.
 
     Timestamps are dropped before encoding (``frame.pts = None``) so the encoder
     lays down its own monotonic timeline: the resampler changes the sample rate
     and layout, which makes the source's timestamps no longer describe the
-    frames being written.
+    frames being written. That is also why trimming here only has to select
+    *which* frames are fed in — the timeline that comes out starts at zero
+    either way.
+
+    Args:
+        av: The imported :mod:`av` module.
+        output: The container being written.
+        container: The source clip, open for reading.
+        in_stream: The source's audio stream.
+        out_stream: The output's audio stream.
+        window: ``(start, end)`` seconds of the source to keep, or ``None`` for
+            all of it.
     """
     context = out_stream.codec_context
     resampler = av.audio.resampler.AudioResampler(
         format=context.format, layout=context.layout, rate=context.sample_rate
     )
+    if window is not None:
+        _seek_to(container, in_stream, window[0])
     for frame in container.decode(in_stream):
+        if window is not None:
+            at = frame.time
+            if at is not None:
+                if at < window[0]:
+                    continue
+                if at >= window[1]:
+                    break
         frame.pts = None
         for resampled in resampler.resample(frame):
             for packet in out_stream.encode(resampled):

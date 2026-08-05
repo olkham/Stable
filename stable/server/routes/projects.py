@@ -19,8 +19,9 @@ from ...core.errors import StableError
 from ...core.project import Project
 from ...video.proxy import generate_proxies
 from .. import motion as motion_glue
+from ..clip_range import ClipRange, load_clip_range, save_clip_range
 from ..jobs import JobManager, get_job_manager
-from ..schemas import ProjectRenameRequest, RenderSettingsUpdate
+from ..schemas import ClipRangeUpdate, ProjectRenameRequest, RenderSettingsUpdate
 from ..serialize import project_detail
 from ..storage import Workspace, get_workspace
 
@@ -167,6 +168,13 @@ def get_frame(
     This is disk I/O only (see :class:`stable.video.proxy.ProxyStore`) — no
     video decode happens on this path, which is what keeps timeline scrubbing
     fast.
+
+    A proxy frame only changes when the proxies are regenerated, so it is worth
+    caching in the browser: scrubbing back over ground already covered should
+    not re-fetch anything. ``FileResponse`` already sends an ``ETag`` and
+    ``Last-Modified`` from the file itself, so the ``max-age`` below is a
+    revalidation window rather than a promise — a regenerated proxy is picked up
+    on the next conditional request instead of being cached forever.
     """
     try:
         store = workspace.get_proxy_store(project_id, tier)
@@ -175,7 +183,9 @@ def get_frame(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except IndexError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(path, media_type="image/jpeg")
+    return FileResponse(
+        path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"}
+    )
 
 
 @router.get("/{project_id}/jobs")
@@ -194,3 +204,69 @@ def get_job(project_id: str, job_id: str, jobs: JobManager = Depends(_jobs)) -> 
     if job is None or job.project_id != project_id:
         raise HTTPException(status_code=404, detail=f"no job {job_id!r} for project {project_id!r}")
     return job.to_event()
+
+
+# -- the working range: In / Out markers (todo 1) -------------------------------
+
+
+@router.get("/{project_id}/range")
+def get_clip_range(project_id: str, workspace: Workspace = Depends(_workspace)) -> dict[str, Any]:
+    """Return the frames tracking and export are limited to.
+
+    Returns:
+        ``in``/``out`` (out exclusive) and ``frames``, plus ``whole_clip``
+        saying whether any limit is set at all — ``null`` markers and "the
+        markers happen to be the ends of the clip" are different states, and the
+        timeline draws them differently.
+    """
+    project = workspace.load_project(project_id)
+    total = int(project.video.frames)
+    stored = load_clip_range(workspace.project_dir(project_id), total)
+    current = stored or ClipRange(0, max(total, 1))
+    return {
+        "in": current.start,
+        "out": current.end,
+        "frames": current.frames,
+        "clip_frames": total,
+        "whole_clip": stored is None,
+    }
+
+
+@router.put("/{project_id}/range")
+def set_clip_range(
+    project_id: str, body: ClipRangeUpdate, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Set or clear the In/Out markers.
+
+    Both fields are optional: sending ``{"in": 100}`` moves the in point and
+    leaves the out point alone, which is what dragging one handle means. Sending
+    ``{"in": null, "out": null}`` clears the range back to the whole clip.
+
+    Note the interaction with the solve: it is measured *from*
+    ``solve.reference_frame``, so a reference frame outside this range will have
+    no tracked points on it and the solve refuses. That refusal already names
+    the fix, and moving the reference frame here would be a surprising thing for
+    a range to do, so the two stay independent and the UI warns instead.
+
+    Raises:
+        HTTPException: 400 if the result would be empty or inverted.
+    """
+    project = workspace.load_project(project_id)
+    total = int(project.video.frames)
+    directory = workspace.project_dir(project_id)
+    current = load_clip_range(directory, total) or ClipRange(0, max(total, 1))
+
+    # `by_alias` matters: the field is `in_` (a Python keyword) exposed as
+    # `in`, and dumping by field name would silently drop the in point.
+    payload = body.model_dump(by_alias=True, exclude_unset=True)
+    if payload.get("in") is None and payload.get("out") is None and payload:
+        save_clip_range(directory, None, total)
+        return get_clip_range(project_id, workspace)
+
+    start = current.start if payload.get("in") is None else int(payload["in"])
+    end = current.end if payload.get("out") is None else int(payload["out"])
+    try:
+        save_clip_range(directory, ClipRange(start, end), total)
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return get_clip_range(project_id, workspace)

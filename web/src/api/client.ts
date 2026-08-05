@@ -2,6 +2,7 @@
 // mirrors one route in stable/server/routes/*.py — see those modules'
 // docstrings for what each endpoint actually does server-side.
 import type {
+  ClipRangeInfo,
   Correction,
   CorrectionsResponse,
   DeviceInfo,
@@ -221,10 +222,15 @@ export function pointPatchUrl(
   frame: number,
   radius?: number,
   rev?: number,
+  source?: "proxy" | "original",
 ): string {
   const size = radius === undefined ? "" : `&radius=${radius}`;
   const revision = rev === undefined ? "" : `&rev=${rev}`;
-  return `/api/projects/${projectId}/points/${pointId}/patches/image?frame=${frame}${size}${revision}`;
+  // The server defaults to the proxy tier, which is what a 48px strip thumbnail
+  // wants: a JPEG read instead of a full-resolution seek that would queue behind
+  // the decoder while scrubbing. `original` is for judging texture.
+  const tier = source === undefined ? "" : `&source=${source}`;
+  return `/api/projects/${projectId}/points/${pointId}/patches/image?frame=${frame}${size}${revision}${tier}`;
 }
 
 export const getTrack = (projectId: string, pointId: string): Promise<TrackData> =>
@@ -341,11 +347,42 @@ export function curvesExportUrl(projectId: string, format: "csv" | "json"): stri
   return `/api/projects/${projectId}/export/curves?format=${format}`;
 }
 
+/**
+ * Queue a stabilized render. Omit `filename` (or send an empty one) and the
+ * server names it for the time, so two exports are two files rather than one
+ * overwriting the other.
+ */
 export const exportVideo = (
   projectId: string,
-  opts: { filename: string; codec: string; crf: number },
-): Promise<{ job_id: string }> => postJson(`/api/projects/${projectId}/export/video`, opts);
+  opts: { filename?: string | null; codec: string; crf: number },
+): Promise<{ job_id: string }> =>
+  postJson(`/api/projects/${projectId}/export/video`, {
+    ...opts,
+    filename: opts.filename ? opts.filename : null,
+  });
+
+export const deleteRender = (projectId: string, filename: string): Promise<{ status: string }> =>
+  request(`/api/projects/${projectId}/export/renders/${encodeURIComponent(filename)}`, {
+    method: "DELETE",
+  });
 
 export function downloadUrl(projectId: string, filename: string): string {
   return `/api/projects/${projectId}/export/download/${encodeURIComponent(filename)}`;
 }
+
+// -- the working range: In/Out markers (todo 1) --------------------------------
+
+/** What tracking and export are limited to (`stable/server/clip_range.py`). */
+export const getClipRange = (projectId: string): Promise<ClipRangeInfo> =>
+  request(`/api/projects/${projectId}/range`);
+
+/**
+ * Move one marker, or clear the range.
+ *
+ * An omitted field leaves that marker alone (dragging one handle); sending both
+ * as `null` goes back to the whole clip.
+ */
+export const updateClipRange = (
+  projectId: string,
+  body: { in?: number | null; out?: number | null },
+): Promise<ClipRangeInfo> => putJson(`/api/projects/${projectId}/range`, body);

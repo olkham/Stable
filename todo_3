@@ -1,0 +1,16 @@
+Incorporate the export UI into the main UI. The export menu should be anoter tab on the side panel, similar to the existing Tracks, Edit, Solve, Smoothing tabs. This will make it easier for users to access the export options without having to switch between different tabs. The preview will be able to use the same canvas and the timeline as the main UI, allowing users to preview their video and make adjustments in one place.
+
+When we update smoothing settings, the curves view doesn't get updates until the user closes and reopens the curves view. The curves view should update in real-time as the user adjusts the smoothing settings, providing immediate feedback on how the changes affect the tracking data.
+
+When smoothing is applied to a track, the track line in the canvas should be updated to reflect the smoothed path. This will give users a visual representation of how the smoothing affects the track and help them make more informed decisions about their adjustments.
+
+The mouse icon needs to change to indicate different modes of interaction. It's currently always a hand, regardless of whether the user is over a track point to move it, or can click to add a new point. The mouse icon should change to a pointer when hovering over a track point, and to a crosshair or plus sign when the user can add a new point. This will provide better visual cues for users and improve the overall usability of the interface.
+Perhaps we can also add a toolbar that lets the user expliclty switch between different interaction modes, such as move, add, delete points, or pan.
+
+The Tracks cards in the tracks panel should be collapsible to save space and reduce clutter. They do it automatically currently, but only when the user clicks on a different track. Instead, we should allow users to manually collapse or expand each track card by clicking on a small arrow or plus/minus icon next to the track name. 
+
+Remove the Solve checkbox from the Tracks panel. Selecting which tracks to solve should be done on the Solve tab, where users can select multiple tracks to solve at once. This will streamline the workflow and reduce confusion about which tracks are being solved and clean up the UI.
+
+During the export, when setting two target points for example, if the user adjusts the Crop size, the UI flickers and the target points become unset (even though they are still within the target area). The warning is also displayed "this render would not move the picture at all, so it would just re-encode the source: the stabilisation warp is 'smoothed motion' minus 'solved motion', and nothing has asked them to differ. Enable at least one smoothing filter in the Smoothing panel (Butterworth at ~1 Hz is the usual starting point), or set a stabilisation target so a tracked point is held still."
+Adjusting the crop size should not unset the target points.
+

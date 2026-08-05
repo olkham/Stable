@@ -64,6 +64,8 @@ __all__ = [
     "load_render_options",
     "save_render_options",
     "resolve_target_positions",
+    "resolve_mapped_targets",
+    "target_residuals",
     "target_choices",
     "build_plan",
     "cached_plan",
@@ -277,9 +279,7 @@ def target_choices(project: Project) -> list[dict[str, Any]]:
     return out
 
 
-def resolve_target_positions(
-    project: Project, target: StabilizationTarget
-) -> np.ndarray | None:
+def resolve_target_positions(project: Project, target: StabilizationTarget) -> np.ndarray | None:
     """Turn a :class:`StabilizationTarget` into a ``[T, 2]`` path, or ``None``.
 
     ``frame`` mode returns ``None`` (nothing extra to hold). ``centroid``
@@ -318,9 +318,7 @@ def resolve_target_positions(
 
     paths = [
         np.asarray(track.points, dtype=np.float64)
-        for track in (
-            load_display_track(project, p) for p in project.points if p.enabled_for_solve
-        )
+        for track in (load_display_track(project, p) for p in project.points if p.enabled_for_solve)
         if track is not None
     ]
     if not paths:
@@ -328,6 +326,113 @@ def resolve_target_positions(
             "a centroid stabilisation target needs at least one tracked, solve-enabled point"
         )
     return average_positions(paths)
+
+
+def resolve_mapped_targets(
+    project: Project, target: StabilizationTarget
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Turn a ``map`` target's pairs into the arrays the plan needs.
+
+    Args:
+        project: The project holding the tracks.
+        target: The operator's choice.
+
+    Returns:
+        ``(sources[K, T, 2], destinations[K, 2], weights[K, T])``, or ``None``
+        when this is not a ``map`` target.
+
+    Raises:
+        ProjectError: If a pair names a point the project does not have or that
+            has not been tracked — a mapping is only as real as its tracks.
+    """
+    from .tracking import load_display_track  # noqa: PLC0415 - avoids an import cycle
+
+    if target.mode != "map" or not target.pairs:
+        return None
+    sources: list[np.ndarray] = []
+    weights: list[np.ndarray] = []
+    destinations: list[tuple[float, float]] = []
+    for pair in target.pairs:
+        point = next((p for p in project.points if p.id == pair.point_id), None)
+        if point is None:
+            raise ProjectError(
+                f"the stabilisation mapping names point {pair.point_id!r}, which this project "
+                "does not have; remove that target or pick another point"
+            )
+        track = load_display_track(project, point)
+        if track is None:
+            raise ProjectError(
+                f"the stabilisation mapping needs point {pair.point_id!r} tracked first"
+            )
+        sources.append(np.asarray(track.points, dtype=np.float64))
+        weights.append(np.asarray(track.confidence, dtype=np.float64))
+        destinations.append(pair.position)
+    return (
+        np.stack(sources),
+        np.asarray(destinations, dtype=np.float64),
+        np.stack(weights),
+    )
+
+
+def target_residuals(
+    project: Project, plan: Any, target: StabilizationTarget, frame: int
+) -> list[dict[str, Any]]:
+    """Report where each mapped point actually lands, and how far that misses by.
+
+    Three or more pairs generally *cannot* all be satisfied by a similarity —
+    the fit is least-squares — so the export screen shows the miss per pair
+    rather than presenting an average as if it were the answer. One or two pairs
+    normally read ~0 px, which is itself worth seeing: it says the mapping is
+    exact rather than merely close.
+
+    Args:
+        project: The project holding the tracks.
+        plan: The built :class:`~stable.render.stabilize.StabilizationPlan`.
+        target: The operator's choice.
+        frame: Which frame to report for.
+
+    Returns:
+        One row per pair with the requested destination, where the plan puts the
+        point, and the distance between them — **all three in output pixels**,
+        so they can be read against each other. (``target`` as *stored* is in
+        the space before the crop/zoom fit, because the fit cannot be known
+        until every transform exists; reporting it unconverted next to a
+        post-fit ``landed`` would look like a miss that is not there. The raw
+        stored value is still on ``options.target``.) Empty for any target that
+        is not a mapping.
+    """
+    resolved = resolve_mapped_targets(project, target)
+    if resolved is None:
+        return []
+    sources, destinations, _weights = resolved
+    index = max(0, min(int(frame), sources.shape[1] - 1))
+    transform = plan.transforms[max(0, min(index, len(plan.transforms) - 1))]
+    fit = plan.geometry.fit
+    rows: list[dict[str, Any]] = []
+    for k, pair in enumerate(target.pairs):
+        source_point = sources[k, index]
+        if not np.isfinite(source_point).all():
+            wanted = fit.apply(np.asarray(pair.position, dtype=np.float64))
+            rows.append(
+                {
+                    "point_id": pair.point_id,
+                    "target": [float(wanted[0]), float(wanted[1])],
+                    "landed": None,
+                    "residual": None,
+                }
+            )
+            continue
+        landed = fit.compose(transform).apply(source_point)
+        wanted = fit.apply(np.asarray(pair.position, dtype=np.float64))
+        rows.append(
+            {
+                "point_id": pair.point_id,
+                "target": [float(wanted[0]), float(wanted[1])],
+                "landed": [float(landed[0]), float(landed[1])],
+                "residual": float(np.hypot(*(landed - wanted))),
+            }
+        )
+    return rows
 
 
 # -- render planning ------------------------------------------------------------
@@ -359,12 +464,16 @@ def build_plan(
     """
     size = (int(project.video.w), int(project.video.h))
     chosen = options or RenderOptions()
+    mapped = resolve_mapped_targets(project, chosen.target)
     return StabilizationPlan.build(
         motion,
         source_size=size,
         border=border or project.render.border,
-        target_positions=resolve_target_positions(project, chosen.target),
+        target_positions=None if mapped else resolve_target_positions(project, chosen.target),
         anchor_frame=chosen.target.anchor_frame,
+        mapped_sources=None if mapped is None else mapped[0],
+        mapped_destinations=None if mapped is None else mapped[1],
+        mapped_weights=None if mapped is None else mapped[2],
         crop=chosen.crop,
         fill=chosen.fill,
     )
@@ -375,9 +484,7 @@ _PLAN_LOCK = threading.Lock()
 _PLAN_CACHE_LIMIT = 8
 
 
-def cached_plan(
-    project_id: str, key: Any, factory: Any
-) -> StabilizationPlan:
+def cached_plan(project_id: str, key: Any, factory: Any) -> StabilizationPlan:
     """Return a memoised render plan, rebuilding it only when ``key`` changes.
 
     The minimal auto-zoom is a whole-clip computation, and a preview scrub asks

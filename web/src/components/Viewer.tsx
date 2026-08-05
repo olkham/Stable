@@ -4,6 +4,24 @@ import { confidenceColor, pointColor } from "../colors";
 import { useFrameImages } from "../hooks/useFrameImages";
 import { useProjectContext } from "../state/ProjectContext";
 import type { PointSummary, TrackData } from "../types";
+import type { Overlays } from "../state/ProjectContext";
+
+/** The overlay elements, their labels, and what each one is. */
+export const OVERLAY_LABELS: [keyof Overlays, string, string][] = [
+  ["paths", "Paths", "The trail a point traces through the clip"],
+  [
+    "markers",
+    "Points",
+    "Where each point is on this frame — independent of the paths, so the trails can be hidden without losing the points",
+  ],
+  ["anchors", "Anchors", "Anchor keyframe pins"],
+  ["ghost", "Ghost", "The dotted before/after trail a correction leaves behind"],
+  [
+    "windows",
+    "Window",
+    "The pattern window (solid) and how far the tracker searches for it each frame (dashed)",
+  ],
+];
 
 /** How close (in canvas CSS pixels) a mousedown has to be to grab a point. */
 const GRAB_RADIUS = 12;
@@ -125,10 +143,18 @@ export function Viewer() {
     setPlacingMode,
     addAnchorAt,
     stabilizedPreview,
+    overlays,
+    setOverlays,
+    overlaysEnabled,
+    setOverlaysEnabled,
+    overlaysFor,
+    pathColor,
+    setPathColor,
+    followTracker,
+    setFollowTracker,
     tracks,
     loadTrack,
     refresh,
-    editing,
     dragMode,
     falloff,
     applyCorrection,
@@ -155,17 +181,12 @@ export function Viewer() {
     setPan({ x: 0, y: 0 });
   }, [project.id]);
 
-  // -- overlay visibility (todos 7, 10) -----------------------------------------
-  // `showPaths` is the trail through time; `showMarkers` is where the point is
-  // *now*. They were one flag, which meant hiding the clutter of a hundred
-  // dotted trails also hid the thing being tracked — the one element you can
-  // never do without. Separate flags, separate checkboxes.
-  const [tracksVisible, setTracksVisible] = useState(true);
-  const [showPaths, setShowPaths] = useState(true);
-  const [showMarkers, setShowMarkers] = useState(true);
-  const [showAnchors, setShowAnchors] = useState(true);
-  const [showGhost, setShowGhost] = useState(true);
-  const [showWindows, setShowWindows] = useState(true);
+  // Overlay visibility (todos 7, 10) now lives in the context, because it is
+  // per *track* as well as global (todo 9): the row of checkboxes below sets
+  // the defaults, and each track card can override them for itself. `paths` is
+  // the trail through time and `markers` is where the point is now — they were
+  // one flag, which meant hiding a hundred dotted trails also hid the things
+  // being tracked.
 
   const proxy = project.proxy["half"];
   const proxyReady = proxy?.ready && proxy.width && proxy.height;
@@ -244,13 +265,17 @@ export function Viewer() {
       ctx.fillStyle = "#111";
       ctx.fillRect(frameLeft, frameTop, frameW, frameH);
     }
-    if (!overlayValid || !tracksVisible) return;
+    if (!overlayValid || !overlaysEnabled) return;
 
     for (const point of project.points) {
       const isSelected = point.id === selectedPointId;
       const track = tracks[point.id];
       const color = pointColor(point.id);
       const live = liveTracking[point.id];
+      // What *this* track draws: the global defaults with its own overrides on
+      // top (stable/../ProjectContext.tsx `overlaysFor`).
+      const { paths: showPaths, markers: showMarkers, anchors: showAnchors, ghost: showGhost, windows: showWindows } =
+        overlaysFor(point.id);
 
       // A run in flight (todos 4, 16): the path found so far is drawn over the
       // stale one in the point's own colour, and the frame the tracker is
@@ -322,21 +347,49 @@ export function Viewer() {
         }
 
         if (showPaths) {
-          // Path: connect consecutive valid frames, colouring each short
-          // segment by that frame's confidence — this is the "confidence
-          // colouring" the track path needs (green = trust it, red = check it).
+          // Path: connect consecutive valid frames, coloured one of two ways
+          // (todo 5, second round). `confidence` shades each short segment by
+          // that frame's confidence — green = trust it, red = check it — which
+          // is the better answer to "is this track any good" and the worse one
+          // to "which of these four trails is p3", since every track is drawn
+          // from the same ramp. `track` uses the point's own colour instead,
+          // and can stroke the whole trail as one path.
           ctx.lineWidth = isSelected ? 2.5 : 1.5;
-          for (let f = 1; f < track.n_frames; f++) {
-            const x0 = track.x[f - 1];
-            const y0 = track.y[f - 1];
-            const x1 = track.x[f];
-            const y1 = track.y[f];
-            if (x0 == null || y0 == null || x1 == null || y1 == null) continue;
-            ctx.strokeStyle = confidenceColor((track.confidence[f - 1] + track.confidence[f]) / 2);
+          if (pathColor === "track") {
+            ctx.save();
+            ctx.strokeStyle = color;
             ctx.beginPath();
-            ctx.moveTo(toCanvasX(x0), toCanvasY(y0));
-            ctx.lineTo(toCanvasX(x1), toCanvasY(y1));
+            let started = false;
+            for (let f = 0; f < track.n_frames; f++) {
+              const x = track.x[f];
+              const y = track.y[f];
+              if (x == null || y == null) {
+                started = false;
+                continue;
+              }
+              const px = toCanvasX(x);
+              const py = toCanvasY(y);
+              if (started) ctx.lineTo(px, py);
+              else ctx.moveTo(px, py);
+              started = true;
+            }
             ctx.stroke();
+            ctx.restore();
+          } else {
+            for (let f = 1; f < track.n_frames; f++) {
+              const x0 = track.x[f - 1];
+              const y0 = track.y[f - 1];
+              const x1 = track.x[f];
+              const y1 = track.y[f];
+              if (x0 == null || y0 == null || x1 == null || y1 == null) continue;
+              ctx.strokeStyle = confidenceColor(
+                (track.confidence[f - 1] + track.confidence[f]) / 2,
+              );
+              ctx.beginPath();
+              ctx.moveTo(toCanvasX(x0), toCanvasY(y0));
+              ctx.lineTo(toCanvasX(x1), toCanvasY(y1));
+              ctx.stroke();
+            }
           }
         }
 
@@ -360,7 +413,11 @@ export function Viewer() {
             }
             ctx.beginPath();
             ctx.arc(toCanvasX(mx), toCanvasY(my), isSelected ? 6 : 4, 0, Math.PI * 2);
-            ctx.fillStyle = confidenceColor(track.confidence[currentFrame]);
+            // The marker follows the same choice as the path: telling tracks
+            // apart is not much use if their trails differ but the dots on this
+            // frame — the things actually being pointed at — do not.
+            ctx.fillStyle =
+              pathColor === "track" ? color : confidenceColor(track.confidence[currentFrame]);
             ctx.fill();
             ctx.lineWidth = 1.5;
             ctx.strokeStyle = dragging ? "#ffd166" : "#fff";
@@ -433,12 +490,9 @@ export function Viewer() {
     sizeTick,
     zoom,
     pan,
-    tracksVisible,
-    showPaths,
-    showMarkers,
-    showAnchors,
-    showGhost,
-    showWindows,
+    overlaysEnabled,
+    overlaysFor,
+    pathColor,
   ]);
 
   /** Convert a mouse event into source-video pixel coordinates, at the current zoom/pan. */
@@ -604,9 +658,11 @@ export function Viewer() {
       // Goes through the context (not api.addAnchor + refresh) so the keyframe
       // list is re-read with the track it lives on — see `addAnchorAt`.
       await addAnchorAt(selectedPointId, currentFrame, x, y);
-    } else if (placingMode === "none" && editing && overlayValid && selectedPointId) {
+    } else if (placingMode === "none" && overlayValid && selectedPointId) {
       // Click-to-move (todo 8): the selected point jumps to wherever was
-      // clicked, exactly as if it had been dragged there.
+      // clicked, exactly as if it had been dragged there. No mode to enter
+      // first (todo 25) — only the *selected* track can be moved, and a move is
+      // one undoable correction, so the cost of a stray click is one Ctrl+Z.
       commitMove(selectedPointId, x, y, evt.shiftKey);
     }
   }
@@ -640,10 +696,13 @@ export function Viewer() {
     }
 
     if (evt.button !== 0) return;
-    if (!editing || placingMode !== "none" || !overlayValid) return;
+    if (placingMode !== "none" || !overlayValid) return;
     const { canvasX, canvasY } = toSource(evt);
     const pointId = hitTest(canvasX, canvasY);
-    if (!pointId) return; // not on a marker -- the click handler may still move it
+    // Only the selected track is draggable: with several tracks on screen,
+    // grabbing whichever marker happens to be under the cursor is how a scrub
+    // turns into an edit nobody asked for (todo 25's one real risk).
+    if (!pointId || pointId !== selectedPointId) return;
     const track = tracks[pointId];
     const fromX = track.x[currentFrame]!;
     const fromY = track.y[currentFrame]!;
@@ -671,10 +730,13 @@ export function Viewer() {
     ? "viewer__canvas-wrap--dragging"
     : placingMode !== "none"
       ? "viewer__canvas-wrap--placing"
-      : editing && overlayValid
+      : selectedPointId && overlayValid
         ? "viewer__canvas-wrap--editing"
         : "";
 
+  // Whether any run is currently reporting a cursor — the only time the
+  // follow toggle means anything.
+  const liveRunning = Object.values(liveTracking).some((live) => live.frame != null);
   const zoomPct = Math.round(zoom * 100);
   const atFit = zoom === MIN_ZOOM && pan.x === 0 && pan.y === 0;
 
@@ -710,79 +772,65 @@ export function Viewer() {
           </button>
         </div>
         <div className="channel-checks">
-          <label className="channel-check" title="Hide every point overlay to see the frame underneath">
+          <label className="channel-check" title="Hide every track's overlay to see the frame underneath">
             <input
               type="checkbox"
-              checked={tracksVisible}
-              onChange={(e) => setTracksVisible(e.target.checked)}
+              checked={overlaysEnabled}
+              onChange={(e) => setOverlaysEnabled(e.target.checked)}
             />
-            Tracks
+            Overlays
           </label>
+          {liveRunning && (
+            <label
+              className="channel-check"
+              title="Keep the playhead on the frame the tracker is reading, so you can watch it work. Scrubbing releases it."
+            >
+              <input
+                type="checkbox"
+                checked={followTracker}
+                onChange={(e) => setFollowTracker(e.target.checked)}
+              />
+              Follow tracker
+            </label>
+          )}
+          {/* Confidence colouring answers "is this track any good"; the point's
+              own colour answers "which track is this". Both matter and one
+              canvas can only show one, so it is a choice rather than a default
+              (todo 5, second round). The timeline heat strip stays confidence-
+              coloured either way, so the signal is never entirely lost. */}
           <label
             className="channel-check"
-            style={{ opacity: tracksVisible ? 1 : 0.4 }}
-            title="The trail a point traces through the clip"
+            title="Colour each track's path and marker by its confidence (green = trust it, red = check it), or by the track's own colour so several tracks can be told apart. The timeline strip always shows confidence."
           >
-            <input
-              type="checkbox"
-              checked={showPaths}
-              disabled={!tracksVisible}
-              onChange={(e) => setShowPaths(e.target.checked)}
-            />
             Paths
+            <select
+              value={pathColor}
+              onChange={(e) => setPathColor(e.target.value as typeof pathColor)}
+              disabled={!overlaysEnabled}
+            >
+              <option value="confidence">by confidence</option>
+              <option value="track">by track</option>
+            </select>
           </label>
-          <label
-            className="channel-check"
-            style={{ opacity: tracksVisible ? 1 : 0.4 }}
-            title="Where each point is on this frame — independent of the paths, so the trails can be hidden without losing the points"
-          >
-            <input
-              type="checkbox"
-              checked={showMarkers}
-              disabled={!tracksVisible}
-              onChange={(e) => setShowMarkers(e.target.checked)}
-            />
-            Points
-          </label>
-          <label
-            className="channel-check"
-            style={{ opacity: tracksVisible ? 1 : 0.4 }}
-            title="Anchor keyframe pins"
-          >
-            <input
-              type="checkbox"
-              checked={showAnchors}
-              disabled={!tracksVisible}
-              onChange={(e) => setShowAnchors(e.target.checked)}
-            />
-            Anchors
-          </label>
-          <label
-            className="channel-check"
-            style={{ opacity: tracksVisible ? 1 : 0.4 }}
-            title="The dotted before/after ghost trail a correction leaves behind"
-          >
-            <input
-              type="checkbox"
-              checked={showGhost}
-              disabled={!tracksVisible}
-              onChange={(e) => setShowGhost(e.target.checked)}
-            />
-            Ghost trails
-          </label>
-          <label
-            className="channel-check"
-            style={{ opacity: tracksVisible ? 1 : 0.4 }}
-            title="The selected point's pattern window (solid) and how far the tracker searches for it each frame (dashed)"
-          >
-            <input
-              type="checkbox"
-              checked={showWindows}
-              disabled={!tracksVisible}
-              onChange={(e) => setShowWindows(e.target.checked)}
-            />
-            Windows
-          </label>
+          {/* These are the *defaults*: a track card can override any of them
+              for itself, which is what "show/hide UI items for a given track"
+              needs once a shot has more than one or two (todo 9). */}
+          {OVERLAY_LABELS.map(([key, label, help]) => (
+            <label
+              key={key}
+              className="channel-check"
+              style={{ opacity: overlaysEnabled ? 1 : 0.4 }}
+              title={help}
+            >
+              <input
+                type="checkbox"
+                checked={overlays[key]}
+                disabled={!overlaysEnabled}
+                onChange={(e) => setOverlays({ ...overlays, [key]: e.target.checked })}
+              />
+              {label}
+            </label>
+          ))}
         </div>
       </div>
       <div ref={wrapRef} className={`viewer__canvas-wrap ${cursorClass}`}>
@@ -799,16 +847,14 @@ export function Viewer() {
               : "Click on the video to add an anchor here"}
           </div>
         )}
-        {placingMode === "none" && editing && overlayValid && (
+        {placingMode === "none" && overlayValid && selectedPointId && (
           <div className="viewer__hint">
-            {selectedPointId
-              ? `Click to move the selected point, or drag it directly — ${
-                  dragMode === "replace" ? "hard replace at this frame" : `offset, ${falloff}f falloff`
-                } (hold Shift to replace)`
-              : "Select a point to move or drag it on the frame"}
+            {`Click to move ${selectedPointId}, or drag it directly — ${
+              dragMode === "replace" ? "hard replace at this frame" : `offset, ${falloff}f falloff`
+            } (Shift to replace, Ctrl+Z to undo)`}
           </div>
         )}
-        {editing && !overlayValid && (
+        {!overlayValid && (
           <div className="viewer__hint">
             Turn the stabilized preview off to edit points on the frame
           </div>
@@ -831,7 +877,7 @@ export function Viewer() {
         </button>
         <span style={{ marginLeft: 8, color: "var(--text-dim)" }}>
           ←/→ frame · space play/pause · ↑/↓ keyframe · A anchor here (⇧A click to place) ·
-          wheel/+/- zoom · middle-drag pan
+          I/O set in-out (⇧I/⇧O go there) · wheel/+/- zoom · middle-drag pan
         </span>
       </div>
     </div>

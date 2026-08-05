@@ -1,0 +1,10 @@
+The new Preview UI in the video export is good. However we have to go back to the existing Video tab to do the export. Deprecate the existing Video tab and move all the export options to the new Preview UI. This will make it more intuitive for users to preview and export their videos in one place.
+
+The exported video clip length should be based on the In/Out markers set by the user. If no markers are set, it should default to the full video length. However, in a test I set In/Out markers and the exported video was still the full length of the video. The marked frames made up the first part of the video, but the remaining frames were just the last frame repearted until the end of the video (or that's how it appeared when played back in VLC)
+
+Add controls to jump to the In/Out markers in the playback timeline. This will allow users to quickly navigate to the start and end points of their desired clip range.
+
+The realtime progress of the track processing shows "running 0% frame xxxx" the frame number is increaseing tbut the percentage is not. It should show the percentage of frames processed out of the total number of frames to be processed. This will give users a better sense of how long the tracking process will take.
+
+When we add a new Track is assigns a new colour to the track, which is used to colour the markers and the track line in the canvas. However, the paths on the canvas are all drawn in the same colour, actually the showing the track confidence which is a nice feature. We should add a toggle to the canvas to show either the track colour or the track confidence. This will allow users to easily differentiate between tracks and understand the quality of the tracking data.
+

@@ -24,6 +24,7 @@ from stable.core.errors import TrackerError
 from stable.core.types import Query, TrackResult
 from stable.trackers.correlation import CorrelationTracker
 from stable.trackers.cotracker3 import CoTracker3Tracker
+from stable.trackers.features import OrbTracker, SiftTracker
 from stable.trackers.kalman import KalmanTracker
 from stable.trackers.klt import KLTTracker
 from stable.trackers.lk import LKTracker
@@ -31,6 +32,7 @@ from stable.trackers.meanshift import MeanShiftTracker
 from stable.trackers.particle import ParticleFilterTracker
 from stable.trackers.raft import RaftTracker
 from stable.trackers.registry import available_trackers, describe_trackers, get_tracker
+from stable.trackers.sam3 import Sam3Tracker
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.template import TemplateTracker
 
@@ -55,12 +57,18 @@ def make_plugin(name: str):
         return ParticleFilterTracker()
     if name == "meanshift":
         return MeanShiftTracker()
+    if name == "sift":
+        return SiftTracker()
+    if name == "orb":
+        return OrbTracker()
     if name == "cotracker3":
         return CoTracker3Tracker(backend=MarkerBackend(), **DEEP_KWARGS)
     if name == "tapir":
         return TapirTracker(backend=MarkerBackend(), **DEEP_KWARGS)
     if name == "raft":
         return RaftTracker(backend=MarkerBackend(), **DEEP_KWARGS)
+    if name == "sam3":
+        return Sam3Tracker(backend=MarkerBackend(), **DEEP_KWARGS)
     raise AssertionError(f"unknown tracker {name!r}")
 
 
@@ -75,8 +83,16 @@ TRACKERS = [
     "cotracker3",
     "tapir",
     "raft",
+    "sam3",
 ]
-DEEP = ["cotracker3", "tapir", "raft"]
+DEEP = ["cotracker3", "tapir", "raft", "sam3"]
+
+# The feature matchers are held to the same *registry* contract here, but
+# their behavioural contract lives in tests/test_feature_trackers.py: this
+# module's clip is a smooth gradient plus one bright square, and SIFT's DoG
+# finds a single keypoint in the whole frame. Asserting tracking accuracy on
+# material a tracker cannot see would test the fixture, not the plugin.
+REGISTRY_TRACKERS = [*TRACKERS, "sift", "orb"]
 
 
 @pytest.fixture(params=TRACKERS)
@@ -88,7 +104,7 @@ def plugin(request):
 # -- registry contract ----------------------------------------------------
 
 
-@pytest.mark.parametrize("name", TRACKERS)
+@pytest.mark.parametrize("name", REGISTRY_TRACKERS)
 def test_every_tracker_is_discoverable_and_described(name):
     plugin_class = get_tracker(name)
     assert name in available_trackers()
@@ -101,7 +117,7 @@ def test_every_tracker_is_discoverable_and_described(name):
     assert plugin_class.requires_gpu is False
 
 
-@pytest.mark.parametrize("name", TRACKERS)
+@pytest.mark.parametrize("name", REGISTRY_TRACKERS)
 def test_lifecycle_is_uniform(name):
     plugin = make_plugin(name)
     assert not plugin.is_prepared
@@ -225,6 +241,35 @@ def test_progress_is_reported_and_ends_at_one(plugin, video):
     assert seen
     assert seen[-1] == pytest.approx(1.0)
     assert seen == sorted(seen)
+
+
+def test_progress_moves_while_a_single_query_run_is_in_flight(plugin, video):
+    """todo 4 (second round): "running 0%" for the whole of a long track.
+
+    The test above ran two queries, so a plugin reporting once *per query* still
+    produced a rising sequence and passed. Server-side tracking gives every run
+    exactly one query
+    (:func:`stable.server.tracking.run_point_tracking` calls
+    ``plugin.track(video, [spec.anchor], ...)``), which turned that same code
+    into a single report, fired when the run was already over — a progress bar
+    that sat at zero while the frame counter beside it climbed.
+
+    So the number that matters is how often progress is heard from *before* the
+    final ``1.0``, on one query. That is what this asserts.
+    """
+    seen: list[float] = []
+    plugin.track(
+        video,
+        [anchor_at(video, 0)],
+        (0, video.frame_count),
+        progress=lambda fraction, message="": seen.append(fraction),
+    )
+
+    during = seen[:-1]
+    assert len(during) > 1, "a run must report progress while it is running, not only at the end"
+    assert during == sorted(during)
+    assert during[-1] > 0.0
+    assert seen[-1] == pytest.approx(1.0)
 
 
 def test_output_is_deterministic(plugin, video):
