@@ -937,6 +937,38 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
+/* One row per setting the point's tracker accepts: label, slider, value.
+   The grid keeps the three columns aligned however many rows there are. */
+.patch-panel__settings {
+  display: grid;
+  gap: 4px 8px;
+  font-size: 0.8rem;
+}
+
+.patch-setting {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr 5.5rem;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+}
+
+.patch-setting input[type="range"] {
+  width: 100%;
+  min-width: 60px;
+}
+
+.patch-setting__value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.patch-panel__note {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
 .patch-panel__pending {
   color: var(--text-dim);
 }

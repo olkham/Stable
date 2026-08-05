@@ -94,6 +94,8 @@ export function PointsPanel() {
     setCurrentFrame,
     placingMode,
     setPlacingMode,
+    addAnchorHere,
+    afterEdit,
     latestJobFor,
     tracks,
     invalidateTrack,
@@ -127,7 +129,10 @@ export function PointsPanel() {
   async function handleDeleteAnchor(pointId: string, frame: number) {
     try {
       await api.deleteAnchor(project.id, pointId, frame);
-      await refresh();
+      // The track carries the keyframe list, so it has to be re-read too — a
+      // project refresh alone would leave the deleted pin listed as if it had
+      // been promoted from a correction.
+      await afterEdit(pointId);
     } catch (err) {
       alert(err instanceof Error ? err.message : String(err));
     }
@@ -177,9 +182,18 @@ export function PointsPanel() {
           const retrackJob = latestJobFor("retrack", point.id);
           const isSelected = point.id === selectedPointId;
           const track = tracks[point.id] as PointTrack | undefined;
-          // Fall back to the point's own pins until its track has loaded, so
-          // the anchor list is never empty just because a fetch is in flight.
-          const anchors: Query[] = track?.ground_truth ?? point.queries;
+          // The point's own pins, plus the keyframes its corrections were
+          // promoted to. Pins come from the project (refreshed the moment one
+          // is placed); promotions only exist on the track, which is fetched
+          // and cached separately — so reading the list off `ground_truth`
+          // alone left a just-placed anchor missing here until the next track
+          // run replaced that cache, even though the canvas drew it at once.
+          const promoted = (track?.ground_truth ?? []).filter(
+            (g) => !point.queries.some((q) => q.frame === g.frame),
+          );
+          const anchors: Query[] = [...point.queries, ...promoted].sort(
+            (a, b) => a.frame - b.frame,
+          );
           const flagged = new Set(track?.flagged_anchors ?? []);
           const violations = track?.anchor_violations ?? [];
           return (
@@ -278,11 +292,17 @@ export function PointsPanel() {
                   className={`anchor-add ${
                     placingMode === "add-anchor" && isSelected ? "button--active" : ""
                   }`}
-                  onClick={() => {
+                  title={`Pin this point at frame ${currentFrame} where it already is (shortcut: A), or click the frame to place it somewhere else (⇧A)`}
+                  onClick={async () => {
                     setSelectedPointId(point.id);
-                    setPlacingMode(
-                      placingMode === "add-anchor" && isSelected ? "none" : "add-anchor",
-                    );
+                    if (placingMode === "add-anchor" && isSelected) {
+                      setPlacingMode("none");
+                      return;
+                    }
+                    // Same rule as the shortcut: pin where the point already
+                    // is, and only ask for a click when there is nothing there
+                    // to pin.
+                    if (!(await addAnchorHere(point.id))) setPlacingMode("add-anchor");
                   }}
                 >
                   + anchor

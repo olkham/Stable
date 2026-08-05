@@ -13,6 +13,7 @@ from typing import Any
 from ..core.project import PointSpec, Project
 from ..core.types import PointTrack
 from .storage import Workspace
+from .tracker_options import load_tracker_options, tracker_search, tracker_window
 from .tracking import load_report, report_path_for
 
 __all__ = ["point_summary", "project_detail"]
@@ -57,13 +58,39 @@ def _load_track_stats(project: Project, point: PointSpec) -> dict[str, Any]:
     }
 
 
-def point_summary(project: Project, point: PointSpec) -> dict[str, Any]:
-    """Return a point's list/detail summary (no per-frame arrays)."""
+def point_summary(
+    project: Project, point: PointSpec, options: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return a point's list/detail summary (no per-frame arrays).
+
+    Args:
+        project: The point's project.
+        point: The point to describe.
+        options: The point's stored tracker settings. Omit it and they are read
+            from the project's own directory — correct for a caller summarising
+            one point, wasteful for a caller summarising a list, which reads the
+            sidecar once and passes each point's share (``{}`` included, so a
+            point with no overrides does not trigger a second read).
+    """
+    if options is None:
+        options = load_tracker_options(Path(project.directory)).get(point.id, {})
+    radius, radius_source = tracker_window(point.tracker, options)
+    search_radius, search_source, _note = tracker_search(point.tracker, options)
     return {
         "id": point.id,
         "queries": [q.to_dict() for q in point.sorted_queries()],
         "tracker": point.tracker,
         "enabled_for_solve": point.enabled_for_solve,
+        # The regions this point's tracker matches and searches, in source
+        # pixels. Carried on every point so the canvas can draw the pattern and
+        # search boxes for all of them without a request per point — see
+        # :mod:`stable.server.tracker_options` for where the numbers come from.
+        "window": {
+            "radius": radius,
+            "attribute": radius_source,
+            "search_radius": search_radius,
+            "search_attribute": search_source,
+        },
         **_load_track_stats(project, point),
     }
 
@@ -86,13 +113,15 @@ def project_detail(workspace: Workspace, project_id: str) -> dict[str, Any]:
         else:
             proxy[tier_name] = {"ready": False}
 
+    # One sidecar read for the whole list rather than one per point.
+    stored = load_tracker_options(workspace.project_dir(project_id))
     return {
         "id": meta.id,
         "name": meta.name,
         "created_at": meta.created_at,
         "original_filename": meta.original_filename,
         "video": project.video.to_dict(),
-        "points": [point_summary(project, p) for p in project.points],
+        "points": [point_summary(project, p, stored.get(p.id)) for p in project.points],
         "solve": project.solve.to_dict(),
         "smoothing": [s.to_dict() for s in project.smoothing],
         "render": project.render.to_dict(),

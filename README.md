@@ -41,6 +41,14 @@ stable sample          # writes ./stable-sample/{clip.mp4, tracks.json, curves.c
 no GPU, no model download, nothing to configure — so there is something
 concrete to look at within seconds of installing.
 
+In the viewer: `←`/`→` step a frame, space plays, `↑`/`↓` jump between the
+selected point's keyframes, `A` pins it where it is on this frame (`⇧A` to
+click the position instead), `+`/`-`/`0` and the wheel zoom, middle-drag pans.
+Each point's **pattern** and **search** sizes are per point, set on the sliders
+beside its patch thumbnails and drawn on the frame as a solid and a dashed box,
+so a feature bigger than the tracker's default window is a slider away rather
+than a reason the track fails.
+
 ## Install
 
 ```bash
@@ -125,6 +133,13 @@ stable models     # list model checkpoints and their cache state
 stable track clip.mp4 --point 120.5,80@0 --point 640,360@0 \
     --tracker lk --out tracks.json
 
+# ...sized to the feature: --window is the pattern's half-size in pixels and
+# --search how far it may move between frames, both stated in pixels whatever
+# the plugin calls its own arguments (a tracker that has no search area says so
+# rather than ignoring the flag)
+stable track clip.mp4 --point 120.5,80@0 --tracker template \
+    --window 24 --search 48 --out tracks.json
+
 # 2. export the solved X/Y/R/S curves
 stable solve tracks.json --out curves.csv --video clip.mp4
 
@@ -195,6 +210,7 @@ trackers' model code) — the frontend is already built into the package
 | `stable.smoothing.edit` | Curve-editor operations: sub-range blend, pin |
 | `stable.render.warp` | The per-frame affine and the three border policies |
 | `stable.render.stabilize` | Planning a render, streaming it to a file or PNG sequence |
+| `stable.server.tracker_options` | Per-point pattern/search sizes: which arguments a plugin lets the operator set, in what units |
 | `stable.server.app` | The FastAPI app: routing, static frontend, packaged-vs-source dist resolution |
 | `stable.server.jobs` | The background job queue + WebSocket progress, incl. model downloads |
 | `stable.server.routes.models` | Model checkpoint list / download / delete, the UI's model manager backend |

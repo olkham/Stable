@@ -38,10 +38,15 @@ from ..storage import Workspace, get_workspace
 from ..tracker_options import (
     SEARCH_RADIUS_RANGE,
     TEMPLATE_RADIUS_RANGE,
+    constructor_parameters,
+    load_tracker_options,
     patch_bounds,
     point_options,
     save_point_options,
+    setting_for,
     template_patch,
+    tracker_search,
+    tracker_settings,
     tracker_window,
 )
 from ..tracking import (
@@ -77,7 +82,8 @@ def list_points(
 ) -> list[dict[str, Any]]:
     """List every point on a project, with lightweight track stats."""
     project = workspace.load_project(project_id)
-    return [point_summary(project, p) for p in project.points]
+    stored = load_tracker_options(workspace.project_dir(project_id))
+    return [point_summary(project, p, stored.get(p.id, {})) for p in project.points]
 
 
 @router.post("")
@@ -383,17 +389,20 @@ def get_point_patches(
             followed *now*, not only where it was pinned.
 
     Returns:
-        The effective window radius and where it came from, the template-size
-        control's range (whether or not it applies), and one entry per patch
-        with ``available`` saying whether it can actually be built — a keyframe
-        too close to the frame edge is reported rather than 404-ing later, so
-        the grid can show *why* a thumbnail is missing.
+        The effective window radius and where it came from, every setting this
+        point's tracker lets the operator change (``settings``, one control per
+        row), the pattern/search summary the canvas draws its boxes from, and
+        one entry per patch with ``available`` saying whether it can actually be
+        built — a keyframe too close to the frame edge is reported rather than
+        404-ing later, so the grid can show *why* a thumbnail is missing.
     """
     project = workspace.load_project(project_id)
     point = _point_or_404(project, point_id)
 
     stored = point_options(workspace.project_dir(project_id), point_id)
     radius, source_attribute = tracker_window(point.tracker, stored)
+    settings = tracker_settings(point.tracker, stored)
+    search_radius, search_attribute, search_note = tracker_search(point.tracker, stored)
     default_radius, default_search = _template_defaults()
 
     video = workspace.get_video_source(project_id)
@@ -414,6 +423,7 @@ def get_point_patches(
         if found is not None:
             current = entry(found[0], frame, found[1])
 
+    window_setting = next((s for s in settings if s["role"] == "window"), None)
     return {
         "point_id": point_id,
         "tracker": point.tracker,
@@ -423,7 +433,29 @@ def get_point_patches(
         # tracker has no local window at all (the deep trackers see whole
         # frames) and this is only a preview size.
         "radius_source": source_attribute,
-        "adjustable": "template_radius" in point_options_schema(point.tracker),
+        # True when this tracker's window is the operator's to set — which is
+        # every classic-CV plugin, each under its own argument name, not only
+        # the template matcher's `template_radius`.
+        "adjustable": window_setting is not None,
+        # One row per control the panel should draw, in order. The panel is
+        # deliberately ignorant of which tracker is selected; this is why.
+        "settings": settings,
+        # The pattern and search regions in one shape, in source pixels, for
+        # the canvas overlay. `search.radius` is null where the algorithm has
+        # no search area at all, and `note` says why.
+        "window": {
+            "radius": radius,
+            "size_px": radius * 2 + 1,
+            "attribute": source_attribute,
+            "adjustable": window_setting is not None,
+        },
+        "search": {
+            "radius": search_radius,
+            "size_px": None if search_radius is None else search_radius * 2 + 1,
+            "attribute": search_attribute,
+            "adjustable": any(s["role"] == "search" for s in settings),
+            "note": search_note,
+        },
         "template_radius": int(stored.get("template_radius", default_radius)),
         "search_radius": int(stored.get("search_radius", default_search)),
         "defaults": {"template_radius": default_radius, "search_radius": default_search},
@@ -436,19 +468,8 @@ def get_point_patches(
 
 
 def point_options_schema(tracker_name: str) -> set[str]:
-    """Return the constructor arguments ``tracker_name`` accepts.
-
-    Used to decide whether the size slider does anything for this tracker: a
-    control that silently fails to change a run is worse than no control.
-    """
-    import inspect  # noqa: PLC0415 - only needed on this path
-
-    from ...trackers.registry import get_tracker  # noqa: PLC0415 - avoids an import cycle
-
-    try:
-        return set(inspect.signature(get_tracker(tracker_name).__init__).parameters)
-    except Exception:  # noqa: BLE001 - an unknown tracker accepts nothing
-        return set()
+    """Return the constructor arguments ``tracker_name`` accepts."""
+    return set(constructor_parameters(tracker_name))
 
 
 @router.put("/{point_id}/patches")
@@ -458,16 +479,32 @@ def set_point_patch_options(
     body: TemplateOptionsUpdate,
     workspace: Workspace = Depends(_workspace),
 ) -> dict[str, Any]:
-    """Set (or clear) a point's template sizes.
+    """Set (or clear) this point's tracker sizes — pattern window, search area.
 
-    A ``null`` for either radius restores the plugin's own default, which is
-    what the panel's "reset" does — storing the default explicitly would freeze
-    it against any later change to the tracker.
+    Any argument in :data:`stable.server.tracker_options.SETTINGS` that the
+    point's *own* tracker accepts may be sent, under the plugin's own name and
+    in the plugin's own units (LK's ``win_size`` is a full side, the radii are
+    half-sizes). One that the tracker would not take is a 400 rather than a
+    silent no-op: the whole point of storing these per point is that they reach
+    the run, and a setting that could not is a bug in the caller.
+
+    A ``null`` restores the plugin's own default, which is what the panel's
+    "reset" does — storing the default explicitly would freeze it against any
+    later change to the tracker.
     """
     project = workspace.load_project(project_id)
-    _point_or_404(project, point_id)
+    point = _point_or_404(project, point_id)
 
     payload = body.model_dump(exclude_unset=True)
+    accepted = point_options_schema(point.tracker)
+    for key in payload:
+        if setting_for(key) is None:
+            raise HTTPException(status_code=400, detail=f"{key!r} is not a settable tracker option")
+        if key not in accepted:
+            raise HTTPException(
+                status_code=400,
+                detail=f"tracker {point.tracker!r} has no {key!r} setting",
+            )
     try:
         save_point_options(workspace.project_dir(project_id), point_id, payload)
     except StableError as exc:

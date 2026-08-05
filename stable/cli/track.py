@@ -114,10 +114,67 @@ def add_track_parser(subparsers: Any) -> argparse.ArgumentParser:
         help="tracking direction relative to each point's anchor frame (default: %(default)s)",
     )
     parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="pattern half-size in source pixels: how big the feature being tracked is. "
+        "Given in pixels whatever the plugin calls its own window argument "
+        "(default: the tracker's own)",
+    )
+    parser.add_argument(
+        "--search",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="how far beyond the pattern to search each frame, in source pixels; only for "
+        "trackers that scan a search area (default: the tracker's own)",
+    )
+    parser.add_argument(
         "--device", default=None, help="compute device ('cpu', 'cuda', ...); default: automatic"
     )
     parser.add_argument("--quiet", action="store_true", help="suppress the progress line")
     return parser
+
+
+def _size_options(tracker_name: str, window: int | None, search: int | None) -> dict[str, Any]:
+    """Turn ``--window`` / ``--search`` pixels into this tracker's own arguments.
+
+    The operator measures a feature in pixels; the plugins disagree about what
+    to call that (``template_radius``, ``patch_radius``, ``win_size``, ...) and
+    whether it is a half-size or a full side. The mapping lives in one table
+    shared with the server, so the CLI and the browser configure a run
+    identically.
+
+    Raises:
+        StableError: If this tracker has no such setting — a flag that would be
+            silently dropped is refused, with the reason.
+    """
+    from ..server.tracker_options import (  # noqa: PLC0415 - only needed on this path
+        SETTINGS,
+        constructor_parameters,
+        tracker_search,
+    )
+
+    accepted = constructor_parameters(tracker_name)
+    options: dict[str, Any] = {}
+    for value, role, flag in ((window, "window", "--window"), (search, "search", "--search")):
+        if value is None:
+            continue
+        setting = next(
+            (s for s in SETTINGS if s.role == role and s.radius_factor and s.attribute in accepted),
+            None,
+        )
+        if setting is None:
+            _radius, _attribute, note = tracker_search(tracker_name)
+            raise ContractError(f"tracker {tracker_name!r} has no {flag} setting: {note}")
+        if not setting.minimum <= setting.from_radius(value) <= setting.maximum:
+            raise ContractError(
+                f"{flag} {value} is out of range for {tracker_name!r} "
+                f"({setting.attribute} must lie in [{setting.minimum}, {setting.maximum}])"
+            )
+        options[setting.attribute] = setting.from_radius(value)
+    return options
 
 
 def _points_row_to_json(row: Any) -> list[list[float] | None]:
@@ -244,7 +301,8 @@ def run_track(args: argparse.Namespace) -> int:
 
     tracker = None
     try:
-        tracker = create_tracker(args.tracker, device=args.device)
+        options = _size_options(args.tracker, args.window, args.search)
+        tracker = create_tracker(args.tracker, device=args.device, options=options)
         result = tracker.track(
             video,
             args.points,

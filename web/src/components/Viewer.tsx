@@ -3,6 +3,7 @@ import * as api from "../api/client";
 import { confidenceColor, pointColor } from "../colors";
 import { useFrameImages } from "../hooks/useFrameImages";
 import { useProjectContext } from "../state/ProjectContext";
+import type { PointSummary, TrackData } from "../types";
 
 /** How close (in canvas CSS pixels) a mousedown has to be to grab a point. */
 const GRAB_RADIUS = 12;
@@ -68,6 +69,23 @@ function canvasToSource(cx: number, cy: number, t: ViewTransform, videoW: number
   return { x: (cx - t.originX) / t.scale + videoW / 2, y: (cy - t.originY) / t.scale + videoH / 2 };
 }
 
+/**
+ * Where a point sits on one frame, in source pixels: what the tracker found
+ * there, or the keyframe the operator pinned there if it has not been tracked
+ * yet. Null when the point has neither, which is a frame with nothing to draw.
+ */
+function markerPosition(
+  point: PointSummary,
+  track: TrackData | undefined,
+  frame: number,
+): { x: number; y: number } | null {
+  const x = track?.x[frame];
+  const y = track?.y[frame];
+  if (x != null && y != null) return { x, y };
+  const pinned = point.queries.find((q) => q.frame === frame);
+  return pinned ? { x: pinned.x, y: pinned.y } : null;
+}
+
 /** Keep panned content covering the display box rather than drifting off it. */
 function clampPan(pan: Pan, zoom: number, dispW: number, dispH: number, videoW: number, videoH: number): Pan {
   const scale = fitScale(dispW, dispH, videoW, videoH) * zoom;
@@ -105,6 +123,7 @@ export function Viewer() {
     setSelectedPointId,
     placingMode,
     setPlacingMode,
+    addAnchorAt,
     stabilizedPreview,
     tracks,
     loadTrack,
@@ -137,10 +156,16 @@ export function Viewer() {
   }, [project.id]);
 
   // -- overlay visibility (todos 7, 10) -----------------------------------------
+  // `showPaths` is the trail through time; `showMarkers` is where the point is
+  // *now*. They were one flag, which meant hiding the clutter of a hundred
+  // dotted trails also hid the thing being tracked — the one element you can
+  // never do without. Separate flags, separate checkboxes.
   const [tracksVisible, setTracksVisible] = useState(true);
   const [showPaths, setShowPaths] = useState(true);
+  const [showMarkers, setShowMarkers] = useState(true);
   const [showAnchors, setShowAnchors] = useState(true);
   const [showGhost, setShowGhost] = useState(true);
+  const [showWindows, setShowWindows] = useState(true);
 
   const proxy = project.proxy["half"];
   const proxyReady = proxy?.ready && proxy.width && proxy.height;
@@ -256,7 +281,7 @@ export function Viewer() {
 
         const hx = live.x[currentFrame];
         const hy = live.y[currentFrame];
-        if (hx != null && hy != null) {
+        if (showMarkers && hx != null && hy != null) {
           ctx.save();
           ctx.strokeStyle = "#ffffff";
           ctx.lineWidth = 2;
@@ -313,7 +338,9 @@ export function Viewer() {
             ctx.lineTo(toCanvasX(x1), toCanvasY(y1));
             ctx.stroke();
           }
+        }
 
+        if (showMarkers) {
           // Current-frame marker, following the pointer while it is being dragged.
           const cx = track.x[currentFrame];
           const cy = track.y[currentFrame];
@@ -360,6 +387,35 @@ export function Viewer() {
           ctx.restore();
         }
       }
+
+      // The pattern the tracker matches and how far it looks for it, as two
+      // boxes on the frame — the only way to answer "is my window big enough
+      // for this feature, and does it move further than that between frames?"
+      // by looking rather than by guessing. Selected point only: at eight
+      // points this would be a mesh, and the size being judged is the one
+      // whose sliders are open in the panel below.
+      if (showWindows && isSelected) {
+        const at = markerPosition(point, track, currentFrame);
+        if (at) {
+          const box = (radius: number, dashed: boolean, stroke: string) => {
+            const side = (radius * 2 + 1) * t.scale;
+            ctx.save();
+            ctx.setLineDash(dashed ? [5, 4] : []);
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = stroke;
+            ctx.strokeRect(
+              toCanvasX(at.x - radius) - 0.5,
+              toCanvasY(at.y - radius) - 0.5,
+              side,
+              side,
+            );
+            ctx.restore();
+          };
+          const search = point.window?.search_radius ?? null;
+          if (search !== null) box(search, true, "rgba(255,255,255,0.55)");
+          if (point.window?.radius) box(point.window.radius, false, color);
+        }
+      }
     }
   }, [
     project.points,
@@ -379,8 +435,10 @@ export function Viewer() {
     pan,
     tracksVisible,
     showPaths,
+    showMarkers,
     showAnchors,
     showGhost,
+    showWindows,
   ]);
 
   /** Convert a mouse event into source-video pixel coordinates, at the current zoom/pan. */
@@ -542,9 +600,10 @@ export function Viewer() {
       setSelectedPointId(point.id);
       await refresh();
     } else if (placingMode === "add-anchor" && selectedPointId) {
-      await api.addAnchor(project.id, selectedPointId, currentFrame, x, y);
       setPlacingMode("none");
-      await refresh();
+      // Goes through the context (not api.addAnchor + refresh) so the keyframe
+      // list is re-read with the track it lives on — see `addAnchorAt`.
+      await addAnchorAt(selectedPointId, currentFrame, x, y);
     } else if (placingMode === "none" && editing && overlayValid && selectedPointId) {
       // Click-to-move (todo 8): the selected point jumps to wherever was
       // clicked, exactly as if it had been dragged there.
@@ -662,7 +721,7 @@ export function Viewer() {
           <label
             className="channel-check"
             style={{ opacity: tracksVisible ? 1 : 0.4 }}
-            title="Track path lines and the current-frame marker"
+            title="The trail a point traces through the clip"
           >
             <input
               type="checkbox"
@@ -671,6 +730,19 @@ export function Viewer() {
               onChange={(e) => setShowPaths(e.target.checked)}
             />
             Paths
+          </label>
+          <label
+            className="channel-check"
+            style={{ opacity: tracksVisible ? 1 : 0.4 }}
+            title="Where each point is on this frame — independent of the paths, so the trails can be hidden without losing the points"
+          >
+            <input
+              type="checkbox"
+              checked={showMarkers}
+              disabled={!tracksVisible}
+              onChange={(e) => setShowMarkers(e.target.checked)}
+            />
+            Points
           </label>
           <label
             className="channel-check"
@@ -697,6 +769,19 @@ export function Viewer() {
               onChange={(e) => setShowGhost(e.target.checked)}
             />
             Ghost trails
+          </label>
+          <label
+            className="channel-check"
+            style={{ opacity: tracksVisible ? 1 : 0.4 }}
+            title="The selected point's pattern window (solid) and how far the tracker searches for it each frame (dashed)"
+          >
+            <input
+              type="checkbox"
+              checked={showWindows}
+              disabled={!tracksVisible}
+              onChange={(e) => setShowWindows(e.target.checked)}
+            />
+            Windows
           </label>
         </div>
       </div>
@@ -745,7 +830,8 @@ export function Viewer() {
           ▶
         </button>
         <span style={{ marginLeft: 8, color: "var(--text-dim)" }}>
-          ←/→ frame · space play/pause · ↑/↓ keyframe · wheel/+/- zoom · middle-drag pan
+          ←/→ frame · space play/pause · ↑/↓ keyframe · A anchor here (⇧A click to place) ·
+          wheel/+/- zoom · middle-drag pan
         </span>
       </div>
     </div>

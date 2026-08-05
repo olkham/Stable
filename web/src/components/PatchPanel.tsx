@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import * as api from "../api/client";
 import { pointColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
-import type { PointPatches } from "../types";
+import type { PointPatches, TrackerSetting } from "../types";
 
 /** Largest a thumbnail is drawn, whatever the patch's own pixel size. */
 const THUMB_PX = 72;
@@ -17,20 +17,24 @@ const THUMB_PX = 72;
  * corner at frame 0 and motion-blurred sky at frame 200 explains a failed track
  * instantly, and no other view in this app shows it.
  *
- * So the panel is shown for every point. What varies by tracker is only the
- * *size* control: the template tracker takes its window from a stored setting,
- * so there the slider changes what the next run will actually match; every
- * other plugin's window comes from its own constructor (LK's `win_size`,
- * mean-shift's `window_radius`, and so on), and the panel reports the real
- * number rather than offering a control that would silently change nothing.
+ * So the panel is shown for every point, and so is the size control: "the thing
+ * I am tracking is bigger than 33 px" is a statement about the subject, not
+ * about which plugin happens to be selected. The server says which settings the
+ * point's own tracker accepts and in what units (`settings`, from
+ * stable/server/tracker_options.py), and one control is drawn per row — the
+ * panel names no tracker and knows no argument, so a plugin that declares a
+ * window gets a working control here for free, and one that declares none gets
+ * an explanation instead of a slider that would change nothing.
  *
  * Patches are rendered server-side from the source clip and drawn pixelated on
  * purpose: at this size, smoothing would hide exactly the texture being judged.
  */
 export function PatchPanel({ pointId }: { pointId: string }) {
-  const { project, currentFrame, setCurrentFrame, editRevision } = useProjectContext();
+  const { project, currentFrame, setCurrentFrame, editRevision, refresh } = useProjectContext();
   const [info, setInfo] = useState<PointPatches | null>(null);
-  const [radius, setRadius] = useState<number | null>(null);
+  // Pending edits to the settings, keyed by the plugin's own argument name.
+  // Only what has been touched lives here, so a reload never fights the user.
+  const [draft, setDraft] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,7 +42,6 @@ export function PatchPanel({ pointId }: { pointId: string }) {
     try {
       const next = await api.getPointPatches(project.id, pointId, currentFrame);
       setInfo(next);
-      setRadius((current) => (current === null || !busy ? next.radius : current));
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -52,28 +55,52 @@ export function PatchPanel({ pointId }: { pointId: string }) {
     void reload();
   }, [reload]);
 
-  if (error) return <div className="error-text">{error}</div>;
-  if (!info || radius === null) return <div className="patch-panel">Loading patches…</div>;
+  // A different point (or a tracker change) invalidates every pending edit:
+  // the settings are per point and named per plugin.
+  useEffect(() => setDraft({}), [pointId, info?.tracker]);
 
-  const [minRadius, maxRadius] = info.template_radius_range;
-  const dirty = radius !== info.radius;
+  if (error) return <div className="error-text">{error}</div>;
+  if (!info) return <div className="patch-panel">Loading patches…</div>;
+
+  const settings = info.settings;
+  const windowSetting = settings.find((s) => s.role === "window");
+  const value = (setting: TrackerSetting) => draft[setting.attribute] ?? setting.value;
+  const dirty = settings.some((s) => value(s) !== s.value);
+  // What the thumbnails should show: the pattern size being previewed, which is
+  // the pending window value while the slider is being dragged.
+  const previewRadius =
+    (windowSetting ? radiusOf(windowSetting, value(windowSetting)) : 0) || info.radius;
   // Cache-buster: a patch URL is (point, frame, radius), but the *pixels* also
   // change when the track moves, and that does not alter the URL.
   const rev = editRevision;
 
-  async function apply(value: number | null) {
+  async function commit(body: Record<string, number | null>) {
     setBusy(true);
     try {
-      const next = await api.updatePointPatches(project.id, pointId, { template_radius: value });
+      const next = await api.updatePointPatches(project.id, pointId, body);
       setInfo(next);
-      setRadius(next.radius);
+      setDraft({});
       setError(null);
+      // The canvas draws its pattern/search boxes from the point summary, so
+      // the sizes have to be re-read there too or the boxes lag the panel.
+      await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
   }
+
+  /** Save every pending change in one request. */
+  const apply = () =>
+    commit(
+      Object.fromEntries(
+        settings.filter((s) => value(s) !== s.value).map((s) => [s.attribute, value(s)]),
+      ),
+    );
+
+  /** Clear every override this point has, restoring the plugin's own defaults. */
+  const reset = () => commit(Object.fromEntries(settings.map((s) => [s.attribute, null])));
 
   function thumb(patch: PointPatches["patches"][number], key: string) {
     const isCurrent = patch.frame === currentFrame;
@@ -90,7 +117,7 @@ export function PatchPanel({ pointId }: { pointId: string }) {
       >
         {patch.available ? (
           <img
-            src={api.pointPatchUrl(project.id, pointId, patch.frame, radius ?? undefined, rev)}
+            src={api.pointPatchUrl(project.id, pointId, patch.frame, previewRadius, rev)}
             width={THUMB_PX}
             height={THUMB_PX}
             alt={`Patch at frame ${patch.frame}`}
@@ -114,38 +141,64 @@ export function PatchPanel({ pointId }: { pointId: string }) {
 
   return (
     <div className="patch-panel" onClick={(e) => e.stopPropagation()}>
-      <div className="patch-panel__controls">
-        {info.adjustable ? (
-          <>
-            <label>
-              Template size
-              <input
-                type="range"
-                min={minRadius}
-                max={maxRadius}
-                value={radius}
-                disabled={busy}
-                onChange={(e) => setRadius(Number(e.target.value))}
-              />
-            </label>
-            <span className="patch-panel__size">
-              {radius * 2 + 1}px{dirty && <span className="patch-panel__pending"> (preview)</span>}
+      <div className="patch-panel__settings">
+        {settings.map((setting) => (
+          <label key={setting.attribute} className="patch-setting" title={setting.help}>
+            <span className="patch-setting__label">{setting.label}</span>
+            <input
+              type="range"
+              min={setting.minimum}
+              max={setting.maximum}
+              step={setting.step}
+              value={value(setting)}
+              disabled={busy}
+              onChange={(e) =>
+                setDraft((prev) => ({ ...prev, [setting.attribute]: Number(e.target.value) }))
+              }
+            />
+            <span className="patch-setting__value">
+              {describeSetting(setting, value(setting))}
+              {value(setting) !== setting.value && (
+                <span className="patch-panel__pending"> (preview)</span>
+              )}
             </span>
-            <button onClick={() => apply(radius)} disabled={busy || !dirty}>
-              Apply
-            </button>
-            <button
-              onClick={() => apply(null)}
-              disabled={busy || !info.custom}
-              title={`Back to the tracker's default (${info.defaults.template_radius * 2 + 1}px)`}
-            >
-              Reset
-            </button>
-          </>
-        ) : (
+          </label>
+        ))}
+
+        {settings.length === 0 && (
           <span className="patch-panel__size" title={patchSizeExplanation(info)}>
             {info.patch_size}px window · {info.tracker}
           </span>
+        )}
+        {/* The reach in pixels, whenever no slider above already states it —
+            a pyramid depth is a count, and "3 levels" does not answer "how far
+            can this point move between frames?". */}
+        {!settings.some((s) => s.role === "search" && s.unit !== "count") && (
+          <span className="patch-panel__note" title={info.search.note}>
+            {info.search.radius === null
+              ? "No search area"
+              : `Search reach ±${info.search.radius}px`}
+          </span>
+        )}
+
+        {settings.length > 0 && (
+          <div className="patch-panel__controls">
+            <button onClick={apply} disabled={busy || !dirty}>
+              Apply
+            </button>
+            <button
+              onClick={reset}
+              disabled={busy || !info.custom}
+              title={`Back to ${info.tracker}'s own defaults`}
+            >
+              Reset
+            </button>
+            {dirty && (
+              <span className="patch-panel__pending">
+                Not saved — the next run still uses the old size
+              </span>
+            )}
+          </div>
         )}
       </div>
 
@@ -241,7 +294,30 @@ export function AllPatchesStrip() {
 
 function patchSizeExplanation(info: PointPatches): string {
   if (info.radius_source) {
-    return `The region ${info.tracker} matches, from its own ${info.radius_source}. Switch this point to the template tracker to set it.`;
+    return `The region ${info.tracker} matches, from its own ${info.radius_source}.`;
   }
   return `${info.tracker} has no local search window — it sees whole frames — so this is a preview size only.`;
+}
+
+/** The radius in source pixels a setting's value corresponds to. */
+function radiusOf(setting: TrackerSetting, value: number): number {
+  if (setting.unit === "side") return Math.floor(value / 2);
+  if (setting.unit === "radius") return value;
+  return setting.radius; // not a length (pyramid depth); its own radius stands
+}
+
+/**
+ * How a value reads to the operator: in pixels they can measure on the frame.
+ *
+ * A pattern is stated as the square it covers, because that is the box drawn on
+ * the canvas; a search area as the distance the point may travel from where it
+ * was, because that is the question being answered ("does it move more than
+ * this between frames?"). A pyramid depth is neither, so it is stated as
+ * itself.
+ */
+function describeSetting(setting: TrackerSetting, value: number): string {
+  if (setting.unit === "count") return `${value} levels`;
+  if (setting.role === "search") return `±${radiusOf(setting, value)}px`;
+  const side = setting.unit === "side" ? value : value * 2 + 1;
+  return `${side}px square`;
 }

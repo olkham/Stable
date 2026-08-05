@@ -36,14 +36,24 @@ Direction = Literal["fwd", "bwd", "bidir"]
 
 
 class TemplateOptionsUpdate(BaseModel):
-    """Body for ``PUT .../points/{id}/template``: one point's template sizes.
+    """Body for ``PUT .../points/{id}/patches``: one point's tracker sizes.
 
-    Both fields are optional *and* nullable, and the two mean different things:
+    Every field is optional *and* nullable, and the two mean different things:
     omitted leaves the stored value alone, while an explicit ``null`` clears it
     so the tracker's own default applies again (todo 14). Range checking lives
     in :mod:`stable.server.tracker_options` beside the storage, not here, so the
     CLI and the HTTP layer cannot disagree about what is valid.
+
+    ``template_radius`` and ``search_radius`` are named because they were the
+    first two, but any argument in
+    :data:`stable.server.tracker_options.SETTINGS` may be sent — LK's
+    ``win_size``, mean-shift's ``window_radius``, and so on — under the plugin's
+    own name. Hence ``extra="allow"``: the settable set is a property of the
+    *tracker*, which this model cannot see, so the route checks the keys against
+    the point's own plugin and rejects one it would not accept.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     template_radius: int | None = None
     search_radius: int | None = None

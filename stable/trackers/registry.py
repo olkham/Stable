@@ -21,6 +21,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Iterable
+from functools import lru_cache
 from importlib import metadata
 from typing import Any
 
@@ -32,6 +33,7 @@ __all__ = [
     "ENTRY_POINT_GROUP",
     "TrackerRegistry",
     "registry",
+    "constructor_parameters",
     "register_tracker",
     "get_tracker",
     "create_tracker",
@@ -43,6 +45,59 @@ logger = logging.getLogger(__name__)
 
 ENTRY_POINT_GROUP = "stable.trackers"
 """The entry-point group third-party trackers advertise themselves under."""
+
+
+@lru_cache(maxsize=64)
+def constructor_parameters(plugin_cls: type) -> dict[str, Any]:
+    """Return ``{argument: default}`` for everything ``plugin_cls`` can be built with.
+
+    Merged over the class's **whole MRO**, subclass defaults winning, because a
+    plugin's own signature is not the whole answer in either direction:
+
+    * A thin subclass forwards the interesting arguments through ``**kwargs``
+      (:class:`~stable.trackers.klt.KLTTracker` over LK, every deep tracker over
+      :class:`~stable.trackers.deep.DeepTrackerPlugin`), so reading only its own
+      signature reports a tracker that takes almost nothing.
+    * ``**kwargs`` is emphatically **not** "accepts anything": what it accepts is
+      whatever the base it forwards to declares. Reading it as "anything" is how
+      a per-point setting stored while a point was on LK reached CoTracker3 and
+      raised ``DeepTrackerPlugin.__init__() got an unexpected keyword argument
+      'win_size'`` — the exact failure
+      :meth:`TrackerRegistry.create`'s option filtering exists to prevent.
+
+    A plugin that means to take free-form keyword arguments has to declare them;
+    that cannot be told apart from one forwarding to a strict base by
+    inspection, and quietly passing an argument that raises is the worse of the
+    two readings.
+
+    Args:
+        plugin_cls: Any class; cached on the class object, so re-registering a
+            name against a different class cannot return a stale answer.
+
+    Returns:
+        ``{name: default}`` for every keyword argument in the chain, with
+        ``None`` where an argument has no default. Empty for a class that cannot
+        be inspected, which callers read as "no options", never as an error.
+    """
+    merged: dict[str, Any] = {}
+    for klass in reversed(getattr(plugin_cls, "__mro__", (plugin_cls,))):
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            parameters = inspect.signature(init).parameters
+        except (TypeError, ValueError):  # pragma: no cover - C-level __init__ only
+            continue
+        for name, parameter in parameters.items():
+            if name == "self" or parameter.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            merged[name] = (
+                None if parameter.default is inspect.Parameter.empty else parameter.default
+            )
+    return merged
 
 
 class TrackerRegistry:
@@ -223,16 +278,11 @@ class TrackerRegistry:
     def _accepted_options(
         plugin_cls: type[TrackerPlugin], options: dict[str, Any] | None
     ) -> dict[str, Any]:
-        """Return the subset of ``options`` that ``plugin_cls.__init__`` accepts."""
+        """Return the subset of ``options`` that ``plugin_cls`` can be built with."""
         if not options:
             return {}
-        try:
-            parameters = inspect.signature(plugin_cls.__init__).parameters
-        except (TypeError, ValueError):  # pragma: no cover - builtins only
-            return {}
-        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
-            return dict(options)
-        return {key: value for key, value in options.items() if key in parameters}
+        accepted = constructor_parameters(plugin_cls)
+        return {key: value for key, value in options.items() if key in accepted}
 
     def names(self) -> list[str]:
         """Return every registered tracker name, sorted."""

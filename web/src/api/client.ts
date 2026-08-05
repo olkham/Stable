@@ -194,10 +194,17 @@ export const getPointPatches = (
       (frame === undefined ? "" : `?frame=${frame}`),
   );
 
+/**
+ * Set one point's tracker sizes, keyed by the plugin's *own* argument names
+ * (`template_radius`, `win_size`, `search_radius`, …) in the plugin's own
+ * units — the shape `PointPatches.settings` describes. `null` clears an
+ * override; a key the point's tracker does not accept is a 400 rather than a
+ * silent no-op.
+ */
 export const updatePointPatches = (
   projectId: string,
   pointId: string,
-  body: { template_radius?: number | null; search_radius?: number | null },
+  body: Record<string, number | null>,
 ): Promise<PointPatches> =>
   putJson(`/api/projects/${projectId}/points/${pointId}/patches`, body);
 

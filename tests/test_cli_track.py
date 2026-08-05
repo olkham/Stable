@@ -214,3 +214,127 @@ def test_track_reports_a_missing_video_cleanly(tmp_path, capsys):
     assert exit_code == 1
     captured = capsys.readouterr()
     assert "error" in captured.err.lower()
+
+
+# -- window and search sizes (--window / --search) ----------------------------
+#
+# The same per-point settings the browser exposes, reachable headlessly. The
+# flags are stated in *pixels* whatever the chosen plugin calls its own window
+# argument, so these tests check the translation as much as the plumbing.
+
+
+def test_window_flag_reaches_the_plugin_in_its_own_units(tmp_path, tiny_clip, monkeypatch):
+    """`--window 20` is LK's `win_size=41`, not `win_size=20`."""
+    from stable.trackers.registry import create_tracker as real_create
+
+    seen: dict[str, object] = {}
+
+    def spy(name, **kwargs):
+        seen.update(kwargs.get("options") or {})
+        return real_create(name, **kwargs)
+
+    monkeypatch.setattr("stable.cli.track.create_tracker", spy)
+
+    video_path, source = tiny_clip
+    x, y = source.true_position(0)
+    exit_code = main(
+        [
+            "track",
+            video_path,
+            "--point",
+            f"{x},{y}@0",
+            "--tracker",
+            "lk",
+            "--window",
+            "20",
+            "--out",
+            str(tmp_path / "tracks.json"),
+            "--quiet",
+        ]
+    )
+    assert exit_code == 0
+    assert seen == {"win_size": 41}
+
+
+def test_window_and_search_reach_a_tracker_that_takes_both(tmp_path, tiny_clip, monkeypatch):
+    from stable.trackers.registry import create_tracker as real_create
+
+    seen: dict[str, object] = {}
+
+    def spy(name, **kwargs):
+        seen.update(kwargs.get("options") or {})
+        return real_create(name, **kwargs)
+
+    monkeypatch.setattr("stable.cli.track.create_tracker", spy)
+
+    video_path, source = tiny_clip
+    x, y = source.true_position(0)
+    exit_code = main(
+        [
+            "track",
+            video_path,
+            "--point",
+            f"{x},{y}@0",
+            "--tracker",
+            "template",
+            "--window",
+            "8",
+            "--search",
+            "30",
+            "--out",
+            str(tmp_path / "tracks.json"),
+            "--quiet",
+        ]
+    )
+    assert exit_code == 0
+    assert seen == {"template_radius": 8, "search_radius": 30}
+
+
+def test_a_search_flag_a_tracker_cannot_honour_is_refused_with_the_reason(
+    tmp_path, tiny_clip, capsys
+):
+    """Silently ignoring it would mean a run that is not what was asked for."""
+    video_path, source = tiny_clip
+    x, y = source.true_position(0)
+    out_path = tmp_path / "tracks.json"
+    exit_code = main(
+        [
+            "track",
+            video_path,
+            "--point",
+            f"{x},{y}@0",
+            "--tracker",
+            "correlation",
+            "--search",
+            "30",
+            "--out",
+            str(out_path),
+            "--quiet",
+        ]
+    )
+    assert exit_code == 1
+    assert not out_path.exists()
+    err = capsys.readouterr().err
+    assert "--search" in err and "never searches" in err
+
+
+def test_an_out_of_range_window_is_refused(tmp_path, tiny_clip, capsys):
+    video_path, source = tiny_clip
+    x, y = source.true_position(0)
+    exit_code = main(
+        [
+            "track",
+            video_path,
+            "--point",
+            f"{x},{y}@0",
+            "--tracker",
+            "template",
+            "--window",
+            "500",
+            "--out",
+            str(tmp_path / "tracks.json"),
+            "--quiet",
+        ]
+    )
+    assert exit_code == 1
+    assert "--window" in capsys.readouterr().err

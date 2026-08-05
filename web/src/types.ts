@@ -27,11 +27,27 @@ export interface ProxyTierInfo {
   fps?: number;
 }
 
+/**
+ * The regions a point's tracker matches and searches, in source pixels.
+ *
+ * Carried on every point summary so the canvas can draw the pattern and search
+ * boxes for all of them without a request each. `search_radius` is null for the
+ * algorithms that have no search area (phase correlation measures a shift
+ * without scanning), and `attribute` names the setting the number came from.
+ */
+export interface PointWindow {
+  radius: number;
+  attribute: string | null;
+  search_radius: number | null;
+  search_attribute: string | null;
+}
+
 export interface PointSummary {
   id: string;
   queries: Query[];
   tracker: string;
   enabled_for_solve: boolean;
+  window: PointWindow;
   has_track: boolean;
   tracked_frames: number;
   mean_confidence: number;
@@ -172,6 +188,34 @@ export interface PointPatch {
   available: boolean;
 }
 
+/**
+ * One per-point tracker setting the operator may change
+ * (stable/server/tracker_options.py's `SETTINGS`).
+ *
+ * `attribute` is the plugin's own constructor argument and the key a PUT sends,
+ * so `value`/`minimum`/`maximum` are all in *that argument's* units: a
+ * half-size for the radii, a full side for LK's `win_size` (`unit: "side"`), a
+ * plain count for the pyramid depth (`unit: "count"`). `radius` is the same
+ * value expressed in source pixels from the point, which is what the canvas
+ * draws and what the patch preview asks for; it is 0 when the setting is not a
+ * length.
+ */
+export interface TrackerSetting {
+  attribute: string;
+  role: "window" | "search";
+  label: string;
+  value: number;
+  default: number;
+  minimum: number;
+  maximum: number;
+  step: number;
+  unit: "radius" | "side" | "count";
+  radius: number;
+  help: string;
+  /** Whether this point has overridden the plugin's own default. */
+  stored: boolean;
+}
+
 /** `GET .../points/{id}/patches` — everything the patch panel draws (todo 14). */
 export interface PointPatches {
   point_id: string;
@@ -186,8 +230,23 @@ export interface PointPatches {
    * the size is only a preview.
    */
   radius_source: string | null;
-  /** Whether the size slider would actually change what the next run matches. */
+  /** Whether this tracker's pattern size is the operator's to set. */
   adjustable: boolean;
+  /** One control per row, in order — the panel knows no tracker names. */
+  settings: TrackerSetting[];
+  /** The pattern region, in source pixels. */
+  window: { radius: number; size_px: number; attribute: string | null; adjustable: boolean };
+  /**
+   * The search region, in source pixels. `radius` is null where the algorithm
+   * has no search area at all, in which case `note` says why.
+   */
+  search: {
+    radius: number | null;
+    size_px: number | null;
+    attribute: string | null;
+    adjustable: boolean;
+    note: string;
+  };
   template_radius: number;
   search_radius: number;
   defaults: { template_radius: number; search_radius: number };

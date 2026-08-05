@@ -62,6 +62,17 @@ interface ProjectContextValue {
 
   placingMode: PlacingMode;
   setPlacingMode: (mode: PlacingMode) => void;
+  /**
+   * Pin a point where it already is on the current frame (the `A` shortcut and
+   * the panel's "+ anchor" both go through this).
+   *
+   * Returns false when the point has no position on this frame — an untracked
+   * point, or a gap — which is the caller's cue to arm click-to-place instead:
+   * there is nowhere to pin it *to* without being told where.
+   */
+  addAnchorHere: (pointId?: string | null) => Promise<boolean>;
+  /** Add an anchor at an explicit position, e.g. from a click on the frame. */
+  addAnchorAt: (pointId: string, frame: number, x: number, y: number) => Promise<void>;
 
   stabilizedPreview: boolean;
   setStabilizedPreview: (on: boolean) => void;
@@ -241,6 +252,47 @@ export function ProjectProvider({
   const undo = useCallback(() => step("undo"), [step]);
   const redo = useCallback(() => step("redo"), [step]);
 
+  // -- anchors ----------------------------------------------------------------
+  //
+  // Adding an anchor goes through `settle`, not a bare `refresh`. The pins live
+  // on the point, but the *keyframe list* the panel and the timeline draw is
+  // the server's `ground_truth` (pins plus promoted corrections) and comes with
+  // the track — so refreshing only the project left a just-placed anchor
+  // invisible in the list until the next track run replaced the cached track.
+  const addAnchorAt = useCallback(
+    async (pointId: string, frame: number, x: number, y: number) => {
+      setEditError(null);
+      try {
+        await api.addAnchor(projectId, pointId, frame, x, y);
+        await settle(pointId);
+      } catch (err) {
+        setEditError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [projectId, settle],
+  );
+
+  const addAnchorHere = useCallback(
+    async (pointId?: string | null) => {
+      const id = pointId ?? selectedPointId;
+      if (!id || !project) return false;
+      const track = tracks[id];
+      const x = track?.x[currentFrame];
+      const y = track?.y[currentFrame];
+      if (x != null && y != null) {
+        await addAnchorAt(id, currentFrame, x, y);
+        return true;
+      }
+      // No tracked position here: an existing pin on this frame is already the
+      // answer, so report success rather than arming a pointless click.
+      const pinned = project.points
+        .find((p) => p.id === id)
+        ?.queries.some((q) => q.frame === currentFrame);
+      return Boolean(pinned);
+    },
+    [project, tracks, currentFrame, selectedPointId, addAnchorAt],
+  );
+
   // Ctrl/Cmd+Z and Ctrl+Shift+Z (or Ctrl+Y), ignored while typing in a field.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
@@ -292,6 +344,25 @@ export function ProjectProvider({
       } else if (event.key === "End") {
         event.preventDefault();
         setCurrentFrame(lastFrame);
+      } else if (event.key === "a" || event.key === "A") {
+        // Pin the selected point on this frame. Where it already has a
+        // position that needs no aiming, so plain `A` just does it; with
+        // Shift (or with nothing to pin, e.g. an untracked point) it arms
+        // click-to-place instead, which is the same two-step the panel button
+        // uses. Pressing it again disarms, so the key is never a trap.
+        if (!selectedPointId) return;
+        event.preventDefault();
+        if (placingMode === "add-anchor") {
+          setPlacingMode("none");
+          return;
+        }
+        if (event.shiftKey) {
+          setPlacingMode("add-anchor");
+          return;
+        }
+        void addAnchorHere(selectedPointId).then((done) => {
+          if (!done) setPlacingMode("add-anchor");
+        });
       } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         if (!selectedPointId) return;
         const point = project.points.find((p) => p.id === selectedPointId);
@@ -312,7 +383,16 @@ export function ProjectProvider({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [project, currentFrame, selectedPointId, tracks, setCurrentFrame, setIsPlaying]);
+  }, [
+    project,
+    currentFrame,
+    selectedPointId,
+    tracks,
+    placingMode,
+    addAnchorHere,
+    setCurrentFrame,
+    setIsPlaying,
+  ]);
 
   // Whenever a track/retrack job for a point finishes, drop the stale cache
   // entry and refresh the project so its summary (frames, confidence) updates.
@@ -365,6 +445,8 @@ export function ProjectProvider({
       setSelectedPointId,
       placingMode,
       setPlacingMode,
+      addAnchorHere,
+      addAnchorAt,
       stabilizedPreview,
       setStabilizedPreview,
       tracks,
@@ -396,6 +478,8 @@ export function ProjectProvider({
     isPlaying,
     selectedPointId,
     placingMode,
+    addAnchorHere,
+    addAnchorAt,
     stabilizedPreview,
     tracks,
     loadTrack,

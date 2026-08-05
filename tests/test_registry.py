@@ -211,3 +211,85 @@ def test_lookup_triggers_discovery_lazily(reg):
     reg.get("dummy")
     assert len(reg) >= 1
     assert "TrackerRegistry" in repr(reg)
+
+
+# -- per-point options reaching (only) the plugins that take them --------------
+#
+# `create(options=...)` is how a per-point setting reaches the tracker that
+# honours it. Settings are stored per *point* and follow it across a tracker
+# change, so the filter has to be exactly right in both directions: drop what
+# the new plugin cannot take, and keep what it can — including arguments it
+# only declares through a base class.
+
+
+class ForwardingTracker(ThirdPartyTracker):
+    """A plugin whose real arguments live on a base it forwards `**kwargs` to.
+
+    The shape every deep tracker here has (and `klt` over `lk`): the subclass
+    names a couple of its own arguments and passes the rest up.
+    """
+
+    name = "forwarding_base"
+
+    def __init__(self, *, window: int = 7, mode: str = "fast") -> None:
+        super().__init__()
+        self.window = window
+        self.mode = mode
+
+
+class ForwardingSubclass(ForwardingTracker):
+    name = "forwarding"
+
+    def __init__(self, *, extra: float = 1.0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.extra = extra
+
+
+def test_kwargs_does_not_mean_a_plugin_accepts_anything(reg):
+    """The regression: a stored setting reaching a plugin that cannot take it.
+
+    `**kwargs` used to be read as "accepts everything", so an option stored
+    while a point was on one tracker was passed verbatim to the next one and
+    raised `__init__() got an unexpected keyword argument` from the *base* the
+    subclass forwards to — which is a crash, not the documented "ignored".
+    """
+    reg.discover(entry_points=[FakeEntryPoint("forwarding", ForwardingSubclass)])
+    plugin = reg.create("forwarding", options={"window": 21, "nonsense": 3}, prepare=False)
+    assert isinstance(plugin, ForwardingSubclass)
+    assert plugin.window == 21  # declared on the base, so it is honoured
+    assert not hasattr(plugin, "nonsense")  # declared nowhere, so it is dropped
+
+
+def test_every_installed_tracker_survives_another_trackers_settings():
+    """Switching a point's tracker must never be able to break tracking.
+
+    Per-point settings are stored under the plugin's own argument names and are
+    deliberately *not* cleared when the tracker changes, so every plugin has to
+    tolerate the union of everything any other plugin might have stored. This is
+    the user-facing bug ("TAPIR/RAFT/CoTracker used to work") as a test.
+    """
+    from stable.server.tracker_options import SETTINGS
+    from stable.trackers.registry import registry as process_registry
+
+    stale = {setting.attribute: setting.minimum for setting in SETTINGS}
+    for name in process_registry.discover():
+        plugin = process_registry.create(name, options=stale, prepare=False)
+        assert plugin.name == name
+
+
+def test_a_plugin_only_declaring_kwargs_receives_nothing_rather_than_crashing(reg):
+    """Free-form `**kwargs` cannot be told apart from forwarding, so it is strict.
+
+    A plugin that means to take arbitrary keyword arguments has to declare them;
+    passing an argument that might raise is the worse of the two readings.
+    """
+
+    class Swallower(ThirdPartyTracker):
+        name = "swallower"
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.seen = kwargs
+
+    reg.discover(entry_points=[FakeEntryPoint("swallower", Swallower)])
+    assert reg.create("swallower", options={"whatever": 1}, prepare=False).seen == {}

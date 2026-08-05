@@ -227,8 +227,9 @@ def test_the_window_size_comes_from_the_tracker_that_is_actually_in_use(client, 
 
     assert body["radius_source"] == "win_size"
     assert body["radius"] == LKTracker().win_size // 2
-    # ...and the slider is hidden, because changing it would not change the run.
-    assert body["adjustable"] is False
+    # ...and it is the operator's to change, under LK's own argument name.
+    assert body["adjustable"] is True
+    assert [s["attribute"] for s in body["settings"] if s["role"] == "window"] == ["win_size"]
 
 
 def test_the_size_control_is_offered_only_where_it_would_do_something(client, template_point):
