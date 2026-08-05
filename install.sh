@@ -128,6 +128,14 @@ _stable_install() {
         return 1
     fi
 
+    # -------------------------------------------------------------- gpu support
+    # PyPI's `torch` wheel is CPU-only, so the CUDA build has to come from
+    # PyTorch's own index and which index depends on the driver. That choice
+    # (and verifying the result actually sees the card) lives in Python, where
+    # it can be tested -- see scripts/install_gpu.py. It asks first, skips
+    # silently on a machine with no NVIDIA GPU, and never fails the install.
+    ( cd "$here" && "$venvpy" scripts/install_gpu.py --python "$venvpy" )
+
     return 0
 }
 
@@ -160,11 +168,12 @@ if [ "$_stable_rc" -eq 0 ]; then
 
      stable sample      run the bundled demo clip end to end
      stable trackers    list the tracking algorithms available
+     stable devices     show whether your GPU is being used
      stable --help      every command
 
- GPU tracking (CoTracker3 / TAPIR) needs PyTorch, which is
- installed separately - see docs/windows-gpu-setup.md for the
- CUDA wheel selection (it applies to Linux too).
+ The deep trackers (CoTracker3 / TAPIR) also need their model
+ code, which is not ours to ship - see docs/windows-gpu-setup.md
+ step 4. RAFT needs nothing further.
 
  Next time, reactivate with:  $_stable_activate_hint
 ============================================================

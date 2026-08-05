@@ -70,6 +70,10 @@ def _cmd_trackers(as_json: bool) -> int:
             flags.append("unavailable")
         suffix = f" [{', '.join(flags)}]" if flags else ""
         print(f"{row['name']:<{width}}  {row['display_name']}  ({row['license']}){suffix}")
+        # An unavailable tracker that does not say what is missing sends the
+        # reader to the docs to guess; the plugin already knows the answer.
+        if not row["available"] and row.get("unavailable_reason"):
+            print(f"{'':<{width}}  -> {row['unavailable_reason']}")
     return 0
 
 

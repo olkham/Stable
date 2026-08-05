@@ -55,18 +55,33 @@ pip install -e ".[torch]"                # + PyTorch (CPU by default; see below 
 (Drop `-e .` for the last argument once installing a released version, e.g.
 `pip install "stable-tracker[server,video]"`.)
 
-The deep trackers also need their model *code*, which is not ours to vendor:
+**GPU:** `install.bat` / `install.sh` set this up for you — they run
+`scripts/install_gpu.py`, which reads your driver's CUDA version, installs the
+matching PyTorch build from PyTorch's own index, and *verifies* the GPU is
+actually visible afterwards (falling back to an older CUDA build if not). A
+machine with no NVIDIA card is told so and left alone. Run it any time:
+
+```bash
+python scripts/install_gpu.py            # asks first
+python scripts/install_gpu.py --dry-run  # show what it would do
+stable devices                           # confirm: "selected: cuda"
+```
+
+Installing the `[torch]` extra by hand gives you a **CPU-only** build on
+Windows, which is why the script exists — see
+**[docs/windows-gpu-setup.md](docs/windows-gpu-setup.md)** for the manual
+route and troubleshooting. On headless Linux, see the CUDA `Dockerfile` at the
+repo root instead.
+
+`raft` works as soon as PyTorch is in place (its model ships inside
+torchvision). CoTracker3 and TAPIR also need their model *code*, which is not
+ours to vendor — `stable trackers` prints the exact command for whichever is
+missing:
 
 ```bash
 pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"          # tapir
 pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git"  # cotracker3
 ```
-
-**GPU on Windows:** `pip install stable-tracker[torch]` alone gives you a
-CPU-only PyTorch build. See **[docs/windows-gpu-setup.md](docs/windows-gpu-setup.md)**
-for installing the matching CUDA wheel, verifying it with `stable devices`,
-and the model-download opt-ins the next section explains. On headless Linux,
-see the CUDA `Dockerfile` at the repo root instead.
 
 ## Model checkpoints — download manager and fail-closed weights
 

@@ -98,10 +98,24 @@ echo Upgrading pip if needed ...
 "%VENVPY%" -m pip install --upgrade pip
 if not %errorlevel%==0 goto :pip_failed
 
+rem Windows will not let pip replace an .exe that is running, and it discovers
+rem this *after* uninstalling the old version - which leaves no working install
+rem at all. Cheaper to refuse up front than to explain the wreckage.
+tasklist /FI "IMAGENAME eq stable.exe" 2>nul | find /I "stable.exe" >nul
+if %errorlevel%==0 goto :stable_running
+
 echo.
 echo Installing Stable and its dependencies ...
 "%VENVPY%" -m pip install -e ".[all]"
 if not %errorlevel%==0 goto :install_failed
+
+rem ------------------------------------------------------------------ gpu support
+rem PyPI's `torch` wheel is CPU-only on Windows, so the CUDA build has to come
+rem from PyTorch's own index and which index depends on the driver. That choice
+rem (and verifying the result actually sees the card) lives in Python, where it
+rem can be tested -- see scripts\install_gpu.py. It asks first, skips silently
+rem on a machine with no NVIDIA GPU, and never fails the install.
+"%VENVPY%" scripts\install_gpu.py --python "%VENVPY%"
 
 rem ---------------------------------------------------------------------- activate
 echo.
@@ -119,10 +133,12 @@ echo  worth knowing:
 echo.
 echo      stable sample      run the bundled demo clip end to end
 echo      stable trackers    list the tracking algorithms available
+echo      stable devices     show whether your GPU is being used
 echo      stable --help      every command
 echo.
-echo  GPU tracking (CoTracker3 / TAPIR) needs PyTorch, which is
-echo  installed separately - see docs\windows-gpu-setup.md.
+echo  The deep trackers (CoTracker3 / TAPIR) also need their model
+echo  code, which is not ours to ship - see docs\windows-gpu-setup.md
+echo  step 4. RAFT needs nothing further.
 echo.
 echo  Next time, reactivate with:  .venv\Scripts\activate.bat
 echo ============================================================
@@ -160,5 +176,15 @@ goto :eof
 :install_failed
 echo.
 echo ERROR: installing Stable failed - see the pip output above.
+popd
+goto :eof
+
+:stable_running
+echo.
+echo ERROR: Stable is currently running, and Windows will not let the
+echo installer replace files that are in use.
+echo.
+echo Close any "stable serve" window (Ctrl+C) and run this again. If you
+echo cannot find it:  taskkill /IM stable.exe /F
 popd
 goto :eof

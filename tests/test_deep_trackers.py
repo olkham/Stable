@@ -7,6 +7,7 @@ tested on a machine with no GPU, no torch and no checkpoints.
 from __future__ import annotations
 
 import hashlib
+import sys
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,21 @@ from stable.trackers.weights import ENV_MODEL_DIR, ModelSpec
 
 PAYLOAD = b"stub weights" * 100
 DIGEST = hashlib.sha256(PAYLOAD).hexdigest()
+
+
+def _hide_module(monkeypatch, name: str) -> None:
+    """Make ``import <name>`` (and its submodules) fail, however it is spelled.
+
+    Setting one ``sys.modules`` entry to ``None`` is the documented way to make
+    an import raise, but it only bites when the module is not *already*
+    imported: ``from torchvision.models.optical_flow import raft_small``
+    resolves straight out of the cache if an earlier test pulled it in. That is
+    why the RAFT test passed alone and failed in the full run. Evicting the
+    whole subtree first closes that gap; monkeypatch restores it afterwards.
+    """
+    for cached in [n for n in list(sys.modules) if n == name or n.startswith(f"{name}.")]:
+        monkeypatch.delitem(sys.modules, cached, raising=False)
+    monkeypatch.setitem(sys.modules, name, None)
 
 
 class StubDeep(DeepTrackerPlugin):
@@ -478,11 +494,15 @@ def test_cotracker_reports_missing_torch(monkeypatch):
 
 
 @pytest.mark.parametrize("plugin_class", [CoTracker3Tracker, TapirTracker, RaftTracker])
-def test_a_missing_model_package_is_reported_before_any_download(
-    plugin_class, cache, monkeypatch
-):
-    """No user should wait for 400 MB only to learn a pip package is missing."""
+def test_a_missing_model_package_is_reported_before_any_download(plugin_class, cache, monkeypatch):
+    """No user should wait for 400 MB only to learn a pip package is missing.
+
+    The missing package is *simulated*: RAFT's lives in torchvision, which the
+    `torch` extra now installs, so relying on it being absent would make this
+    test pass or fail depending on the machine rather than on the code.
+    """
     monkeypatch.setattr("stable.trackers.deep.torch_module", lambda: object())
+    monkeypatch.setattr(plugin_class, "_implementation_available", classmethod(lambda cls: False))
     plugin = plugin_class()
     with pytest.raises(TrackerError, match="model code"):
         plugin.prepare("cpu")
@@ -578,7 +598,16 @@ def test_raft_is_unavailable_without_torch(monkeypatch):
 
 
 def test_raft_reports_a_missing_model_package(monkeypatch):
+    """Simulated, not assumed: torchvision is a declared dependency now.
+
+    This used to pass only because torchvision happened not to be installed,
+    so it started failing the moment the `torch` extra began pulling it in —
+    the test was asserting a property of the machine, not of the code. Setting
+    the module to None in sys.modules makes `import torchvision...` raise
+    ImportError (documented CPython behaviour) whether or not it is present.
+    """
     monkeypatch.setattr("stable.trackers.raft.torch_module", lambda: object())
+    _hide_module(monkeypatch, "torchvision")
     with pytest.raises(TrackerError, match="torchvision"):
         RaftTracker()._build_backend("cpu", "weights.pt")
 

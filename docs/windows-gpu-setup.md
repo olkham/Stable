@@ -50,21 +50,42 @@ stable trackers
 
 ## 3. Install the CUDA build of PyTorch
 
-This is the one step `pip install stable-tracker[torch]` deliberately does
-**not** do for you: PyPI's default `torch` wheel is CPU-only on Windows, and
-the right CUDA build depends on your driver. Pick the wheel index that
-matches your driver's supported CUDA version at
-<https://pytorch.org/get-started/locally/> (Stable > Windows > Pip > Python >
-CUDA 12.x), or use this as a starting point:
+**`install.bat` / `install.sh` now do this for you.** They run
+`scripts/install_gpu.py`, which reads your driver's CUDA version from
+`nvidia-smi`, installs the newest matching wheel from PyTorch's own index, and
+— the part that matters — *verifies* `torch.cuda.is_available()` afterwards,
+falling back to an older CUDA build if the first one installs but cannot see
+the card. On a machine with no NVIDIA GPU it says so and exits without
+installing anything.
+
+You can run it on its own at any time:
 
 ```powershell
-pip install torch --index-url https://download.pytorch.org/whl/cu124
+python scripts/install_gpu.py            # asks first
+python scripts/install_gpu.py --yes      # no prompt (for scripts)
+python scripts/install_gpu.py --dry-run  # show what it would do
 ```
 
-A newer driver can run an older CUDA wheel (CUDA is forward-compatible), so if
-`cu124` fails to install or `torch.cuda.is_available()` comes back `False`,
-try `cu121` or `cu118` from the same index before assuming something else is
-wrong.
+Set `STABLE_INSTALL_GPU=0` to make the installers skip it entirely, or `=1` to
+accept without prompting.
+
+### Doing it by hand
+
+`pip install stable-tracker[torch]` deliberately does **not** pick a CUDA
+build: PyPI's default `torch` wheel is CPU-only on Windows, and the right build
+depends on your driver. Pick the index matching your driver's CUDA version from
+<https://pytorch.org/get-started/locally/>, or start here:
+
+```powershell
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+```
+
+A newer driver can run an older CUDA wheel (CUDA is backward-compatible), so if
+one fails to install or `torch.cuda.is_available()` comes back `False`, try an
+older tag — `cu126`, `cu124`, `cu121`, `cu118` — from the same index before
+assuming something else is wrong. Install `torchvision` alongside `torch` and
+from the *same* index: it carries the RAFT tracker's architecture and weights,
+and a torchvision built against a different CUDA than torch fails confusingly.
 
 Verify:
 
@@ -86,13 +107,21 @@ Stable calls too (`stable.core.device.select_device`).
 
 ## 4. Install the deep trackers' model code
 
-The checkpoints download separately (next step); this installs the network
-*architectures*, which are not Stable's to vendor:
+`raft` needs nothing further — its architecture and weights ship inside
+torchvision, which step 3 installed, so it becomes available as soon as CUDA
+PyTorch is in place.
+
+CoTracker3 and TAPIR are different: their model code lives only on GitHub and
+is not Stable's to vendor. The checkpoints download separately (next step);
+this installs the network *architectures*:
 
 ```powershell
 pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"
 pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git"
 ```
+
+`stable trackers` says which of these is missing and what to run — an
+unavailable tracker reports the reason rather than just greying out.
 
 This needs `git` on PATH (<https://git-scm.com/download/win>) and, for some
 transitive dependencies, the
