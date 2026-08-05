@@ -161,7 +161,58 @@ export interface FilterInfo {
   params: FilterParamInfo[];
 }
 
+/** One keyframe in the template grid, and whether a patch fits at it. */
+export interface TemplateAnchor {
+  frame: number;
+  x: number;
+  y: number;
+  /** False when the patch would fall off the edge of the frame at this size. */
+  available: boolean;
+}
+
+/** `GET .../points/{id}/template` — everything the template panel draws (todo 14). */
+export interface TemplateOptions {
+  point_id: string;
+  tracker: string;
+  template_radius: number;
+  search_radius: number;
+  /** Side of the square patch in pixels, i.e. `2 * template_radius + 1`. */
+  patch_size: number;
+  defaults: { template_radius: number; search_radius: number };
+  template_radius_range: [number, number];
+  search_radius_range: [number, number];
+  /** Whether anything has been overridden, i.e. whether "reset" does anything. */
+  custom: boolean;
+  anchors: TemplateAnchor[];
+}
+
 export type JobStatus = "queued" | "running" | "done" | "error" | "cancelled";
+
+/**
+ * What a running job has produced *so far* (stable/server/jobs.py's
+ * `JobProgress.publish`). Every field is optional because it depends on what
+ * kind of job is running and how far it has got:
+ *
+ * - `frame`/`frame_min`/`frame_max`/`frames_read` come from the decoder itself
+ *   (stable/video/telemetry.py) and so appear for any job that reads video.
+ * - `track` is the path found so far, published per completed run by
+ *   `LivePartialTrack` in stable/server/tracking.py. Its `x`/`y` are the full
+ *   clip length with `null` for frames not yet covered — the same shape as a
+ *   finished `TrackData`, so the viewer draws both with one code path.
+ */
+export interface JobPartial {
+  frame?: number;
+  frame_min?: number;
+  frame_max?: number;
+  frames_read?: number;
+  runs_done?: number;
+  runs_total?: number;
+  track?: {
+    x: (number | null)[];
+    y: (number | null)[];
+    n_frames: number;
+  };
+}
 
 export interface JobEvent {
   id: string;
@@ -173,6 +224,7 @@ export interface JobEvent {
   message: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   result: Record<string, any> | null;
+  partial: JobPartial | null;
   error: string | null;
   updated_at: number;
 }

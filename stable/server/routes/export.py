@@ -33,6 +33,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 
 from ...core.errors import ProjectError, RenderError, StableError
+from ...core.project import Project
+from ...core.trackdata import AE_FORMAT, after_effects_keyframes
 from ...render.stabilize import render_stabilized
 from .. import motion as motion_glue
 from ..jobs import JobManager, get_job_manager
@@ -41,7 +43,7 @@ from ..storage import Workspace, get_workspace
 from ..tracking import load_display_track
 from . import solve as solve_routes
 
-__all__ = ["router"]
+__all__ = ["router", "TRACK_FORMATS"]
 
 NO_OP_DETAIL = (
     "this render would not move the picture at all, so it would just re-encode the source: "
@@ -66,18 +68,32 @@ def _jobs() -> JobManager:
 # -- data export ---------------------------------------------------------------
 
 
+TRACK_FORMATS = ("json", "csv", AE_FORMAT)
+"""Formats ``GET /export/tracks`` can produce.
+
+``json``/``csv`` are the numbers; ``ae`` is After Effects keyframe data, which
+is the half of todo 18 that "use in other applications" actually needs — see
+:mod:`stable.core.trackdata`.
+"""
+
+
 @router.get("/tracks")
 def export_tracks(
     project_id: str, format: str = "json", workspace: Workspace = Depends(_workspace)
 ) -> Response:
-    """Export every point's (corrected) track as CSV or JSON.
+    """Export every point's (corrected) track as CSV, JSON or AE keyframe data.
 
     Args:
-        format: ``"json"`` or ``"csv"``.
+        format: One of :data:`TRACK_FORMATS`.
     """
-    if format not in ("json", "csv"):
-        raise HTTPException(status_code=400, detail="format must be 'json' or 'csv'")
+    if format not in TRACK_FORMATS:
+        raise HTTPException(
+            status_code=400, detail=f"format must be one of {', '.join(TRACK_FORMATS)}"
+        )
     project = workspace.load_project(project_id)
+
+    if format == AE_FORMAT:
+        return _export_after_effects(project)
 
     rows: list[dict[str, Any]] = []
     for point in project.points:
@@ -110,6 +126,36 @@ def export_tracks(
         content=buffer.getvalue(),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=tracks.csv"},
+    )
+
+
+def _export_after_effects(project: Project) -> Response:
+    """Render every tracked point as After Effects keyframe data.
+
+    Raises:
+        HTTPException: 400 if no point has been tracked yet — an empty keyframe
+            document imports as nothing at all, which looks like a broken
+            export rather than an empty project.
+    """
+    tracks: list[tuple[str, list[tuple[float, float]]]] = []
+    for point in project.points:
+        track = load_display_track(project, point)
+        if track is None:
+            continue
+        tracks.append((point.id, [(float(x), float(y)) for x, y in track.points]))
+    if not tracks:
+        raise HTTPException(status_code=400, detail="no point has been tracked yet")
+
+    body = after_effects_keyframes(
+        tracks,
+        fps=project.video.fps,
+        width=project.video.w,
+        height=project.video.h,
+    )
+    return Response(
+        content=body,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=tracks-ae.txt"},
     )
 
 

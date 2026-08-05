@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
 import { confidenceColor, pointColor } from "../colors";
+import { useFrameImages } from "../hooks/useFrameImages";
 import { useProjectContext } from "../state/ProjectContext";
 
 /** How close (in canvas CSS pixels) a mousedown has to be to grab a point. */
@@ -112,22 +113,15 @@ export function Viewer() {
     dragMode,
     falloff,
     applyCorrection,
+    liveTracking,
   } = useProjectContext();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const imageCache = useRef(new Map<string, HTMLImageElement>());
-  // Bumped once a frame image finishes loading, to make the draw effect below
-  // re-run and pick it up from imageCache -- it does nothing on its own, since
-  // it is not otherwise a drawing input, but must be a real dependency of that
-  // effect (not just referenced from inside it) or the newly-loaded image
-  // never gets painted until some *other* prop happens to change the canvas.
-  const [redrawTick, forceRedraw] = useState(0);
   // Bumped whenever the display box resizes (window resize, sidebar/curves
   // panel toggling), so the canvas is re-sized and re-fit to the new space
   // rather than staying at whatever size it happened to mount at (todo 2).
   const [sizeTick, setSizeTick] = useState(0);
-  const [error, setError] = useState<string | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   // A mousedown that grabbed a point (dragged or not) is followed by a native
   // "click" on the same element; without this the click handler would run
@@ -160,35 +154,24 @@ export function Viewer() {
     }
   }, [project.points, tracks, loadTrack]);
 
-  const frameSrc = useMemo(() => {
-    if (!proxyReady) return null;
-    return stabilizedPreview
-      ? api.stabilizedFrameUrl(project.id, currentFrame)
-      : api.frameUrl(project.id, currentFrame);
-  }, [proxyReady, stabilizedPreview, project.id, currentFrame]);
-
-  useEffect(() => {
-    if (!frameSrc) return;
-    setError(null);
-    const cached = imageCache.current.get(frameSrc);
-    if (cached && cached.complete) {
-      forceRedraw((n) => n + 1);
-      return;
-    }
-    const img = new Image();
-    img.onload = () => {
-      imageCache.current.set(frameSrc, img);
-      // Cap the cache so a long scrub session does not grow unbounded.
-      if (imageCache.current.size > 240) {
-        const oldest = imageCache.current.keys().next().value;
-        if (oldest) imageCache.current.delete(oldest);
-      }
-      forceRedraw((n) => n + 1);
-    };
-    img.onerror = () =>
-      setError(stabilizedPreview ? "stabilized preview not ready yet" : "frame not available");
-    img.src = frameSrc;
-  }, [frameSrc, stabilizedPreview]);
+  // Frame images, with the neighbours prefetched and the previous frame held on
+  // screen until the next one has actually decoded (todo 5) -- see
+  // hooks/useFrameImages.ts for why navigation used to flash black.
+  const urlFor = useCallback(
+    (frame: number) => {
+      if (!proxyReady) return null;
+      return stabilizedPreview
+        ? api.stabilizedFrameUrl(project.id, frame)
+        : api.frameUrl(project.id, frame);
+    },
+    [proxyReady, stabilizedPreview, project.id],
+  );
+  const frames = useFrameImages(urlFor, currentFrame, project.video.frames);
+  const error = frames.error
+    ? stabilizedPreview
+      ? "stabilized preview not ready yet"
+      : "frame not available"
+    : null;
 
   // The stabilized preview warps (and may crop) the frame, so overlay
   // coordinates — which are in *source* space — no longer line up with what is
@@ -230,9 +213,8 @@ export function Viewer() {
     const frameW = videoW * t.scale;
     const frameH = videoH * t.scale;
 
-    const img = frameSrc ? imageCache.current.get(frameSrc) : undefined;
-    if (img) {
-      ctx.drawImage(img, frameLeft, frameTop, frameW, frameH);
+    if (frames.image) {
+      ctx.drawImage(frames.image, frameLeft, frameTop, frameW, frameH);
     } else {
       ctx.fillStyle = "#111";
       ctx.fillRect(frameLeft, frameTop, frameW, frameH);
@@ -243,6 +225,47 @@ export function Viewer() {
       const isSelected = point.id === selectedPointId;
       const track = tracks[point.id];
       const color = pointColor(point.id);
+      const live = liveTracking[point.id];
+
+      // A run in flight (todos 4, 16): the path found so far is drawn over the
+      // stale one in the point's own colour, and the frame the tracker is
+      // reading right now gets a ring. Scrubbing back over covered frames shows
+      // the tracker's answer for them before the job has finished.
+      if (live?.x && live.y && showPaths) {
+        ctx.save();
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeStyle = color;
+        ctx.setLineDash([6, 3]);
+        ctx.beginPath();
+        let started = false;
+        for (let f = 0; f < live.x.length; f++) {
+          const lx = live.x[f];
+          const ly = live.y[f];
+          if (lx == null || ly == null) {
+            started = false;
+            continue;
+          }
+          const px = toCanvasX(lx);
+          const py = toCanvasY(ly);
+          if (started) ctx.lineTo(px, py);
+          else ctx.moveTo(px, py);
+          started = true;
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        const hx = live.x[currentFrame];
+        const hy = live.y[currentFrame];
+        if (hx != null && hy != null) {
+          ctx.save();
+          ctx.strokeStyle = "#ffffff";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(toCanvasX(hx), toCanvasY(hy), 9, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
 
       if (track) {
         // Before/after ghosting: where corrections exist the server also sends
@@ -346,10 +369,11 @@ export function Viewer() {
     currentFrame,
     selectedPointId,
     proxyReady,
-    frameSrc,
+    frames.image,
+    frames.revision,
+    liveTracking,
     drag,
     overlayValid,
-    redrawTick,
     sizeTick,
     zoom,
     pan,

@@ -17,6 +17,7 @@ import type {
   SmoothingFilter,
   SmoothingResponse,
   SolveResponse,
+  TemplateOptions,
   TrackData,
   TrackerInfo,
 } from "../types";
@@ -180,6 +181,35 @@ export const trackPoint = (
 ): Promise<{ job_id: string }> =>
   postJson(`/api/projects/${projectId}/points/${pointId}/track`, opts);
 
+// -- template matching (todo 14) ---------------------------------------------
+
+export const getTemplateOptions = (
+  projectId: string,
+  pointId: string,
+): Promise<TemplateOptions> => request(`/api/projects/${projectId}/points/${pointId}/template`);
+
+export const updateTemplateOptions = (
+  projectId: string,
+  pointId: string,
+  body: { template_radius?: number | null; search_radius?: number | null },
+): Promise<TemplateOptions> =>
+  putJson(`/api/projects/${projectId}/points/${pointId}/template`, body);
+
+/**
+ * URL of the template patch at one keyframe. `radius` previews a size that has
+ * not been saved yet, so dragging the slider updates the grid live; without it
+ * the stored radius is used.
+ */
+export function templatePatchUrl(
+  projectId: string,
+  pointId: string,
+  frame: number,
+  radius?: number,
+): string {
+  const size = radius === undefined ? "" : `&radius=${radius}`;
+  return `/api/projects/${projectId}/points/${pointId}/template/patch?frame=${frame}${size}`;
+}
+
 export const getTrack = (projectId: string, pointId: string): Promise<TrackData> =>
   request(`/api/projects/${projectId}/points/${pointId}/track`);
 
@@ -285,7 +315,8 @@ export const updateRenderSettings = (
 
 // -- export -------------------------------------------------------------------
 
-export function tracksExportUrl(projectId: string, format: "csv" | "json"): string {
+/** `ae` is After Effects keyframe data (stable/core/trackdata.py), not a data dump. */
+export function tracksExportUrl(projectId: string, format: "csv" | "json" | "ae"): string {
   return `/api/projects/${projectId}/export/tracks?format=${format}`;
 }
 

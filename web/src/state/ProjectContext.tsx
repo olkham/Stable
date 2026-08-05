@@ -10,6 +10,7 @@ import {
 } from "react";
 import * as api from "../api/client";
 import { useJobsSocket } from "../hooks/useJobsSocket";
+import { useLiveTracking, type LiveTracking } from "../hooks/useLiveTracking";
 import type {
   Correction,
   HistoryStatus,
@@ -48,6 +49,8 @@ interface ProjectContextValue {
 
   jobs: Record<string, JobEvent>;
   latestJobFor: (kind: string, target?: string | null) => JobEvent | undefined;
+  /** In-flight track/retrack runs, by point id — their live cursor and partial path. */
+  liveTracking: Record<string, LiveTracking>;
 
   currentFrame: number;
   setCurrentFrame: (frame: number) => void;
@@ -128,6 +131,7 @@ export function ProjectProvider({
   const [editRevision, setEditRevision] = useState(0);
 
   const jobs = useJobsSocket(projectId);
+  const liveTracking = useLiveTracking(jobs);
 
   const refresh = useCallback(async () => {
     const detail = await api.getProject(projectId);
@@ -352,6 +356,7 @@ export function ProjectProvider({
       trackers,
       jobs,
       latestJobFor,
+      liveTracking,
       currentFrame,
       setCurrentFrame,
       isPlaying,
@@ -386,6 +391,7 @@ export function ProjectProvider({
     trackers,
     jobs,
     latestJobFor,
+    liveTracking,
     currentFrame,
     isPlaying,
     selectedPointId,

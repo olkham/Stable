@@ -29,8 +29,16 @@ interface AnchorIntegrity {
  * hit, go look at it".
  */
 export function Timeline() {
-  const { project, currentFrame, setCurrentFrame, isPlaying, setIsPlaying, selectedPointId, tracks } =
-    useProjectContext();
+  const {
+    project,
+    currentFrame,
+    setCurrentFrame,
+    isPlaying,
+    setIsPlaying,
+    selectedPointId,
+    tracks,
+    liveTracking,
+  } = useProjectContext();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const frames = Math.max(project.video.frames, 1);
@@ -139,6 +147,27 @@ export function Timeline() {
       }
     }
 
+    // A tracking run in flight (todos 4, 16): shade the span its decoder has
+    // reached and mark the frame it is on, so "how far has it got, and is it
+    // worth scrubbing back to look" is answerable without opening a panel.
+    for (const live of Object.values(liveTracking)) {
+      const color = pointColor(live.pointId);
+      if (live.span) {
+        const x0 = (live.span.from / frames) * width;
+        const x1 = ((live.span.to + 1) / frames) * width;
+        ctx.save();
+        ctx.globalAlpha = 0.3;
+        ctx.fillStyle = color;
+        ctx.fillRect(x0, height - 5, Math.max(x1 - x0, 1), 5);
+        ctx.restore();
+      }
+      if (live.frame != null) {
+        const x = (live.frame / frames) * width;
+        ctx.fillStyle = color;
+        ctx.fillRect(x - 1, 0, 2, height);
+      }
+    }
+
     // Playhead.
     const px = (currentFrame / frames) * width;
     ctx.strokeStyle = "#fff";
@@ -155,6 +184,7 @@ export function Timeline() {
     frames,
     flagged,
     anchorFrames,
+    liveTracking,
   ]);
 
   function seekFromEvent(evt: React.MouseEvent<HTMLDivElement>) {

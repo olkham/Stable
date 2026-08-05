@@ -906,3 +906,87 @@ button:disabled {
 .model-list__delete {
   color: var(--danger);
 }
+
+/* -- template matching panel (todo 14) ------------------------------------- */
+
+.template-panel {
+  margin: 8px 0 4px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.template-panel__controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+}
+
+.template-panel__controls label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+}
+
+.template-panel__size {
+  min-width: 84px;
+  font-variant-numeric: tabular-nums;
+}
+
+.template-panel__pending {
+  color: var(--text-dim);
+}
+
+.template-panel__grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.template-thumb {
+  margin: 0;
+  text-align: center;
+  cursor: pointer;
+  border: 2px solid transparent;
+  border-radius: 3px;
+  line-height: 0;
+}
+
+.template-thumb--current {
+  border-color: var(--accent, #4da3ff);
+}
+
+.template-thumb img {
+  display: block;
+  border-radius: 2px;
+  background: #000;
+}
+
+.template-thumb__missing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #2a1414;
+  color: #ff3b30;
+  border-radius: 2px;
+  font-size: 1.2rem;
+}
+
+.template-thumb figcaption {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.template-panel__empty,
+.template-panel__warning {
+  margin: 8px 0 0;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}

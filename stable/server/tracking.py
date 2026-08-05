@@ -34,6 +34,25 @@ keyframes *plus* every manual correction that states a position (see
 Before this, a retrack simply spliced over whatever anchors lay in its
 direction: the user's keyframes were silently discarded by the very run that was
 supposed to respect them.
+
+Watching a run happen
+---------------------
+A track over a long clip takes minutes, and until it finished there was nothing
+to look at but a percentage. Two things now stream out of a running job (todos 4
+and 16), both through the :class:`~stable.server.jobs.JobProgress` the job body
+is handed:
+
+* **Where the tracker is** — published by the worker itself from
+  :mod:`stable.video.telemetry`, needing nothing from this module.
+* **What it has found** — :class:`LivePartialTrack` below publishes the merged
+  positions after each planned run completes, so the path appears a segment at a
+  time and the operator can scrub back over frames already covered rather than
+  waiting for the whole clip.
+
+Both are best-effort: the publishing calls are duck-typed, so every caller that
+passes a plain ``(fraction, message)`` callback — the CLI, and every test
+written before this existed — keeps working untouched and simply publishes
+nothing.
 """
 
 from __future__ import annotations
@@ -67,6 +86,7 @@ from ..trackers.merge import (
 )
 from ..trackers.registry import create_tracker
 from .storage import Workspace
+from .tracker_options import point_options
 
 __all__ = [
     "run_point_tracking",
@@ -82,7 +102,77 @@ __all__ = [
     "load_display_track",
     "load_raw_track",
     "retrack_resolver",
+    "LivePartialTrack",
 ]
+
+
+class LivePartialTrack:
+    """Accumulates finished runs and publishes the path found so far.
+
+    A tracking job plans several runs and only merges at the end, so until now
+    nothing existed to look at mid-job. This holds one ``x``/``y`` array over the
+    whole clip, fills in each run as it lands, and publishes the pair — the same
+    shape ``GET .../points/{id}/track`` returns, with ``null`` for frames not yet
+    covered, so the viewer draws a partial path with exactly the code that draws
+    a finished one.
+
+    This is deliberately *not* the merge: blending runs is
+    :func:`~stable.trackers.merge.merge_anchor_runs`' job and running it early,
+    on a partial set, could only produce a different answer from the real one.
+    Later runs overwrite earlier ones where they overlap, which is enough for a
+    preview and cannot influence the result that gets persisted.
+
+    Args:
+        n_frames: Clip length, fixing the published arrays' length.
+        progress: The job's progress reporter. Anything without a ``merge``
+            method (a plain callback) disables publishing entirely.
+        total_runs: How many runs are planned, for the ``runs_done``/
+            ``runs_total`` counters the UI shows.
+    """
+
+    def __init__(self, n_frames: int, progress: Any, *, total_runs: int) -> None:
+        """Create an all-unknown partial track bound to one job."""
+        self._n_frames = max(0, int(n_frames))
+        self._publish = getattr(progress, "merge", None)
+        self._total_runs = max(0, int(total_runs))
+        self._runs_done = 0
+        self._x: list[float | None] = [None] * self._n_frames
+        self._y: list[float | None] = [None] * self._n_frames
+
+    @property
+    def enabled(self) -> bool:
+        """Whether anything is listening (a plain progress callback means no)."""
+        return callable(self._publish)
+
+    def add_run(self, track: PointTrack) -> None:
+        """Record one finished run's positions and publish the result so far.
+
+        Args:
+            track: The run's guarded output, ``NaN`` outside the frames it
+                covered.
+        """
+        self._runs_done += 1
+        if not self.enabled:
+            return
+        points = np.asarray(track.points, dtype=np.float64)
+        valid = np.isfinite(points).all(axis=1)
+        for frame in np.nonzero(valid)[0]:
+            if frame >= self._n_frames:
+                break
+            self._x[frame] = float(points[frame, 0])
+            self._y[frame] = float(points[frame, 1])
+        self.publish()
+
+    def publish(self) -> None:
+        """Push the current partial path onto the job event."""
+        if not self.enabled:
+            return
+        assert self._publish is not None  # noqa: S101 - `enabled` just checked it
+        self._publish(
+            track={"x": self._x, "y": self._y, "n_frames": self._n_frames},
+            runs_done=self._runs_done,
+            runs_total=self._total_runs,
+        )
 
 
 def report_path_for(npz_path: Path) -> Path:
@@ -281,11 +371,13 @@ def run_point_tracking(
     run_specs = plan_anchor_runs(anchors, frame_range)
     tracker_name = tracker or point.tracker
 
-    plugin = create_tracker(tracker_name, device=device)
+    options = point_options(workspace.project_dir(project_id), point_id)
+    plugin = create_tracker(tracker_name, device=device, options=options)
     track_runs: list[TrackRun] = []
     violations: list[AnchorViolation] = []
+    n_runs = len(run_specs)
+    live = LivePartialTrack(video.frame_count, progress, total_runs=n_runs)
     try:
-        n_runs = len(run_specs)
         for index, spec in enumerate(run_specs):
 
             def sub_progress(
@@ -307,6 +399,7 @@ def run_point_tracking(
             )
             violations.extend(breaches)
             track_runs.append(TrackRun.from_spec(spec, guarded))
+            live.add_run(guarded)
     finally:
         plugin.release()
 
@@ -426,7 +519,9 @@ def run_point_retrack(
     correction = RetrackCorrection(
         frame=frame, x=query.x, y=query.y, direction=direction, tracker=plugin_name
     )
-    plugin = create_tracker(plugin_name, device=device)
+    options = point_options(workspace.project_dir(project_id), point_id)
+    plugin = create_tracker(plugin_name, device=device, options=options)
+    live = LivePartialTrack(n_frames, progress, total_runs=2 if direction == "bidir" else 1)
     try:
         if direction == "bidir":
             # A bidirectional retrack is two single-direction runs (the plugin
@@ -435,10 +530,12 @@ def run_point_retrack(
             forward = plugin.track(
                 video, [query], (frame, run_range[1]), "fwd", progress=_scaled(progress, 0, 2)
             ).point(0)
+            live.add_run(forward)
             backward = plugin.track(
                 video, [query], (run_range[0], frame + 1), "bwd", progress=_scaled(progress, 1, 2)
             ).point(0)
             run = _combine_halves(forward, backward, frame)
+            live.add_run(backward)
         else:
             run = plugin.track(
                 video,
@@ -447,6 +544,7 @@ def run_point_retrack(
                 cast(Direction, direction),
                 progress=progress,
             ).point(0)
+            live.add_run(run)
     finally:
         plugin.release()
 

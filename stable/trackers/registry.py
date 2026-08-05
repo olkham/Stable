@@ -182,7 +182,12 @@ class TrackerRegistry:
             ) from None
 
     def create(
-        self, name: str, *, device: str | None = None, prepare: bool = True
+        self,
+        name: str,
+        *,
+        device: str | None = None,
+        prepare: bool = True,
+        options: dict[str, Any] | None = None,
     ) -> TrackerPlugin:
         """Instantiate a tracker and (by default) prepare it on a device.
 
@@ -191,6 +196,12 @@ class TrackerRegistry:
             device: Device string; ``None`` selects automatically
                 (``cuda`` when available, else ``cpu``).
             prepare: Call :meth:`~stable.trackers.base.TrackerPlugin.prepare`.
+            options: Constructor keyword arguments for the plugin, e.g.
+                ``{"template_radius": 20}`` — how a per-point tracker setting
+                reaches the plugin that honours it (todo 14). Keys the plugin
+                does not accept are **ignored**, not an error: options are
+                stored per point and follow it if its tracker is changed, and a
+                stale key from a previous tracker must not stop it running.
 
         Returns:
             A ready-to-use plugin instance.
@@ -203,10 +214,25 @@ class TrackerRegistry:
         resolved = select_device(device)
         if plugin_cls.requires_gpu and resolved == "cpu":
             raise TrackerError(f"tracker {name!r} requires a GPU but no CUDA device is available")
-        plugin = plugin_cls()
+        plugin = plugin_cls(**self._accepted_options(plugin_cls, options))
         if prepare:
             plugin.prepare(resolved)
         return plugin
+
+    @staticmethod
+    def _accepted_options(
+        plugin_cls: type[TrackerPlugin], options: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Return the subset of ``options`` that ``plugin_cls.__init__`` accepts."""
+        if not options:
+            return {}
+        try:
+            parameters = inspect.signature(plugin_cls.__init__).parameters
+        except (TypeError, ValueError):  # pragma: no cover - builtins only
+            return {}
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            return dict(options)
+        return {key: value for key, value in options.items() if key in parameters}
 
     def names(self) -> list[str]:
         """Return every registered tracker name, sorted."""
@@ -262,9 +288,15 @@ def get_tracker(name: str) -> type[TrackerPlugin]:
     return registry.get(name)
 
 
-def create_tracker(name: str, *, device: str | None = None, prepare: bool = True) -> TrackerPlugin:
+def create_tracker(
+    name: str,
+    *,
+    device: str | None = None,
+    prepare: bool = True,
+    options: dict[str, Any] | None = None,
+) -> TrackerPlugin:
     """Instantiate a prepared tracker from the process-wide registry."""
-    return registry.create(name, device=device, prepare=prepare)
+    return registry.create(name, device=device, prepare=prepare, options=options)
 
 
 def available_trackers() -> list[str]:

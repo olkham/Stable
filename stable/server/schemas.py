@@ -29,9 +29,24 @@ __all__ = [
     "CorrectionUpdate",
     "RetrackRequest",
     "ModelDownloadRequest",
+    "TemplateOptionsUpdate",
 ]
 
 Direction = Literal["fwd", "bwd", "bidir"]
+
+
+class TemplateOptionsUpdate(BaseModel):
+    """Body for ``PUT .../points/{id}/template``: one point's template sizes.
+
+    Both fields are optional *and* nullable, and the two mean different things:
+    omitted leaves the stored value alone, while an explicit ``null`` clears it
+    so the tracker's own default applies again (todo 14). Range checking lives
+    in :mod:`stable.server.tracker_options` beside the storage, not here, so the
+    CLI and the HTTP layer cannot disagree about what is valid.
+    """
+
+    template_radius: int | None = None
+    search_radius: int | None = None
 
 
 class PointCreate(BaseModel):

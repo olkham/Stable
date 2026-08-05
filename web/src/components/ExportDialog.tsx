@@ -201,6 +201,13 @@ export function ExportDialog({ onClose }: { onClose: () => void }) {
               <a href={api.tracksExportUrl(project.id, "json")} download="tracks.json">
                 tracks.json
               </a>
+              <a
+                href={api.tracksExportUrl(project.id, "ae")}
+                download="tracks-ae.txt"
+                title="After Effects keyframe data — paste onto a layer's Position property"
+              >
+                After Effects
+              </a>
             </div>
             <p>Solved + smoothed X/Y/R/S curves:</p>
             <div className="export-links">

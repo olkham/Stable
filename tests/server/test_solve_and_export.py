@@ -123,6 +123,38 @@ def test_export_tracks_csv_and_json(client: TestClient, tracked_project) -> None
     assert set(rows[0]) == {"point_id", "frame", "x", "y", "confidence", "visible"}
 
 
+def test_export_tracks_as_after_effects_keyframes(client: TestClient, tracked_project) -> None:
+    """Todo 18's other half: a format a compositor will actually read."""
+    project_id, source = tracked_project
+
+    response = client.get(f"/api/projects/{project_id}/export/tracks", params={"format": "ae"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "tracks-ae.txt" in response.headers["content-disposition"]
+
+    text = response.text
+    assert text.startswith("Adobe After Effects 8.0 Keyframe Data")
+    assert text.count("Transform\tPosition") == 2  # one block per tracked point
+    assert f"\tSource Width\t{source.width}" in text
+    assert "End of Keyframe Data" in text
+
+
+def test_an_unknown_export_format_is_refused_by_name(client: TestClient, tracked_project) -> None:
+    project_id, _source = tracked_project
+    response = client.get(f"/api/projects/{project_id}/export/tracks", params={"format": "xml"})
+    assert response.status_code == 400
+    assert "ae" in response.json()["detail"]
+
+
+def test_after_effects_export_needs_something_to_export(client: TestClient, tiny_clip) -> None:
+    """An empty keyframe document reads as a broken export, so it is refused."""
+    detail = upload_clip(client, tiny_clip[0])
+    wait_job(client, detail["id"], detail["proxy_job_id"])
+    response = client.get(f"/api/projects/{detail['id']}/export/tracks", params={"format": "ae"})
+    assert response.status_code == 400
+    assert "tracked" in response.json()["detail"]
+
+
 def test_export_curves_requires_solve(client: TestClient, tracked_project) -> None:
     project_id, _source = tracked_project
     response = client.get(f"/api/projects/{project_id}/export/curves")

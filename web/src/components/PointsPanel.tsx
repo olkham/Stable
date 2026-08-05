@@ -4,6 +4,7 @@ import { pointColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackData } from "../types";
 import { JobProgress } from "./JobProgress";
+import { TemplatePanel } from "./TemplatePanel";
 
 /** How far a keyframe may be from where a run landed before it is flagged. */
 const FLAGGED_ANCHOR_COLOR = "#ff3b30";
@@ -253,6 +254,13 @@ export function PointsPanel() {
                   + anchor
                 </button>
               </div>
+
+              {/* Template matching gets its own controls, and only when it is
+                  the tracker actually in use — the patch grid is meaningless
+                  for LK or a deep tracker (todo 14). */}
+              {point.tracker === "template" && isSelected && (
+                <TemplatePanel pointId={point.id} />
+              )}
 
               <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                 <button onClick={() => handleTrack(point.id)}>

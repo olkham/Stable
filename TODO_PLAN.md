@@ -130,6 +130,35 @@ Verified against the real project: as the user had it → `is_no_op=True`, refus
 
 **OWNS:** `stable/video/**`, `stable/server/jobs.py`, `stable/server/routes/ws.py`, `stable/server/app.py`, `stable/server/storage.py`, `stable/cli/serve.py`, `stable/trackers/deep.py`, `stable/trackers/chunking.py`, `web/src/components/JobProgress.tsx`, `web/src/hooks/**`, `web/src/api/client.ts`
 
+### W4 — done
+
+**First, the suite was not green — it was crashing.** `pytest tests/server` did not fail, it killed the interpreter with an access violation (`0xC0000005`). Every server test file passed *alone*, so the failure only appeared in a full run and had been committed. `Workspace.get_video_source` hands **one** `PyAVVideoSource` to background jobs and request threads alike, so `Workspace.close()` — run by `reset_workspace()` between test modules, and by the app lifespan on shutdown — freed the FFmpeg container while a proxy job was still decoding through it. Reproduced in 40 lines (close a source while a thread reads it) before anything was changed.
+
+`PyAVVideoSource.close()` now takes the same lock the decode path holds, so an in-flight decode finishes and every later one raises `VideoError` instead of touching freed memory; abandoned decode generators are closed explicitly rather than left for the GC to finalise beside their replacement. `delete_project` was the same bug from the other side — it evicted the cached source without closing it, so on Windows the open handle silently defeated the `rmtree(ignore_errors=True)` that followed.
+
+**Todo 6 — measured, and the first number was wrong.** `scripts/benchmark_video.py` runs each optimisation against its own disabled setting on one clip (240 frames, 1920x1080, 32 cores):
+
+| | before | after | |
+|---|---|---|---|
+| proxy generation (1 → 8 encode threads) | 180 f/s | 306 f/s | **1.71x** |
+| multi-run decode, single-threaded | 272 f/s | 309 f/s | **1.14x** |
+| **4 concurrent runs (shared decoder → pool)** | **34.6 f/s** | **485 f/s** | **14.03x** |
+| scattered scrub (the UI's pattern) | 11.5 f/s | 11.5 f/s | 1.00x |
+
+The first run of this reported **24.61x** for multi-run decode. That was an artefact: the "before" case had been given a 16 MB cache, where `PyAVVideoSource`'s real default is 64 frames. Corrected to the actual old default it is 1.14x. The honest headline is the **concurrent** row — pooling exists so parallel jobs stop dragging one decoder's cursor across the clip, and that is where the 14x is. The scrub row is there to show read-ahead costs the UI nothing.
+
+**Todos 4 and 16 — live results, not a live percentage.** `jobs.py` already published the decoder's frame cursor; what was missing was *what the tracker found*. `tracking.LivePartialTrack` accumulates each planned run as it lands and publishes the path so far — full clip length, `null` where not yet covered, the same shape a finished `TrackData` has, so the viewer draws a partial path with the code that draws a finished one. Deliberately **not** a partial merge: blending is `merge_anchor_runs`' job and running it early on a partial set could only disagree with the real answer. Publishing is duck-typed (`getattr(progress, "merge", None)`), so the CLI and every pre-existing test pass a plain callback and publish nothing.
+
+Frontend: `useLiveTracking` indexes in-flight runs by point; the viewer draws the partial path dashed in the point's colour with a ring on the frame being read; the timeline shades the span covered and marks the cursor; `JobProgress` says "frame 812 · run 2/4" instead of only a percentage.
+
+**Todo 5 — two causes, both fixed.** `useFrameImages` keeps the previous frame on screen until the next has actually decoded (the picture only ever changes to another picture, never to black) *and* prefetches neighbours biased in the direction of travel. The old code painted immediately and drew `#111` on a miss, which is the flash.
+
+**`stable serve`** binds the socket itself — requested port, then the next ten, then whatever the OS gives — and prints the URL only once that succeeded, naming the port actually held. Port 8000 is held by `iphlpsvc` on this box, so the old code printed a correct-looking URL and then a traceback. Verified live: falls back to 8001 and answers there.
+
+**Not done:** todo 1 (upload progress) was already done by W3 via `XMLHttpRequest` in `ProjectPicker.tsx`; moving it into `api/client.ts` now that W4 owns that file would be churn for no behaviour change, so it stays.
+
+**Tests:** `tests/server/test_live_tracking.py` (7), `tests/test_video_source.py` +3 (the close race — before the fix these did not fail, they killed the interpreter), `tests/test_cli_serve.py` +6.
+
 ## W5 — Tracker algorithms (Sonnet) — todos 22–28
 
 Each as a `TrackerPlugin` registered via the `stable.trackers` entry-point group (see `CONTRIBUTING.md`). Confidence must be normalised to [0,1] on the shared scale in `trackers/confidence.py`.
@@ -148,6 +177,22 @@ Each as a `TrackerPlugin` registered via the `stable.trackers` entry-point group
 - **19** Save/load tracking sessions. **Verify before building** — projects already persist to disk via `server/storage.py`; likely already satisfied, in which case say so rather than duplicating it.
 
 **OWNS:** `stable/trackers/template.py`, `web/src/components/PointsPanel.tsx` (after W1), a new template panel component, `stable/server/routes/projects.py`
+
+### W6 — done
+
+**Todo 14 — the size, and the patch it produces.** Per-point tracker settings live in `tracker_options.json`, a sidecar beside `solve.json` / `smoothing.json` / `render_options.json` — the same choice W2 made for the render options, and for the same reason: the locked v1 project schema stays untouched (a test asserts the setting never appears in `project.stable.json`). `TrackerRegistry.create` gained an `options=` argument that is **filtered against the plugin's own constructor**, so settings follow a point across a tracker change instead of erroring — switching a template point to LK and tracking it is a test, not a hope.
+
+`GET/PUT .../points/{id}/template` and `GET .../points/{id}/template/patch` serve the settings and the patch itself, cropped on demand from the source clip (a patch is a pure function of clip/frame/position/radius; caching it would only mean invalidating it every time an anchor moves). `TemplatePanel.tsx` puts a size slider above a grid of one thumbnail per keyframe, drawn pixelated so the texture being judged is not smoothed away. The slider previews sizes through a `radius` query parameter before anything is saved, so dragging shows the consequence and only "Apply" commits it.
+
+The grid's "this patch does not fit" marker uses **the tracker's own edge rule**, so a keyframe the panel shows as ✕ is exactly one the tracker would refuse — the preview cannot flatter the run.
+
+**Todo 18 — verified, then extended.** CSV and JSON already existed for both tracks and curves, via `stable solve` and the export dialog, so todo 18's two named formats were done. What was missing was the *"use in other applications"* half: no compositor reads either. Added After Effects keyframe data (`format=ae`, `stable/core/trackdata.py`) — tab-separated, CRLF, pastes onto a layer's Position, coordinates unflipped because AE also measures from the top-left with Y down, and gaps **skipped** rather than written as zero so a missing frame does not import as the point jumping to the corner.
+
+Deliberately not Nuke: a `Tracker4` node is an intricate knob serialisation that would have to be checked against Nuke itself to be trusted, and shipping a format that cannot be verified here is worse than not shipping it.
+
+**Todo 19 — already satisfied; verified rather than rebuilt.** Projects persist continuously through `server/storage.py`, so "pause and resume without losing progress" is a claim about the existing design. `tests/server/test_session_persistence.py` walks a full session (points, anchors, a track, a manual correction, solve settings, template settings), throws the entire server away, and reopens from disk in a new one: the corrected path, its anchors, the correction on top of it and the sidecar settings all come back, and the proxy frames are still servable. Nothing was built for this todo. The second test covers the other half — a deleted project really leaves disk, which on Windows is only true because `delete_project` now closes the video source first.
+
+**Tests:** `tests/server/test_template_options.py` (11), `tests/test_trackdata.py` (8), `tests/server/test_session_persistence.py` (2), `tests/server/test_solve_and_export.py` +3.
 
 ---
 
