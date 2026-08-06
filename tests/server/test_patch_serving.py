@@ -139,7 +139,8 @@ def test_a_new_keyframes_patch_is_rendered_before_anything_asks_for_it(client, t
     clear_patch_cache()
 
     added = client.post(
-        f"/api/projects/{project_id}/points/p1/anchors", json={"frame": 11, "x": 24.0, "y": 21.0}
+        f"/api/projects/{project_id}/points/p1/keyframes",
+        json={"frame": 11, "x": 24.0, "y": 21.0, "track": "none"},
     )
     assert added.status_code == 200, added.text
     assert drain_patch_warmup(), "the warmer never finished"

@@ -16,7 +16,9 @@ from ..trackers.merge import DEFAULT_ANCHOR_TOLERANCE_PX
 
 __all__ = [
     "PointCreate",
-    "AnchorCreate",
+    "KeyframeCreate",
+    "KeyframeUpdate",
+    "TrackMode",
     "PointUpdate",
     "TrackRequest",
     "SolveSettingsUpdate",
@@ -34,6 +36,15 @@ __all__ = [
 ]
 
 Direction = Literal["fwd", "bwd", "bidir"]
+
+TrackMode = Literal["auto", "none"]
+"""Whether a keyframe edit re-tracks its point by itself (todo_6).
+
+An edit changes the answer for the whole point, so the default is ``"auto"``:
+the path re-flows without the operator hunting for a Track button. ``"none"``
+is for a caller batching several edits — or a test — that wants to decide when
+the run happens.
+"""
 
 
 class TemplateOptionsUpdate(BaseModel):
@@ -69,12 +80,33 @@ class PointCreate(BaseModel):
     tracker: str | None = None
 
 
-class AnchorCreate(BaseModel):
-    """Body for ``POST /api/projects/{id}/points/{point_id}/anchors``: add an anchor pin."""
+class KeyframeCreate(BaseModel):
+    """Body for ``POST /api/projects/{id}/points/{point_id}/keyframes``.
+
+    States that the point is at ``(x, y)`` on ``frame`` — whatever the project
+    said before, pin or promoted correction (see
+    :func:`stable.server.tracking.effective_keyframes`).
+    """
 
     frame: int
     x: float
     y: float
+    track: TrackMode = "auto"
+
+
+class KeyframeUpdate(BaseModel):
+    """Body for ``PATCH /api/projects/{id}/points/{point_id}/keyframes/{frame}``.
+
+    Every position field is optional and omitting one keeps it, so a drag along
+    the timeline sends ``frame`` alone and a drag on the image sends ``x``/``y``
+    alone. All three together is one atomic move, which is what stops the UI
+    from having to express a drag as delete-then-add.
+    """
+
+    frame: int | None = None
+    x: float | None = None
+    y: float | None = None
+    track: TrackMode = "auto"
 
 
 class PointUpdate(BaseModel):

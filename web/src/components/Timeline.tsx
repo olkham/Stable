@@ -1,32 +1,20 @@
 import { useEffect, useMemo, useRef } from "react";
 import { confidenceColor, pointColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
-import type { TrackData } from "../types";
 
 /** Colour of a keyframe no tracking run could actually reach (todos 13, 15). */
-const FLAGGED_ANCHOR_COLOR = "#ff3b30";
+const FLAGGED_KEYFRAME_COLOR = "#ff3b30";
 
 /**
- * The anchor-integrity fields `GET .../points/{id}/track` adds (W1). Declared
- * here rather than on the shared `TrackData` so the timeline can read them
- * without that type being co-owned; `flagged_anchors` lists the keyframes a run
- * reached and disagreed with, which is exactly what gets painted red.
- */
-interface AnchorIntegrity {
-  flagged_anchors?: number[];
-  ground_truth?: { frame: number; x: number; y: number }[];
-}
-
-/**
- * Transport controls + scrub bar + per-point anchor pins + confidence
+ * Transport controls + scrub bar + per-point keyframe ticks + confidence
  * heat-strip for the selected point — the timeline's "go fix this" signal:
  * a red dip in the strip is where the merge disagreed or confidence dropped.
  *
  * Corrections on the selected point are marked along the top edge, so an edit
- * made on the frame is visible on the timeline without opening a panel. Anchor
- * pins are drawn in the point's colour when a run actually passed through them
- * and in red when one reached them and disagreed — "this keyframe was never
- * hit, go look at it".
+ * made on the frame is visible on the timeline without opening a panel.
+ * Keyframe ticks are drawn in the point's colour when a run actually passed
+ * through them and in red when one reached them and disagreed — "tracking
+ * disagrees with you here, go look at it".
  */
 /** Playback speeds offered, as multiples of the clip's own frame rate. */
 const PLAYBACK_RATES = [0.25, 0.5, 1, 2, 4];
@@ -70,24 +58,22 @@ export function Timeline() {
   // states, and only the first has anything to jump to.
   const ranged = clipRange && !clipRange.whole_clip ? clipRange : null;
 
-  // Keyframes per point that no run reached, and the full ground-truth list
-  // (pins plus the keyframes manual corrections were promoted to, so a drag
-  // shows up on the timeline as the anchor it has become).
+  // Keyframes per point that a run reached and disagreed with, and the full
+  // unified keyframe list — pins and the positions manual corrections state are
+  // one concept, so they are one tick style here.
   const flagged = useMemo(() => {
     const out: Record<string, Set<number>> = {};
     for (const [pointId, data] of Object.entries(tracks)) {
-      out[pointId] = new Set((data as TrackData & AnchorIntegrity).flagged_anchors ?? []);
+      out[pointId] = new Set(data.flagged_keyframes ?? []);
     }
     return out;
   }, [tracks]);
 
-  const anchorFrames = useMemo(() => {
+  const keyframeFrames = useMemo(() => {
     const out: Record<string, number[]> = {};
     for (const point of project.points) {
-      const promoted = (tracks[point.id] as (TrackData & AnchorIntegrity) | undefined)?.ground_truth;
-      out[point.id] = promoted
-        ? promoted.map((q) => q.frame)
-        : point.queries.map((q) => q.frame);
+      const stated = tracks[point.id]?.keyframes;
+      out[point.id] = (stated ?? point.queries).map((k) => k.frame);
     }
     return out;
   }, [project.points, tracks]);
@@ -176,16 +162,16 @@ export function Timeline() {
       ctx.fillRect(x0, 0, Math.max(x1 - x0, 2), 3);
     }
 
-    // Anchor pins for every point (selected point's pins are brighter). A pin a
+    // Keyframe ticks for every point (the selected point's are brighter). One a
     // run reached and disagreed with goes red and gets a full-height tick, so
     // "this keyframe still needs a human" is visible without selecting the point.
     for (const point of project.points) {
       const color = pointColor(point.id);
       const missed = flagged[point.id];
-      for (const frame of anchorFrames[point.id] ?? []) {
+      for (const frame of keyframeFrames[point.id] ?? []) {
         const x = (frame / frames) * width;
         const unreached = missed?.has(frame) ?? false;
-        ctx.fillStyle = unreached ? FLAGGED_ANCHOR_COLOR : color;
+        ctx.fillStyle = unreached ? FLAGGED_KEYFRAME_COLOR : color;
         ctx.globalAlpha = point.id === selectedPointId ? 1 : 0.55;
         ctx.beginPath();
         ctx.moveTo(x, height);
@@ -257,7 +243,7 @@ export function Timeline() {
     currentFrame,
     frames,
     flagged,
-    anchorFrames,
+    keyframeFrames,
     liveTracking,
     clipRange,
   ]);

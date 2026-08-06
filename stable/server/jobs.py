@@ -372,6 +372,44 @@ class JobManager:
             self._fns.pop(job_id, None)
             return job
 
+    def cancel_queued_matching(
+        self, project_id: str, kind: str, target: str | None
+    ) -> list[Job]:
+        """Cancel every *queued* job of one kind for one target: supersede, don't queue.
+
+        Auto-tracking (todo_6) submits a run on every keyframe edit, and a drag
+        is many edits in a second. Without this, five nudges cost five full
+        tracks executed one after another, the first four of which are answers
+        to questions the operator has already moved on from. Cancelling the
+        queued ones first means only the newest edit survives to run.
+
+        A *running* job is deliberately left alone \u2014 :meth:`cancel` explains why
+        there is no safe point to interrupt one \u2014 and it is harmless here: the
+        job submitted after this lands behind it and overwrites its result.
+
+        Args:
+            project_id: The project whose queue to sweep.
+            kind: The job kind to match, e.g. ``"track"``.
+            target: The id the job concerns, e.g. a point id.
+
+        Returns:
+            The jobs that were cancelled, oldest first.
+        """
+        cancelled: list[Job] = []
+        with self._lock:
+            for job_id in list(self._by_project.get(project_id, [])):
+                job = self._jobs.get(job_id)
+                if job is None or job.status != "queued":
+                    continue
+                if job.kind != kind or job.target != target:
+                    continue
+                job.status = "cancelled"
+                job.message = "superseded by a newer edit"
+                job.updated_at = time.time()
+                self._fns.pop(job_id, None)
+                cancelled.append(job)
+        return cancelled
+
     def jobs_for_project(self, project_id: str) -> list[Job]:
         """Return every tracked job for a project, oldest first."""
         with self._lock:

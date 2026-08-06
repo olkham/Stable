@@ -1,9 +1,11 @@
-"""Point CRUD, anchor pins, the tracking job trigger, and template previews.
+"""Point CRUD, keyframes, the tracking job trigger, and template previews.
 
-A "point" is a :class:`~stable.core.project.PointSpec`: a set of anchor
-keyframes plus a tracker choice. Placing more anchors on the timeline (pins) is
-what feeds :mod:`stable.trackers.merge`'s multi-anchor blend — this module is
-the HTTP surface for that, plus submitting the actual tracking job.
+A "point" is a :class:`~stable.core.project.PointSpec`: a set of keyframes plus
+a tracker choice. Placing more keyframes on the timeline is what feeds
+:mod:`stable.trackers.merge`'s multi-anchor blend — this module is the HTTP
+surface for that, plus submitting the actual tracking job. Since todo_6 a
+keyframe edit re-tracks the point by itself unless the caller opts out; see
+:func:`_auto_track`.
 
 Todo 14 adds two routes on top: what patches a point has (``/patches``) and the
 pixels of one of them (``/patches/image``), rendered on demand — see
@@ -26,16 +28,19 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from ...core.corrections import GROUND_TRUTH_KINDS
 from ...core.errors import ProjectError, StableError
 from ...core.project import PointSpec, Project
 from ...core.types import Query
 from ...trackers.template import TemplateTracker
 from ..jobs import JobManager, get_job_manager
 from ..schemas import (
-    AnchorCreate,
+    KeyframeCreate,
+    KeyframeUpdate,
     PointCreate,
     PointUpdate,
     TemplateOptionsUpdate,
+    TrackMode,
     TrackRequest,
 )
 from ..serialize import point_summary
@@ -59,13 +64,15 @@ from ..tracker_options import (
 )
 from ..tracking import (
     effective_anchors,
-    load_anchor_violations,
+    effective_keyframes,
     load_display_track,
+    load_keyframe_violations,
     load_raw_track,
     load_report,
     report_path_for,
     run_point_tracking,
 )
+from .edits import discard_corrections
 
 __all__ = ["router"]
 
@@ -193,19 +200,153 @@ def delete_point(
     return {"status": "deleted", "removed": removed}
 
 
-@router.post("/{point_id}/anchors")
-def add_anchor(
-    project_id: str, point_id: str, body: AnchorCreate, workspace: Workspace = Depends(_workspace)
-) -> dict[str, Any]:
-    """Add an anchor keyframe (a timeline pin) to a point.
+# -- keyframes (todo_6) --------------------------------------------------------
+#
+# A keyframe is one thing to the operator — "the feature is HERE on this frame" —
+# and two things in storage: a pin in `PointSpec.queries`, or a manual correction
+# carrying an absolute position that was promoted to ground truth. Both had their
+# own route pair, their own chip and their own delete gesture, and nobody could
+# say why. These routes are where that stops: they all speak
+# `stable.server.tracking.effective_keyframes` and decide for themselves which
+# storage a given edit has to rewrite. The project file is untouched by the
+# change — v1 files keep loading, and the corrections layer keeps its
+# raw-is-immutable, undo-is-drop-a-correction contract.
 
-    Adding an anchor at a frame that already has one replaces it — a pin drag
-    in the UI is expressed as delete-then-add at the new frame, so this only
-    needs to handle "two anchors, same frame" as a same-position edit.
+
+def submit_track_job(
+    workspace: Workspace,
+    jobs: JobManager,
+    project_id: str,
+    point_id: str,
+    request: TrackRequest,
+) -> str:
+    """Queue the full multi-keyframe track for one point and return the job id."""
+
+    def _run(progress: Any) -> dict[str, Any]:
+        return run_point_tracking(
+            workspace,
+            project_id,
+            point_id,
+            tracker=request.tracker,
+            direction=request.direction,
+            device=request.device,
+            progress=progress,
+            anchor_tolerance_px=request.anchor_tolerance_px,
+        )
+
+    return jobs.submit(project_id, "track", _run, target=point_id).id
+
+
+def _auto_track(
+    workspace: Workspace,
+    jobs: JobManager,
+    project_id: str,
+    point_id: str,
+    mode: TrackMode,
+) -> str | None:
+    """Re-track a point after a keyframe edit, unless the caller asked not to.
+
+    Full-point is the right grain even for a single moved keyframe: the merge
+    re-runs globally regardless, and its cost is capped at roughly twice the
+    clip however many keyframes there are. What is *not* free is queueing one
+    run per edit while the operator drags, so any run for this point that has
+    not started yet is superseded first (see
+    :meth:`stable.server.jobs.JobManager.cancel_queued_matching`).
+
+    Returns:
+        The submitted job's id, or ``None`` for ``track="none"``.
     """
+    if mode != "auto":
+        return None
+    jobs.cancel_queued_matching(project_id, "track", point_id)
+    return submit_track_job(workspace, jobs, project_id, point_id, TrackRequest())
+
+
+def _claims_on(point: PointSpec, frame: int) -> list[str]:
+    """Return the ids of enabled corrections that place the point on ``frame``.
+
+    Those are what a new statement about that frame has to clear out. Ground
+    truth kinds (``replace``, ``retrack``) are the obvious ones — they *are* the
+    keyframe. ``offset`` is here too because it is half of one: a drag is stored
+    as an offset plus a companion ``replace`` (see
+    :func:`stable.server.routes.edits._promotion_for`), and dropping only the
+    replace would leave the nudge to displace the very position the operator
+    just restated.
+    """
+    displacing = (*GROUND_TRUTH_KINDS, "offset")
+    return [
+        correction.id
+        for correction in point.corrections
+        if correction.enabled
+        and correction.kind in displacing
+        and getattr(correction, "frame", None) == frame
+    ]
+
+
+def _keyframe_payload(project: Project, point: PointSpec, job_id: str | None) -> dict[str, Any]:
+    """Return the shape every mutating keyframe route answers with.
+
+    The point summary, so a caller can refresh its card from the same response;
+    the resulting keyframe list *and* correction list, because a keyframe edit
+    may have discarded a correction and a panel showing the stale one would be
+    the two-concepts problem all over again; and the id of the auto-track this
+    edit triggered (``None`` when it triggered none), so the caller can subscribe
+    to the run over the jobs WebSocket.
+    """
+    return {
+        **point_summary(project, point),
+        "keyframes": [k.to_dict() for k in effective_keyframes(point)],
+        "corrections": [c.to_dict() for c in point.corrections],
+        "job_id": job_id,
+    }
+
+
+def _unlink(paths: Iterable[Path]) -> None:
+    """Delete files that nothing references any more, best effort."""
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
+@router.get("/{point_id}/keyframes")
+def list_keyframes(
+    project_id: str, point_id: str, workspace: Workspace = Depends(_workspace)
+) -> list[dict[str, Any]]:
+    """List every position the operator has stated for a point, in frame order.
+
+    Each entry carries where it came from — ``source`` is ``"pin"`` or
+    ``"correction"``, with the promoting ``correction_id`` for the latter. The
+    UI has no use for the distinction; a caller reconciling this list with the
+    corrections panel does.
+    """
+    project = workspace.load_project(project_id)
+    point = _point_or_404(project, point_id)
+    return [k.to_dict() for k in effective_keyframes(point)]
+
+
+@router.post("/{point_id}/keyframes")
+def add_keyframe(
+    project_id: str,
+    point_id: str,
+    body: KeyframeCreate,
+    workspace: Workspace = Depends(_workspace),
+    jobs: JobManager = Depends(_jobs),
+) -> dict[str, Any]:
+    """State where a point truly is on one frame, replacing whatever said otherwise.
+
+    One frame, one truth: a pin already on that frame is overwritten, and a
+    correction claiming it is discarded rather than shadowed. Shadowing was the
+    tempting shortcut and it is wrong — the correction would keep displacing the
+    displayed track at that frame while the pin quietly told the next merge
+    something else.
+
+    Raises:
+        HTTPException: 400 if the frame lies past the end of the clip.
+    """
+    orphaned: list[Path] = []
 
     def _mutate(project: Project) -> None:
         spec = project.point(point_id)
+        orphaned.extend(discard_corrections(project, spec, _claims_on(spec, body.frame)))
         spec.queries = [q for q in spec.queries if q.frame != body.frame]
         spec.queries.append(Query(frame=body.frame, x=body.x, y=body.y))
 
@@ -213,35 +354,119 @@ def add_anchor(
         project = workspace.update_project(project_id, _mutate)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _unlink(orphaned)
     # Same as placing a point: the patch is rendered while the operator is still
-    # looking at the frame they pinned, not when they next open the card.
+    # looking at the frame they keyed, not when they next open the card.
     warm_patches(workspace, project_id, point_id, [(body.frame, body.x, body.y)])
-    return point_summary(project, project.point(point_id))
+    job_id = _auto_track(workspace, jobs, project_id, point_id, body.track)
+    return _keyframe_payload(project, project.point(point_id), job_id)
 
 
-@router.delete("/{point_id}/anchors/{frame}")
-def delete_anchor(
-    project_id: str, point_id: str, frame: int, workspace: Workspace = Depends(_workspace)
+@router.patch("/{point_id}/keyframes/{frame}")
+def move_keyframe(
+    project_id: str,
+    point_id: str,
+    frame: int,
+    body: KeyframeUpdate,
+    workspace: Workspace = Depends(_workspace),
+    jobs: JobManager = Depends(_jobs),
 ) -> dict[str, Any]:
-    """Remove an anchor keyframe.
+    """Move a keyframe — along the timeline, across the image, or both — in one write.
+
+    A drag is one gesture and has to be one mutation. Expressed as
+    delete-then-add it is two, and between them the point is missing a truth
+    position: a delete of the last keyframe is refused outright, and an
+    auto-track that slipped into the gap would have tracked from a state the
+    operator never asked for.
+
+    Whatever backed the keyframe is replaced by a pin at the new location; a
+    correction-backed one is discarded with its cached run, because the operator
+    has just restated that position and the old claim could only fight the new
+    one at the next merge. Landing on another keyframe's frame replaces it, the
+    same way :func:`add_keyframe` does.
 
     Raises:
-        HTTPException: 400 if this would leave the point with zero anchors —
-            every point needs at least one truth position to track from.
+        HTTPException: 404 if the point has no keyframe on ``frame``, 400 if the
+            destination lies past the end of the clip.
     """
+    project = workspace.load_project(project_id)
+    point = _point_or_404(project, point_id)
+    current = next((k for k in effective_keyframes(point) if k.frame == frame), None)
+    if current is None:
+        raise HTTPException(
+            status_code=404, detail=f"point {point_id!r} has no keyframe on frame {frame}"
+        )
+    target = Query(
+        frame=frame if body.frame is None else body.frame,
+        x=current.x if body.x is None else body.x,
+        y=current.y if body.y is None else body.y,
+    )
+    orphaned: list[Path] = []
 
-    def _mutate(project: Project) -> None:
-        spec = project.point(point_id)
-        remaining = [q for q in spec.queries if q.frame != frame]
-        if not remaining:
-            raise ProjectError("cannot delete a point's last remaining anchor")
-        spec.queries = remaining
+    def _mutate(proj: Project) -> None:
+        spec = proj.point(point_id)
+        claimed = {*_claims_on(spec, frame), *_claims_on(spec, target.frame)}
+        orphaned.extend(discard_corrections(proj, spec, claimed))
+        spec.queries = [q for q in spec.queries if q.frame not in (frame, target.frame)]
+        spec.queries.append(target)
 
     try:
         project = workspace.update_project(project_id, _mutate)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return point_summary(project, project.point(point_id))
+    _unlink(orphaned)
+    warm_patches(workspace, project_id, point_id, [(target.frame, target.x, target.y)])
+    job_id = _auto_track(workspace, jobs, project_id, point_id, body.track)
+    return _keyframe_payload(project, project.point(point_id), job_id)
+
+
+@router.delete("/{point_id}/keyframes/{frame}")
+def delete_keyframe(
+    project_id: str,
+    point_id: str,
+    frame: int,
+    track: TrackMode = "auto",
+    workspace: Workspace = Depends(_workspace),
+    jobs: JobManager = Depends(_jobs),
+) -> dict[str, Any]:
+    """Remove the keyframe on a frame, whatever states it.
+
+    A pin is dropped; a promoting correction is discarded along with the cached
+    run of a retrack, since leaving it would put the keyframe straight back. The
+    caller does not have to know which it was — that asymmetry is precisely what
+    todo_6 exists to hide.
+
+    Raises:
+        HTTPException: 404 if there is no keyframe on that frame, 400 if it is
+            the point's last one. The count is of *effective* keyframes, not
+            pins: a point whose only truth position came from a correction is
+            just as unable to be tracked as one with no pins at all.
+    """
+    project = workspace.load_project(project_id)
+    point = _point_or_404(project, point_id)
+    keyframes = effective_keyframes(point)
+    if not any(k.frame == frame for k in keyframes):
+        raise HTTPException(
+            status_code=404, detail=f"point {point_id!r} has no keyframe on frame {frame}"
+        )
+    if len(keyframes) == 1:
+        raise HTTPException(
+            status_code=400, detail="cannot delete a point's last remaining keyframe"
+        )
+    orphaned: list[Path] = []
+
+    def _mutate(proj: Project) -> None:
+        spec = proj.point(point_id)
+        orphaned.extend(discard_corrections(proj, spec, _claims_on(spec, frame)))
+        spec.queries = [q for q in spec.queries if q.frame != frame]
+
+    try:
+        project = workspace.update_project(project_id, _mutate)
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _unlink(orphaned)
+    job_id = _auto_track(workspace, jobs, project_id, point_id, track)
+    return _keyframe_payload(project, project.point(point_id), job_id)
 
 
 @router.post("/{point_id}/track")
@@ -252,37 +477,24 @@ def track_point(
     workspace: Workspace = Depends(_workspace),
     jobs: JobManager = Depends(_jobs),
 ) -> dict[str, str]:
-    """Submit a background job that tracks a point from every one of its anchors.
+    """Submit a background job that tracks a point from every one of its keyframes.
 
     Runs :func:`stable.trackers.merge.plan_anchor_runs`, executes each run with
     the chosen tracker plugin, and merges the results — the real Phase 0-2
     pipeline, not a stub. See :mod:`stable.server.tracking`.
 
-    "Every one of its anchors" includes the ones the operator's manual
-    corrections promoted (:func:`stable.server.tracking.effective_anchors`), and
-    a run that reaches a keyframe it disagrees with is stopped there rather than
-    drifting past it — the job result names the frame and the pixel distance.
+    "Every one of its keyframes" includes the ones the operator's manual
+    corrections promoted (:func:`stable.server.tracking.effective_keyframes`),
+    and a run that reaches a keyframe it disagrees with is stopped there rather
+    than drifting past it — the job result names the frame and the pixel
+    distance.
     """
     project = workspace.load_project(project_id)
     try:
         project.point(point_id)
     except StableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    def _run(progress: Any) -> dict[str, Any]:
-        return run_point_tracking(
-            workspace,
-            project_id,
-            point_id,
-            tracker=body.tracker,
-            direction=body.direction,
-            device=body.device,
-            progress=progress,
-            anchor_tolerance_px=body.anchor_tolerance_px,
-        )
-
-    job = jobs.submit(project_id, "track", _run, target=point_id)
-    return {"job_id": job.id}
+    return {"job_id": submit_track_job(workspace, jobs, project_id, point_id, body)}
 
 
 def _gaps(track: Any) -> list[list[int]]:
@@ -336,7 +548,7 @@ def get_track(
             report = load_report(report_path_for(Path(path)))
 
     anchors = effective_anchors(point)
-    violations = load_anchor_violations(project, point)
+    violations = load_keyframe_violations(project, point)
     payload: dict[str, Any] = {
         "point_id": point_id,
         "n_frames": track.n_frames,
@@ -348,12 +560,12 @@ def get_track(
         "contributions": (report or {}).get("contributions", [0] * track.n_frames),
         "anchor_frames": (report or {}).get("anchor_frames", [q.frame for q in anchors]),
         # Every position the operator has stated, pins plus promoted manual
-        # corrections — what the panel lists and the timeline pins.
-        "ground_truth": [q.to_dict() for q in anchors],
+        # corrections — what the panel lists and the timeline ticks.
+        "keyframes": [k.to_dict() for k in effective_keyframes(point)],
         # Keyframes a run reached and disagreed with: drawn red on the timeline
         # and the reason a track needs manual review (todos 13, 15).
-        "anchor_violations": violations,
-        "flagged_anchors": sorted({int(v["frame"]) for v in violations}),
+        "keyframe_violations": violations,
+        "flagged_keyframes": sorted({int(v["frame"]) for v in violations}),
         "corrections": [c.to_dict() for c in point.corrections],
         "gaps": _gaps(track),
         "raw_x": None,

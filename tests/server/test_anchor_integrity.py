@@ -1,14 +1,14 @@
 """W1: a user-placed keyframe is ground truth and is never silently overridden.
 
-Todo 13 is the bug these tests were written against: anchors the operator placed
-up front were ignored by tracking runs started elsewhere in the clip. The merge
-(:mod:`stable.trackers.merge`) has guaranteed exact anchor passthrough since
-Phase 0 — what was missing was the *server* handing every anchor to the run in
-the first place, so a retrack simply spliced straight over them.
+Todo 13 is the bug these tests were written against: keyframes the operator
+placed up front were ignored by tracking runs started elsewhere in the clip. The
+merge (:mod:`stable.trackers.merge`) has guaranteed exact anchor passthrough
+since Phase 0 — what was missing was the *server* handing every keyframe to the
+run in the first place, so a retrack simply spliced straight over them.
 
 The other todos in the cluster are the same idea from different angles and are
 covered here too: promotion of manual corrections (11), bounded runs (12, 20)
-and the flagged-anchor signal the timeline draws red (15).
+and the flagged-keyframe signal the timeline draws red (15).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def project(client: TestClient, tiny_clip):
 
 
 def place_point(client: TestClient, project_id: str, frame: int, x: float, y: float) -> str:
-    """Create a point with its first anchor and return its id."""
+    """Create a point with its first keyframe and return its id."""
     response = client.post(
         f"/api/projects/{project_id}/points",
         json={"frame": frame, "x": x, "y": y, "tracker": TRACKER},
@@ -40,17 +40,17 @@ def place_point(client: TestClient, project_id: str, frame: int, x: float, y: fl
     return str(response.json()["id"])
 
 
-def add_anchor(client: TestClient, project_id: str, point_id: str, frame, x, y) -> None:
-    """Pin an extra anchor keyframe onto a point."""
+def add_keyframe(client: TestClient, project_id: str, point_id: str, frame, x, y) -> None:
+    """State an extra keyframe on a point, without re-tracking it."""
     response = client.post(
-        f"/api/projects/{project_id}/points/{point_id}/anchors",
-        json={"frame": frame, "x": x, "y": y},
+        f"/api/projects/{project_id}/points/{point_id}/keyframes",
+        json={"frame": frame, "x": x, "y": y, "track": "none"},
     )
     assert response.status_code == 200, response.text
 
 
 def track(client: TestClient, project_id: str, point_id: str, **body) -> dict:
-    """Run the full multi-anchor tracking job and return the finished job."""
+    """Run the full multi-keyframe tracking job and return the finished job."""
     submitted = client.post(
         f"/api/projects/{project_id}/points/{point_id}/track",
         json={"tracker": TRACKER, **body},
@@ -94,7 +94,7 @@ def test_a_retrack_honours_every_anchor_it_passes(client, project) -> None:
 
     ax, ay = source.true_position(15)
     ax, ay = ax + 12.0, ay
-    add_anchor(client, project_id, point_id, 15, ax, ay)
+    add_keyframe(client, project_id, point_id, 15, ax, ay)
     track(client, project_id, point_id)
 
     merged = track_of(client, project_id, point_id)
@@ -116,33 +116,33 @@ def test_a_disagreeing_run_stops_at_the_anchor_and_reports_it(client, project) -
     point_id = place_point(client, project_id, 0, x0, y0)
 
     ax, ay = source.true_position(15)
-    add_anchor(client, project_id, point_id, 15, ax + 12.0, ay)
+    add_keyframe(client, project_id, point_id, 15, ax + 12.0, ay)
     track(client, project_id, point_id)
 
     x5, y5 = source.true_position(5)
     job = retrack(client, project_id, point_id, frame=5, x=x5, y=y5, direction="fwd")
 
-    violations = job["result"]["anchor_violations"]
+    violations = job["result"]["keyframe_violations"]
     assert [v["frame"] for v in violations] == [15]
     assert violations[0]["distance"] > 6.0
     assert job["result"]["stopped_at"] == 15
 
     after = track_of(client, project_id, point_id)
     # The disagreement outlives the job: it is what the timeline paints red.
-    assert 15 in after["flagged_anchors"]
-    assert any(v["frame"] == 15 and v["distance"] > 6.0 for v in after["anchor_violations"])
+    assert 15 in after["flagged_keyframes"]
+    assert any(v["frame"] == 15 and v["distance"] > 6.0 for v in after["keyframe_violations"])
 
 
 def test_an_agreeing_run_carries_straight_on_through_a_keyframe(client, project) -> None:
-    """The guard is about disagreement, not about anchors as such."""
+    """The guard is about disagreement, not about keyframes as such."""
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
-    add_anchor(client, project_id, point_id, 15, *source.true_position(15))
+    add_keyframe(client, project_id, point_id, 15, *source.true_position(15))
     track(client, project_id, point_id)
 
     job = retrack(client, project_id, point_id, frame=5, direction="fwd")
-    assert job["result"]["anchor_violations"] == []
+    assert job["result"]["keyframe_violations"] == []
     assert job["result"]["stopped_at"] is None
     assert job["result"]["covered_range"][1] > 15
 
@@ -167,10 +167,11 @@ def test_a_drag_is_promoted_to_a_ground_truth_keyframe(client, project) -> None:
     assert [c["kind"] for c in after["corrections"]] == ["offset", "replace"]
     expected = (before["x"][10] + 4.0, before["y"][10] - 3.0)
     assert (after["x"][10], after["y"][10]) == pytest.approx(expected, abs=1e-3)
-    assert [q["frame"] for q in after["ground_truth"]] == [0, 10]
-    assert (after["ground_truth"][1]["x"], after["ground_truth"][1]["y"]) == pytest.approx(
+    assert [q["frame"] for q in after["keyframes"]] == [0, 10]
+    assert (after["keyframes"][1]["x"], after["keyframes"][1]["y"]) == pytest.approx(
         expected, abs=1e-3
     )
+    assert after["keyframes"][1]["source"] == "correction"
 
 
 def test_a_retrack_does_not_overwrite_an_earlier_manual_correction(client, project) -> None:
@@ -189,7 +190,7 @@ def test_a_retrack_does_not_overwrite_an_earlier_manual_correction(client, proje
 
     after = track_of(client, project_id, point_id)
     assert (after["x"][18], after["y"][18]) == pytest.approx(fixed, abs=1e-3)
-    assert 18 in after["flagged_anchors"]
+    assert 18 in after["flagged_keyframes"]
 
 
 def test_a_re_track_plans_through_the_promoted_keyframe(client, project) -> None:
@@ -221,13 +222,13 @@ def test_undo_un_promotes_the_keyframe_in_one_step(client, project) -> None:
         f"/api/projects/{project_id}/points/{point_id}/corrections",
         json={"kind": "offset", "frame": 9, "dx": 5.0, "dy": 0.0},
     )
-    assert [q["frame"] for q in track_of(client, project_id, point_id)["ground_truth"]] == [0, 9]
+    assert [q["frame"] for q in track_of(client, project_id, point_id)["keyframes"]] == [0, 9]
 
     undone = client.post(f"/api/projects/{project_id}/edits/undo")
     assert undone.status_code == 200
     restored = track_of(client, project_id, point_id)
     assert restored["corrections"] == []
-    assert [q["frame"] for q in restored["ground_truth"]] == [0]
+    assert [q["frame"] for q in restored["keyframes"]] == [0]
 
 
 # -- todos 12 and 20: bounded runs -------------------------------------------------
@@ -237,7 +238,7 @@ def test_a_run_can_stop_at_the_next_keyframe(client, project) -> None:
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
-    add_anchor(client, project_id, point_id, 20, *source.true_position(20))
+    add_keyframe(client, project_id, point_id, 20, *source.true_position(20))
     track(client, project_id, point_id)
 
     job = retrack(client, project_id, point_id, frame=6, direction="fwd", stop_at_keyframe=True)
@@ -249,7 +250,7 @@ def test_a_run_can_stop_at_the_previous_keyframe(client, project) -> None:
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
-    add_anchor(client, project_id, point_id, 8, *source.true_position(8))
+    add_keyframe(client, project_id, point_id, 8, *source.true_position(8))
     track(client, project_id, point_id)
 
     job = retrack(client, project_id, point_id, frame=20, direction="bwd", stop_at_keyframe=True)
@@ -318,11 +319,11 @@ def test_every_keyframe_is_intersected_or_flagged(client, project) -> None:
     x0, y0 = source.true_position(frames[0])
     point_id = place_point(client, project_id, frames[0], x0, y0)
     for frame in frames[1:-1]:
-        add_anchor(client, project_id, point_id, frame, *source.true_position(frame))
+        add_keyframe(client, project_id, point_id, frame, *source.true_position(frame))
     # The last keyframe is 25 px from where the feature actually is, so no run
     # can reach it: it is exactly the "needs manual review" case.
     bad_x, bad_y = source.true_position(frames[-1])
-    add_anchor(client, project_id, point_id, frames[-1], bad_x + 25.0, bad_y)
+    add_keyframe(client, project_id, point_id, frames[-1], bad_x + 25.0, bad_y)
 
     job = track(client, project_id, point_id)
     assert sorted(job["result"]["anchor_frames"]) == sorted(frames)
@@ -334,9 +335,9 @@ def test_every_keyframe_is_intersected_or_flagged(client, project) -> None:
             source.true_position(frame), abs=1e-3
         )
     # ... and the one no run could reconcile is flagged rather than pretended about.
-    assert after["flagged_anchors"] == [frames[-1]]
-    assert all(f not in after["flagged_anchors"] for f in frames[:-1])
-    breach = next(v for v in after["anchor_violations"] if v["frame"] == frames[-1])
+    assert after["flagged_keyframes"] == [frames[-1]]
+    assert all(f not in after["flagged_keyframes"] for f in frames[:-1])
+    breach = next(v for v in after["keyframe_violations"] if v["frame"] == frames[-1])
     assert breach["distance"] > 20.0
     assert breach["direction"] == "fwd"
 
@@ -347,8 +348,8 @@ def test_a_clean_multi_keyframe_track_flags_nothing(client, project) -> None:
     x0, y0 = source.true_position(frames[0])
     point_id = place_point(client, project_id, frames[0], x0, y0)
     for frame in frames[1:]:
-        add_anchor(client, project_id, point_id, frame, *source.true_position(frame))
+        add_keyframe(client, project_id, point_id, frame, *source.true_position(frame))
 
     job = track(client, project_id, point_id)
-    assert job["result"]["flagged_anchors"] == []
-    assert track_of(client, project_id, point_id)["flagged_anchors"] == []
+    assert job["result"]["flagged_keyframes"] == []
+    assert track_of(client, project_id, point_id)["flagged_keyframes"] == []

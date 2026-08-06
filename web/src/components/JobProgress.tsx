@@ -15,7 +15,10 @@ import type { JobEvent } from "../types";
  * message is reliably the run counter and the percentage actually moves.
  */
 export function JobProgress({ job }: { job: JobEvent | undefined }) {
-  if (!job || job.status === "done") return null;
+  // "cancelled" is a job auto-track superseded: moving two keyframes quickly
+  // queues a second re-track and the server drops the first. That is the system
+  // working, so it should not leave a stalled bar sitting on the card.
+  if (!job || job.status === "done" || job.status === "cancelled") return null;
   if (job.status === "error") {
     return <div className="job-progress job-progress--error">Failed: {job.error}</div>;
   }

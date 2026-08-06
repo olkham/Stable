@@ -9,6 +9,8 @@ import type {
   FilterInfo,
   HistoryStatus,
   JobEvent,
+  Keyframe,
+  KeyframeMutation,
   ModelInfo,
   ModelsResponse,
   PointSummary,
@@ -170,21 +172,63 @@ export const updatePoint = (
 export const deletePoint = (projectId: string, pointId: string): Promise<{ status: string }> =>
   request(`/api/projects/${projectId}/points/${pointId}`, { method: "DELETE" });
 
-export const addAnchor = (
+// -- keyframes (todo_6) -----------------------------------------------------
+//
+// One concept, one set of routes. A keyframe is "the feature is HERE on this
+// frame", whether the server is holding it as a pin on the point or as a manual
+// correction that states an absolute position; these calls speak the unified
+// list and let the server work out which storage an edit has to rewrite.
+//
+// Every mutating call takes `track`: with the default `"auto"` the server
+// re-tracks the point from all of its keyframes, superseding any run for the
+// same point that has not started yet, and returns the job's id so the caller
+// can watch it re-flow over the jobs WebSocket. `"none"` edits the keyframe and
+// leaves the path alone.
+
+/** Whether a keyframe edit re-tracks its point by itself. */
+export type TrackMode = "auto" | "none";
+
+export const getKeyframes = (projectId: string, pointId: string): Promise<Keyframe[]> =>
+  request(`/api/projects/${projectId}/points/${pointId}/keyframes`);
+
+export const addKeyframe = (
   projectId: string,
   pointId: string,
   frame: number,
   x: number,
   y: number,
-): Promise<PointSummary> =>
-  postJson(`/api/projects/${projectId}/points/${pointId}/anchors`, { frame, x, y });
+  track: TrackMode = "auto",
+): Promise<KeyframeMutation> =>
+  postJson(`/api/projects/${projectId}/points/${pointId}/keyframes`, { frame, x, y, track });
 
-export const deleteAnchor = (
+/**
+ * Move a keyframe along the timeline, across the image, or both — in one write.
+ *
+ * A drag is one gesture and has to be one request: expressed as delete-then-add
+ * the point is briefly missing a truth position, and an auto-track that slipped
+ * into the gap would track from a state nobody asked for. Omitted fields keep
+ * their current value; landing on a frame that already has a keyframe replaces
+ * it.
+ */
+export const moveKeyframe = (
   projectId: string,
   pointId: string,
   frame: number,
-): Promise<PointSummary> =>
-  request(`/api/projects/${projectId}/points/${pointId}/anchors/${frame}`, { method: "DELETE" });
+  to: { frame?: number; x?: number; y?: number },
+  track: TrackMode = "auto",
+): Promise<KeyframeMutation> =>
+  patchJson(`/api/projects/${projectId}/points/${pointId}/keyframes/${frame}`, { ...to, track });
+
+/** Remove whatever states the point's position on a frame. 400 for its last one. */
+export const deleteKeyframe = (
+  projectId: string,
+  pointId: string,
+  frame: number,
+  track: TrackMode = "auto",
+): Promise<KeyframeMutation> =>
+  request(`/api/projects/${projectId}/points/${pointId}/keyframes/${frame}?track=${track}`, {
+    method: "DELETE",
+  });
 
 export const trackPoint = (
   projectId: string,

@@ -1,4 +1,4 @@
-"""Point CRUD, anchor pins, and the real tracking pipeline as a background job."""
+"""Point CRUD, keyframes, and the real tracking pipeline as a background job."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def test_point_ids_increment(client: TestClient, project) -> None:
     assert ids == ["p1", "p2", "p3"]
 
 
-def test_anchor_add_and_delete(client: TestClient, project) -> None:
+def test_keyframe_add_and_delete(client: TestClient, project) -> None:
     detail, source = project
     project_id = detail["id"]
     x0, y0 = source.true_position(0)
@@ -67,18 +67,21 @@ def test_anchor_add_and_delete(client: TestClient, project) -> None:
 
     x10, y10 = source.true_position(10)
     added = client.post(
-        f"/api/projects/{project_id}/points/p1/anchors", json={"frame": 10, "x": x10, "y": y10}
+        f"/api/projects/{project_id}/points/p1/keyframes",
+        json={"frame": 10, "x": x10, "y": y10, "track": "none"},
     )
     assert added.status_code == 200
     frames = sorted(q["frame"] for q in added.json()["queries"])
     assert frames == [0, 10]
+    assert [k["frame"] for k in added.json()["keyframes"]] == [0, 10]
+    assert added.json()["job_id"] is None
 
-    # Cannot delete the last remaining anchor.
-    client.delete(f"/api/projects/{project_id}/points/p1/anchors/0")
+    # Cannot delete the last remaining keyframe.
+    client.delete(f"/api/projects/{project_id}/points/p1/keyframes/0?track=none")
     single = client.get(f"/api/projects/{project_id}/points").json()[0]
     assert len(single["queries"]) == 1
 
-    forbidden = client.delete(f"/api/projects/{project_id}/points/p1/anchors/10")
+    forbidden = client.delete(f"/api/projects/{project_id}/points/p1/keyframes/10?track=none")
     assert forbidden.status_code == 400
 
 
@@ -147,10 +150,11 @@ def test_multi_anchor_merge_passes_through_every_anchor(client: TestClient, proj
     )
     for frame in frames[1:]:
         x, y = source.true_position(frame)
-        anchor = client.post(
-            f"/api/projects/{project_id}/points/p1/anchors", json={"frame": frame, "x": x, "y": y}
+        keyframe = client.post(
+            f"/api/projects/{project_id}/points/p1/keyframes",
+            json={"frame": frame, "x": x, "y": y, "track": "none"},
         )
-        assert anchor.status_code == 200
+        assert keyframe.status_code == 200
 
     submitted = client.post(f"/api/projects/{project_id}/points/p1/track", json={"tracker": "lk"})
     job = wait_job(client, project_id, submitted.json()["job_id"], timeout=60)

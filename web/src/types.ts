@@ -108,6 +108,41 @@ export interface ProjectMeta {
   original_filename: string;
 }
 
+/**
+ * One position the operator has stated: "this feature is HERE on this frame".
+ *
+ * The single truth concept in the product. `source` says which storage backs it
+ * — a pin in the point's `queries`, or a manual correction that states an
+ * absolute position — and nothing in the UI is allowed to care: one marker, one
+ * chip, one delete gesture. The field exists so a caller reconciling this list
+ * with the corrections panel can, not so the operator has to.
+ */
+export interface Keyframe {
+  frame: number;
+  x: number;
+  y: number;
+  source: "pin" | "correction";
+  correction_id: string | null;
+}
+
+/**
+ * A keyframe a tracking run reached and disagreed with (stable/trackers/merge.py).
+ *
+ * The run stops there rather than drifting past a position the operator stated,
+ * and says by how far it missed — which is the app's one "go and look at this"
+ * signal: red on the timeline, an actionable line on the point's card.
+ */
+export interface KeyframeViolation {
+  frame: number;
+  /** Where the run actually was when it reached that frame. */
+  tracked: [number, number];
+  /** How far, in pixels, the run was from the stated position. */
+  distance: number;
+  /** The keyframe the run started from. */
+  origin: number;
+  direction: "fwd" | "bwd";
+}
+
 export interface TrackData {
   point_id: string;
   n_frames: number;
@@ -117,7 +152,14 @@ export interface TrackData {
   visible: boolean[];
   disagreement: (number | null)[];
   contributions: number[];
+  /** Engine vocabulary: the frames the merge planned its runs from. */
   anchor_frames: number[];
+  /** Every position the operator has stated for this point, in frame order. */
+  keyframes: Keyframe[];
+  /** Where a run disagreed with one of them, and by how much. */
+  keyframe_violations: KeyframeViolation[];
+  /** Just the frames of those, for the timeline's red ticks. */
+  flagged_keyframes: number[];
   /** The typed, non-destructive edit layer applied to this point, in order. */
   corrections: Correction[];
   /** Inclusive [start, end] runs of frames with no position, for one-click filling. */
@@ -125,6 +167,21 @@ export interface TrackData {
   /** The untouched merged track, present only when enabled corrections exist. */
   raw_x: (number | null)[] | null;
   raw_y: (number | null)[] | null;
+}
+
+/**
+ * What every mutating keyframe route answers with.
+ *
+ * The point summary (so a card can be refreshed from the same response), the
+ * resulting keyframe list, the resulting *correction* list — a keyframe edit may
+ * discard the correction that was backing one, and a panel left showing the
+ * stale one would be the two-concepts problem all over again — and the id of the
+ * auto-track the edit triggered, or null when `track: "none"` was asked for.
+ */
+export interface KeyframeMutation extends PointSummary {
+  keyframes: Keyframe[];
+  corrections: Correction[];
+  job_id: string | null;
 }
 
 // -- the corrections layer (stable/core/corrections.py) -----------------------
@@ -201,14 +258,6 @@ export interface PointPatch {
   kind: "keyframe" | "tracked";
   /** False when the patch would fall off the edge of the frame at this size. */
   available: boolean;
-  /**
-   * Whether this keyframe is one of the point's own pins, and so deletable.
-   *
-   * The grid also shows keyframes that manual corrections were *promoted* to;
-   * those belong to a correction, not to the point, and are removed by deleting
-   * the correction on the Edit tab (todo 9, fourth round).
-   */
-  pinned: boolean;
 }
 
 /**

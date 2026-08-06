@@ -21,6 +21,8 @@ Endpoints, all under ``/projects/{project_id}``:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -29,6 +31,7 @@ from ...core.corrections import (
     Correction,
     OffsetCorrection,
     ReplaceCorrection,
+    RetrackCorrection,
     apply_corrections,
     correction_from_dict,
 )
@@ -40,9 +43,14 @@ from ..jobs import JobManager, get_job_manager
 from ..schemas import CorrectionIn, CorrectionUpdate, RetrackRequest
 from ..serialize import point_summary
 from ..storage import Workspace, get_workspace
-from ..tracking import load_display_track, retrack_resolver, run_point_retrack
+from ..tracking import (
+    load_display_track,
+    retrack_resolver,
+    run_point_retrack,
+    violations_path_for,
+)
 
-__all__ = ["router", "history_for"]
+__all__ = ["router", "history_for", "discard_corrections"]
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["edits"])
 
@@ -63,6 +71,56 @@ def history_for(workspace: Workspace, project_id: str) -> EditHistory:
     than keeping process state that a second browser tab could disagree with.
     """
     return EditHistory(workspace.project_dir(project_id) / HISTORY_FILENAME)
+
+
+def _cached_runs(project: Project, correction: Correction) -> list[Path]:
+    """Return the files on disk that exist only because of ``correction``."""
+    if not isinstance(correction, RetrackCorrection) or not correction.source:
+        return []
+    resolved = project.resolve_path(correction.source)
+    if not resolved:
+        return []
+    npz = Path(resolved)
+    return [npz, violations_path_for(npz)]
+
+
+def discard_corrections(
+    project: Project, point: PointSpec, correction_ids: Iterable[str]
+) -> list[Path]:
+    """Drop corrections from a point for good, reporting the runs they orphaned.
+
+    :func:`delete_correction` is the *undoable* removal and so leaves a
+    retrack's cached ``.npz`` alone — undo has to be able to bring the spliced
+    run back. This is the other one: a keyframe the operator moves or deletes
+    (todo_6) takes its promoting correction with it permanently, and the cached
+    run nothing references any more is a leak in the project directory.
+
+    The paths are *returned* rather than unlinked here because this runs inside
+    the project's read-modify-write — files must not disappear before the save
+    that makes their absence correct, and must not disappear at all if it
+    raises.
+
+    Args:
+        project: The owning project, for resolving a correction's cached run.
+        point: The point to rewrite, in place.
+        correction_ids: Which corrections to drop. Unknown ids are ignored, so a
+            caller can pass the ids it computed from a stale read.
+
+    Returns:
+        The now-unreferenced files, for the caller to unlink after saving.
+    """
+    wanted = set(correction_ids)
+    if not wanted:
+        return []
+    orphaned: list[Path] = []
+    remaining: list[Correction] = []
+    for correction in point.corrections:
+        if correction.id in wanted:
+            orphaned.extend(_cached_runs(project, correction))
+        else:
+            remaining.append(correction)
+    point.corrections = remaining
+    return orphaned
 
 
 def _describe(project: Project, point: PointSpec, history: EditHistory) -> dict[str, Any]:

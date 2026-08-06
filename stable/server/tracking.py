@@ -59,8 +59,9 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 
@@ -69,7 +70,7 @@ from ..core.corrections import (
     RetrackCorrection,
     RetrackResolver,
     apply_corrections,
-    ground_truth_anchors,
+    ground_truth_claims,
 )
 from ..core.errors import ProjectError, StableError
 from ..core.project import PointSpec, Project
@@ -92,6 +93,8 @@ from .tracker_options import point_options
 __all__ = [
     "run_point_tracking",
     "run_point_retrack",
+    "Keyframe",
+    "effective_keyframes",
     "effective_anchors",
     "bounded_frame_range",
     "report_path_for",
@@ -99,7 +102,7 @@ __all__ = [
     "violations_path_for",
     "load_report",
     "load_violations",
-    "load_anchor_violations",
+    "load_keyframe_violations",
     "load_display_track",
     "load_raw_track",
     "retrack_resolver",
@@ -207,12 +210,90 @@ def load_violations(path: Path) -> list[dict[str, Any]]:
     return [dict(entry) for entry in data] if isinstance(data, list) else []
 
 
+KeyframeSource = Literal["pin", "correction"]
+"""What in the project file states a keyframe's position."""
+
+
+@dataclass(frozen=True)
+class Keyframe:
+    """One position the operator has stated, and what states it.
+
+    To the operator this is a single concept — "the feature is *here* on this
+    frame" (todo_6). In storage it is two: a pin in ``PointSpec.queries``, or a
+    manual correction that carries an absolute position and was promoted to
+    ground truth. Nothing about that split is interesting to a user, but it is
+    the difference between which list a delete has to rewrite, so it rides along
+    as ``source``/``correction_id`` rather than being guessed at again by every
+    caller.
+
+    Args:
+        frame: Absolute frame the position is stated on.
+        x: Horizontal position in source pixels.
+        y: Vertical position in source pixels.
+        source: ``"pin"`` for a ``queries`` entry, ``"correction"`` for a
+            promoted edit.
+        correction_id: The promoting correction's id, or ``None`` for a pin.
+    """
+
+    frame: int
+    x: float
+    y: float
+    source: KeyframeSource
+    correction_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe form the keyframe routes answer with."""
+        return {
+            "frame": self.frame,
+            "x": self.x,
+            "y": self.y,
+            "source": self.source,
+            "correction_id": self.correction_id,
+        }
+
+    @property
+    def query(self) -> Query:
+        """This keyframe as the plain anchor the tracking stack takes."""
+        return Query(frame=self.frame, x=self.x, y=self.y)
+
+
+def effective_keyframes(point: PointSpec) -> list[Keyframe]:
+    """Return every position the operator has stated for a point, with its origin.
+
+    The union of the point's pins and the anchors its enabled manual corrections
+    promote to (todo 11). A correction wins over a pin on the same frame: it is
+    the later statement of where the feature is.
+
+    Args:
+        point: The point whose ground truth is wanted.
+
+    Returns:
+        Keyframes sorted by frame.
+    """
+    by_frame: dict[int, Keyframe] = {
+        int(q.frame): Keyframe(
+            frame=int(q.frame), x=float(q.x), y=float(q.y), source="pin", correction_id=None
+        )
+        for q in point.sorted_queries()
+    }
+    for query, correction in ground_truth_claims(point.corrections):
+        frame = int(query.frame)
+        by_frame[frame] = Keyframe(
+            frame=frame,
+            x=float(query.x),
+            y=float(query.y),
+            source="correction",
+            correction_id=correction.id,
+        )
+    return [by_frame[frame] for frame in sorted(by_frame)]
+
+
 def effective_anchors(point: PointSpec) -> list[Query]:
     """Return every position the operator has stated for a point, by frame.
 
-    The union of the point's anchor keyframes and the anchors its enabled
-    manual corrections promote to (todo 11). A correction wins over a pin on the
-    same frame: it is the later statement of where the feature is.
+    :func:`effective_keyframes` without the provenance — what the engine wants,
+    since :func:`~stable.trackers.merge.plan_anchor_runs` neither knows nor
+    cares whether a position came from a pin or from a promoted correction.
 
     Args:
         point: The point whose ground truth is wanted.
@@ -221,10 +302,7 @@ def effective_anchors(point: PointSpec) -> list[Query]:
         Anchors sorted by frame, ready for
         :func:`~stable.trackers.merge.plan_anchor_runs`.
     """
-    by_frame = {int(q.frame): q for q in point.sorted_queries()}
-    for query in ground_truth_anchors(point.corrections):
-        by_frame[int(query.frame)] = query
-    return [by_frame[frame] for frame in sorted(by_frame)]
+    return [keyframe.query for keyframe in effective_keyframes(point)]
 
 
 def bounded_frame_range(
@@ -288,11 +366,11 @@ def _save_report(
 ) -> None:
     """Write a :class:`~stable.trackers.merge.MergeReport` as JSON.
 
-    ``anchor_violations`` (and the ``flagged_anchors`` frame list derived from
-    it) ride along in the same sidecar so reopening a project keeps the "this
-    keyframe was never actually reached" signal the timeline draws red — it is a
-    property of the run, not something recomputable from the merged track, whose
-    anchor passthrough is exact by construction.
+    ``keyframe_violations`` (and the ``flagged_keyframes`` frame list derived
+    from it) ride along in the same sidecar so reopening a project keeps the
+    "this keyframe was never actually reached" signal the timeline draws red —
+    it is a property of the run, not something recomputable from the merged
+    track, whose anchor passthrough is exact by construction.
     """
     report = result.report
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,8 +380,8 @@ def _save_report(
         "contributions": [int(v) for v in report.contributions.tolist()],
         "disagreement": disagreement,
         "anchor_frames": list(report.anchor_frames),
-        "anchor_violations": [v.to_dict() for v in breaches],
-        "flagged_anchors": sorted({v.frame for v in breaches}),
+        "keyframe_violations": [v.to_dict() for v in breaches],
+        "flagged_keyframes": sorted({v.frame for v in breaches}),
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -353,7 +431,7 @@ def run_point_tracking(
     Returns:
         A JSON-safe summary: ``point_id``, ``n_frames``, ``anchor_frames``,
         ``mean_confidence``, ``worst_frames`` (the merge's "go fix this" list),
-        ``anchor_violations`` and ``flagged_anchors`` (todos 13 and 15).
+        ``keyframe_violations`` and ``flagged_keyframes`` (todos 13 and 15).
 
     Raises:
         ProjectError: If the point has no anchors.
@@ -435,8 +513,8 @@ def run_point_tracking(
         "anchor_frames": list(merge_result.report.anchor_frames),
         "mean_confidence": float(conf.mean()) if conf.size else 0.0,
         "worst_frames": merge_result.report.worst_frames(),
-        "anchor_violations": [v.to_dict() for v in violations],
-        "flagged_anchors": sorted({v.frame for v in violations}),
+        "keyframe_violations": [v.to_dict() for v in violations],
+        "flagged_keyframes": sorted({v.frame for v in violations}),
     }
 
 
@@ -606,8 +684,8 @@ def run_point_retrack(
             [int(covered_frames[0]), int(covered_frames[-1])] if covered_frames.size else None
         ),
         "mean_confidence": float(run.confidence[covered].mean()) if covered.any() else 0.0,
-        "anchor_violations": [v.to_dict() for v in violations],
-        "flagged_anchors": sorted({v.frame for v in violations}),
+        "keyframe_violations": [v.to_dict() for v in violations],
+        "flagged_keyframes": sorted({v.frame for v in violations}),
         "stopped_at": violations[0].frame if violations else None,
     }
 
@@ -708,7 +786,7 @@ def load_display_track(project: Project, point: PointSpec) -> PointTrack | None:
         return raw
 
 
-def load_anchor_violations(project: Project, point: PointSpec) -> list[dict[str, Any]]:
+def load_keyframe_violations(project: Project, point: PointSpec) -> list[dict[str, Any]]:
     """Return every keyframe disagreement recorded for a point, in frame order.
 
     A track can fail to reach an operator's keyframe in two places: the
@@ -722,7 +800,10 @@ def load_anchor_violations(project: Project, point: PointSpec) -> list[dict[str,
         raw_path = project.resolve_path(point.raw)
         if raw_path:
             report = load_report(report_path_for(Path(raw_path))) or {}
-            found.extend(dict(entry) for entry in report.get("anchor_violations", []))
+            # ``anchor_violations`` is what sidecars written before todo_6 call
+            # the same list; a project from an older build must still flag.
+            entries = report.get("keyframe_violations", report.get("anchor_violations", []))
+            found.extend(dict(entry) for entry in entries)
     for correction in point.corrections:
         if not correction.enabled or not isinstance(correction, RetrackCorrection):
             continue

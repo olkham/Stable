@@ -543,14 +543,14 @@ button:disabled {
   padding: 0 4px;
 }
 
-.points-list__anchors {
+.points-list__keyframes {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
   align-items: center;
 }
 
-.anchor-chip {
+.keyframe-chip {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -562,7 +562,7 @@ button:disabled {
   gap: 3px;
 }
 
-.anchor-chip__delete {
+.keyframe-chip__delete {
   border: none;
   background: none;
   color: var(--danger);
@@ -571,9 +571,14 @@ button:disabled {
   line-height: 1;
 }
 
-.anchor-add {
+.keyframe-add {
   font-size: 0.72rem;
   padding: 1px 6px;
+}
+
+.points-list__error {
+  font-size: 0.72rem;
+  color: var(--danger);
 }
 
 .points-list__stats {

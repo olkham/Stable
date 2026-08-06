@@ -128,12 +128,12 @@ export function TrackEdits({ pointId }: { pointId: string }) {
       {worthShowing && gaps.length > 0 && (
         <div className="track-edits__gaps">
           {gaps.map(([start, end]) => (
-            <span key={`${start}-${end}`} className="anchor-chip">
+            <span key={`${start}-${end}`} className="keyframe-chip">
               <button className="link-button" onClick={() => setCurrentFrame(start)}>
                 {start}–{end}
               </button>
               <button
-                className="anchor-chip__delete"
+                className="keyframe-chip__delete"
                 title="Fill this gap"
                 onClick={() =>
                   void applyCorrection(pointId, {

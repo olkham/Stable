@@ -172,7 +172,7 @@ tracks by it and the UI colours the timeline by it:
 
 > **confidence ≈ the probability that this position is accurate to within a few
 > pixels.** `0` = no information (occluded, lost, never tracked). `1` = as good
-> as a user-placed anchor.
+> as a user-placed keyframe.
 
 Recipe, using `stable.trackers.confidence`:
 

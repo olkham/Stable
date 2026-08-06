@@ -203,3 +203,14 @@ Model download manager UI; `stable serve` one-command launch that opens the brow
 - Each phase = one subagent run. Prompt: "Read PLAN.md. Implement Phase N. Respect the Stack/Architecture/Data-model sections as fixed decisions. Meet the acceptance criteria; write tests proving them."
 - If a phase agent wants to change a contract, it must update PLAN.md in the same PR and say why.
 - Keep test media tiny (bundle one 5 s 720p clip); never commit model weights.
+
+## Post-Phase 6 — todo_6
+
+Unified the UI's two names for the same thing — pinned anchors and promoted
+keyframes — into one: **keyframe**, with auto-track (a keyframe edit re-tracks
+its point by itself, superseding any queued run for the same point). No
+project-file schema change and no change to the Phase 0-2 engine, which keeps
+its own `anchor` vocabulary internally (`plan_anchor_runs`,
+`merge_anchor_runs`, `enforce_anchor_agreement` in `stable.trackers.merge`) —
+this was a server API (`/keyframes` replacing `/anchors`) and frontend
+terminology/UX pass. See `done/TODO_6_PLAN.md`.

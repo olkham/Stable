@@ -149,8 +149,8 @@ def test_every_keyframe_gets_an_entry_in_the_grid(client, template_point):
     for frame in (10, 20):
         x, y = source.true_position(frame)
         client.post(
-            f"/api/projects/{project_id}/points/p1/anchors",
-            json={"frame": frame, "x": x, "y": y},
+            f"/api/projects/{project_id}/points/p1/keyframes",
+            json={"frame": frame, "x": x, "y": y, "track": "none"},
         )
     body = client.get(f"/api/projects/{project_id}/points/p1/patches").json()
     assert [a["frame"] for a in body["patches"]] == [0, 10, 20]

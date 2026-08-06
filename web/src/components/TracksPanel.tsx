@@ -2,14 +2,14 @@ import { useState } from "react";
 import * as api from "../api/client";
 import { pointColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
-import type { Query, TrackData, TrackerInfo } from "../types";
+import type { Keyframe, TrackerInfo } from "../types";
 import { JobProgress } from "./JobProgress";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 import { TrackEdits } from "./TrackEdits";
 import { OVERLAY_LABELS } from "./Viewer";
 
 /** How far a keyframe may be from where a run landed before it is flagged. */
-const FLAGGED_ANCHOR_COLOR = "#ff3b30";
+const FLAGGED_KEYFRAME_COLOR = "#ff3b30";
 
 /**
  * Why the tracker a point is *already set to* cannot run here, if it cannot.
@@ -24,32 +24,6 @@ function unavailableReason(trackers: TrackerInfo[], name: string): string | null
   if (!match || match.available) return null;
   return match.unavailable_reason ?? `${name} is not available in this environment`;
 }
-
-/** One keyframe a tracking run reached and disagreed with. */
-interface AnchorViolation {
-  frame: number;
-  anchor: [number, number];
-  tracked: [number, number];
-  distance: number;
-  origin: number;
-  direction: "fwd" | "bwd";
-}
-
-/**
- * The anchor-integrity fields `GET .../points/{id}/track` adds (W1), kept local
- * to the components that read them rather than on the shared `TrackData`.
- *
- * `ground_truth` is every position the operator has stated — the point's pins
- * *plus* the keyframes their manual corrections were promoted to — so a drag
- * appears here as the anchor it has become.
- */
-interface AnchorIntegrity {
-  ground_truth?: Query[];
-  anchor_violations?: AnchorViolation[];
-  flagged_anchors?: number[];
-}
-
-type PointTrack = TrackData & AnchorIntegrity;
 
 /** How far a bounded run should reach (todos 12 and 20). */
 type RunLimit = "clip" | "keyframe" | "frames";
@@ -86,8 +60,8 @@ function submitBoundedRun(projectId: string, pointId: string, body: BoundedRunBo
  * means *that* track's trails, and the global checkboxes above the canvas could
  * only ever mean all of them.
  *
- * Keyframes are ground truth. A pin the tracker could not reconcile with what it
- * saw is listed in red here and on the timeline rather than being quietly
+ * Keyframes are the operator's truth. One a tracking run reached and disagreed
+ * with is listed in red here and on the timeline rather than being quietly
  * averaged away, and a run started from one is bounded — to the next keyframe,
  * or to a number of frames — instead of always ploughing to the end of the clip.
  */
@@ -102,8 +76,8 @@ export function TracksPanel() {
     setCurrentFrame,
     tool,
     setTool,
-    addAnchorHere,
-    afterEdit,
+    addKeyframeHere,
+    deleteKeyframe,
     latestJobFor,
     tracks,
     invalidateTrack,
@@ -116,6 +90,10 @@ export function TracksPanel() {
   const [runLimit, setRunLimit] = useState<RunLimit>("keyframe");
   const [runFrames, setRunFrames] = useState(10);
   const [runError, setRunError] = useState<string | null>(null);
+  // Why the last ✕ did nothing, if it did nothing — the server refuses to leave
+  // a point with no stated position at all, which is a rule worth saying out
+  // loud rather than a click that silently fails.
+  const [keyframeError, setKeyframeError] = useState<string | null>(null);
   // Which cards the operator has explicitly opened or closed (todo 5, fourth
   // round). Tri-state, like the overlay overrides below: a card nobody has
   // touched follows the old behaviour — open when its track is selected — and
@@ -145,16 +123,8 @@ export function TracksPanel() {
     await refresh();
   }
 
-  async function handleDeleteAnchor(pointId: string, frame: number) {
-    try {
-      await api.deleteAnchor(project.id, pointId, frame);
-      // The track carries the keyframe list, so it has to be re-read too — a
-      // project refresh alone would leave the deleted pin listed as if it had
-      // been promoted from a correction.
-      await afterEdit(pointId);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : String(err));
-    }
+  async function handleDeleteKeyframe(pointId: string, frame: number) {
+    setKeyframeError(await deleteKeyframe(pointId, frame));
   }
 
   /**
@@ -200,21 +170,17 @@ export function TracksPanel() {
           const trackJob = latestJobFor("track", point.id);
           const retrackJob = latestJobFor("retrack", point.id);
           const isSelected = point.id === selectedPointId;
-          const track = tracks[point.id] as PointTrack | undefined;
-          // The point's own pins, plus the keyframes its corrections were
-          // promoted to. Pins come from the project (refreshed the moment one
-          // is placed); promotions only exist on the track, which is fetched
-          // and cached separately — so reading the list off `ground_truth`
-          // alone left a just-placed anchor missing here until the next track
-          // run replaced that cache, even though the canvas drew it at once.
-          const promoted = (track?.ground_truth ?? []).filter(
-            (g) => !point.queries.some((q) => q.frame === g.frame),
-          );
-          const anchors: Query[] = [...point.queries, ...promoted].sort(
-            (a, b) => a.frame - b.frame,
-          );
-          const flagged = new Set(track?.flagged_anchors ?? []);
-          const violations = track?.anchor_violations ?? [];
+          const track = tracks[point.id];
+          // Every position the operator has stated for this point, as one list:
+          // the server reconciles pins and the positions manual corrections
+          // state, and which storage backs a given one is none of this panel's
+          // business. Before the first track there is nothing cached, and the
+          // point's own queries are the same list in the other storage.
+          const keyframes: Keyframe[] =
+            track?.keyframes ??
+            point.queries.map((q) => ({ ...q, source: "pin" as const, correction_id: null }));
+          const flagged = new Set(track?.flagged_keyframes ?? []);
+          const violations = track?.keyframe_violations ?? [];
           const isOpen = expanded[point.id] ?? isSelected;
           return (
             <li
@@ -289,61 +255,61 @@ export function TracksPanel() {
               </div>
 
               {isOpen && (
-              <div className="points-list__anchors" onClick={(e) => e.stopPropagation()}>
-                {anchors.map((q) => {
-                  const missed = flagged.has(q.frame);
-                  const pinned = point.queries.some((p) => p.frame === q.frame);
+              <div className="points-list__keyframes" onClick={(e) => e.stopPropagation()}>
+                {keyframes.map((k) => {
+                  const missed = flagged.has(k.frame);
                   return (
                     <span
-                      key={q.frame}
-                      className="anchor-chip"
-                      style={missed ? { borderColor: FLAGGED_ANCHOR_COLOR } : undefined}
+                      key={k.frame}
+                      className="keyframe-chip"
+                      style={missed ? { borderColor: FLAGGED_KEYFRAME_COLOR } : undefined}
                       title={
                         missed
-                          ? "No tracking run reached this keyframe — needs manual review"
-                          : pinned
-                            ? "Anchor keyframe"
-                            : "Keyframe promoted from a manual correction"
+                          ? `Tracking disagrees with your keyframe at frame ${k.frame} — click to go there`
+                          : `Keyframe at frame ${k.frame} — click to go there, × to remove it`
                       }
-                      onClick={() => setCurrentFrame(q.frame)}
+                      onClick={() => setCurrentFrame(k.frame)}
                     >
-                      <span style={missed ? { color: FLAGGED_ANCHOR_COLOR } : undefined}>
-                        {pinned ? "" : "✎"}f{q.frame}
+                      <span style={missed ? { color: FLAGGED_KEYFRAME_COLOR } : undefined}>
+                        f{k.frame}
                       </span>
-                      {pinned && point.queries.length > 1 && (
-                        <button
-                          className="anchor-chip__delete"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteAnchor(point.id, q.frame);
-                          }}
-                        >
-                          ×
-                        </button>
-                      )}
+                      <button
+                        className="keyframe-chip__delete"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteKeyframe(point.id, k.frame);
+                        }}
+                      >
+                        ×
+                      </button>
                     </span>
                   );
                 })}
                 <button
-                  className={`anchor-add ${
-                    tool === "add-anchor" && isSelected ? "button--active" : ""
+                  className={`keyframe-add ${
+                    tool === "add-keyframe" && isSelected ? "button--active" : ""
                   }`}
-                  title={`Pin this point at frame ${currentFrame} where it already is (shortcut: A), or click the frame to place it somewhere else (⇧A)`}
+                  title={`Set a keyframe at frame ${currentFrame} where this point already is (shortcut: A), or click the frame to place it somewhere else (⇧A)`}
                   onClick={async () => {
                     setSelectedPointId(point.id);
-                    if (tool === "add-anchor" && isSelected) {
+                    if (tool === "add-keyframe" && isSelected) {
                       setTool("move");
                       return;
                     }
-                    // Same rule as the shortcut: pin where the point already
+                    // Same rule as the shortcut: state where the point already
                     // is, and only ask for a click when there is nothing there
-                    // to pin.
-                    if (!(await addAnchorHere(point.id))) setTool("add-anchor");
+                    // to state.
+                    if (!(await addKeyframeHere(point.id))) setTool("add-keyframe");
                   }}
                 >
-                  + anchor
+                  + keyframe
                 </button>
               </div>
+              )}
+              {isOpen && keyframeError && (
+                <div className="points-list__error" onClick={(e) => e.stopPropagation()}>
+                  {keyframeError}
+                </div>
               )}
 
               {/* What this track draws on the canvas (todo 9). The row above
@@ -400,7 +366,7 @@ ${
                 {point.worst_frames.length > 0 && (
                   <span
                     className="points-list__warning"
-                    title="Frames where the multi-anchor merge disagreed most — consider adding an anchor here"
+                    title="Frames where the tracking runs disagreed most — consider setting a keyframe here"
                     onClick={() => setCurrentFrame(point.worst_frames[0])}
                   >
                     ⚠ check frame {point.worst_frames[0]}
@@ -457,16 +423,25 @@ ${
                   point's card next to its keyframes and its patches. */}
               {isOpen && <TrackEdits pointId={point.id} />}
 
+              {/* Where the tracker and the operator disagree (W1's
+                  `keyframe_violations`). Said as the actionable thing it is —
+                  the run stopped rather than drift through a keyframe it could
+                  not reach — and clicking goes to the frame to fix it. */}
               {isOpen && violations.length > 0 && (
                 <ul className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                   {violations.map((v) => (
                     <li
                       key={`${v.frame}-${v.origin}-${v.direction}`}
-                      style={{ color: FLAGGED_ANCHOR_COLOR, cursor: "pointer", listStyle: "none" }}
-                      title={`The run from frame ${v.origin} stopped here rather than drift past a keyframe it disagreed with`}
+                      style={{ color: FLAGGED_KEYFRAME_COLOR, cursor: "pointer", listStyle: "none" }}
+                      title={`Tracking ${
+                        v.direction === "fwd" ? "forwards" : "backwards"
+                      } from frame ${v.origin} stopped here rather than drift past a keyframe it could not reach. Click to go to frame ${
+                        v.frame
+                      }.`}
                       onClick={() => setCurrentFrame(v.frame)}
                     >
-                      ⚑ keyframe f{v.frame} missed by {v.distance.toFixed(1)} px
+                      ⚑ tracking disagrees with your keyframe at frame {v.frame} by{" "}
+                      {v.distance.toFixed(1)} px — adjust the point or set a keyframe nearby
                     </li>
                   ))}
                 </ul>

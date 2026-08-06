@@ -45,6 +45,7 @@ __all__ = [
     "correction_from_dict",
     "apply_corrections",
     "ground_truth_anchors",
+    "ground_truth_claims",
     "RetrackResolver",
     "FALLOFF_SHAPES",
     "INTERPOLATION_METHODS",
@@ -345,6 +346,36 @@ def correction_from_dict(data: dict[str, Any]) -> Correction:
         raise ContractError(f"invalid {kind!r} correction: {exc}") from exc
 
 
+def ground_truth_claims(corrections: Sequence[Correction]) -> list[tuple[Query, Correction]]:
+    """Return each promoted anchor *and* the correction that states it.
+
+    :func:`ground_truth_anchors` answers "where has the operator said this point
+    is"; a caller that has to let them take it back needs "and which edit said
+    so". Unifying pins and promoted corrections into one keyframe list (todo_6)
+    is exactly that caller: a keyframe the user drags or deletes must know what
+    in the project file to rewrite.
+
+    Args:
+        corrections: A point's correction layer, in order. Disabled entries are
+            skipped, so toggling a fix off also retires the anchor it implied.
+
+    Returns:
+        One ``(query, correction)`` pair per frame, sorted by frame. Where
+        several corrections land on the same frame the last one wins, matching
+        the order :func:`apply_corrections` applies them in.
+    """
+    by_frame: dict[int, tuple[Query, Correction]] = {}
+    for correction in corrections:
+        if not correction.enabled or correction.kind not in GROUND_TRUTH_KINDS:
+            continue
+        if not isinstance(correction, ReplaceCorrection | RetrackCorrection):
+            continue  # pragma: no cover - a third-party subclass reusing the kind
+        frame = int(correction.frame)
+        query = Query(frame=frame, x=float(correction.x), y=float(correction.y))
+        by_frame[frame] = (query, correction)
+    return [by_frame[frame] for frame in sorted(by_frame)]
+
+
 def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
     """Return the anchor keyframes a point's manual corrections amount to.
 
@@ -364,15 +395,7 @@ def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
         several corrections land on the same frame the last one wins, matching
         the order :func:`apply_corrections` applies them in.
     """
-    by_frame: dict[int, Query] = {}
-    for correction in corrections:
-        if not correction.enabled or correction.kind not in GROUND_TRUTH_KINDS:
-            continue
-        if not isinstance(correction, ReplaceCorrection | RetrackCorrection):
-            continue  # pragma: no cover - a third-party subclass reusing the kind
-        frame = int(correction.frame)
-        by_frame[frame] = Query(frame=frame, x=float(correction.x), y=float(correction.y))
-    return [by_frame[frame] for frame in sorted(by_frame)]
+    return [query for query, _correction in ground_truth_claims(corrections)]
 
 
 RetrackResolver = Callable[["RetrackCorrection"], PointTrack | None]

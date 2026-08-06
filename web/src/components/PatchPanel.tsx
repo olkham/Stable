@@ -34,7 +34,7 @@ const SETTLE_MS = 150;
  * purpose: at this size, smoothing would hide exactly the texture being judged.
  */
 export function PatchPanel({ pointId }: { pointId: string }) {
-  const { project, currentFrame, setCurrentFrame, editRevision, refresh, afterEdit } =
+  const { project, currentFrame, setCurrentFrame, editRevision, refresh, deleteKeyframe } =
     useProjectContext();
   const [info, setInfo] = useState<PointPatches | null>(null);
   // The keyframe image the operator has clicked, so `Delete` has something to
@@ -76,25 +76,24 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   useEffect(() => setSelectedKeyframe(null), [pointId]);
 
   /**
-   * Remove one of this point's own keyframe pins.
+   * Remove one of this point's keyframes.
    *
-   * Goes through `afterEdit`, not a bare refresh: the keyframe list the panel
-   * and the timeline draw comes with the *track*, which is cached separately
-   * from the project, so refreshing only the project would leave a deleted pin
-   * on screen until the next tracking run replaced that cache.
+   * Goes through the context's `deleteKeyframe`, not a bare refresh: the
+   * keyframe list the panel and the timeline draw comes with the *track*, which
+   * is cached separately from the project, so refreshing only the project would
+   * leave a deleted keyframe on screen until the next tracking run replaced
+   * that cache. A refusal (the last remaining keyframe) comes back as a message
+   * rather than an exception.
    */
-  const deleteKeyframe = useCallback(
+  const removeKeyframe = useCallback(
     async (frame: number) => {
-      try {
-        await api.deleteAnchor(project.id, pointId, frame);
-        setSelectedKeyframe(null);
-        await afterEdit(pointId);
-        await reload();
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      }
+      const refused = await deleteKeyframe(pointId, frame);
+      setError(refused);
+      if (refused) return;
+      setSelectedKeyframe(null);
+      await reload();
     },
-    [project.id, pointId, afterEdit, reload],
+    [pointId, deleteKeyframe, reload],
   );
 
   // Delete/Backspace removes the selected keyframe image. Ignored while typing
@@ -106,11 +105,11 @@ export function PatchPanel({ pointId }: { pointId: string }) {
       const target = event.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
       event.preventDefault();
-      void deleteKeyframe(selectedKeyframe as number);
+      void removeKeyframe(selectedKeyframe as number);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedKeyframe, deleteKeyframe]);
+  }, [selectedKeyframe, removeKeyframe]);
 
   if (error) return <div className="error-text">{error}</div>;
   if (!info) return <div className="patch-panel">Loading patches…</div>;
@@ -124,13 +123,14 @@ export function PatchPanel({ pointId }: { pointId: string }) {
    * whole frames. For those there is no patch: the radius below is a preview
    * size this panel invented, and a grid of thumbnails of it is a picture of
    * something the algorithm never looks at. The keyframes themselves still
-   * matter (they are where the point is pinned, and deleting one has to keep
-   * working), so they are listed — as frames, which is what they are here.
+   * matter (they are where the operator has said the point is, and deleting one
+   * has to keep working), so they are listed — as frames, which is what they
+   * are here.
    */
   const hasWindow = info.radius_source !== null;
-  // Pins only: the last one cannot be deleted, and a promoted correction is not
-  // one of them, so counting the whole grid would get that limit wrong.
-  const keyframeCount = info.patches.filter((p) => p.pinned).length;
+  // The last keyframe cannot be deleted, so the ✕ has to know how many there
+  // are — every keyframe counts, whichever storage the server keeps it in.
+  const keyframeCount = info.patches.filter((p) => p.kind === "keyframe").length;
   const windowSetting = settings.find((s) => s.role === "window");
   const value = (setting: TrackerSetting) => draft[setting.attribute] ?? setting.value;
   const dirty = settings.some((s) => value(s) !== s.value);
@@ -170,9 +170,6 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   /** Why a keyframe's × is unavailable, or null when it can be deleted. */
   function undeletableReason(patch: PointPatches["patches"][number]): string | null {
     if (patch.kind !== "keyframe") return "Only keyframes can be deleted";
-    if (!patch.pinned) {
-      return "This keyframe comes from a manual correction — delete the correction on the Edit tab";
-    }
     if (keyframeCount <= 1) {
       return "A point needs at least one keyframe to track from — this is its last one";
     }
@@ -209,7 +206,7 @@ export function PatchPanel({ pointId }: { pointId: string }) {
             title={blocked ?? `Delete keyframe ${patch.frame}`}
             onClick={(e) => {
               e.stopPropagation();
-              if (!blocked) void deleteKeyframe(patch.frame);
+              if (!blocked) void removeKeyframe(patch.frame);
             }}
           >
             ×
@@ -351,24 +348,24 @@ export function PatchPanel({ pointId }: { pointId: string }) {
       ) : (
         <>
           {/* No thumbnails, because there is no patch (todo 5, sixth round) —
-              but the keyframes are still the point's ground truth, and removing
+              but the keyframes are still the operator's truth, and removing
               one has to be possible from here whatever the tracker is. */}
           <span className="patch-panel__label">Keyframes</span>
           <div className="patch-panel__keyframes">
             {info.patches.map((patch) => {
               const blocked = undeletableReason(patch);
               return (
-                <span key={`k${patch.frame}`} className="anchor-chip">
+                <span key={`k${patch.frame}`} className="keyframe-chip">
                   <button className="link-button" onClick={() => setCurrentFrame(patch.frame)}>
-                    {patch.pinned ? "◆" : "✎"}f{patch.frame}
+                    {patch.kind === "keyframe" ? "◆" : ""}f{patch.frame}
                   </button>
                   {patch.kind === "keyframe" && (
                     <button
-                      className="anchor-chip__delete"
+                      className="keyframe-chip__delete"
                       disabled={blocked !== null}
                       title={blocked ?? `Delete keyframe ${patch.frame}`}
                       onClick={() => {
-                        if (!blocked) void deleteKeyframe(patch.frame);
+                        if (!blocked) void removeKeyframe(patch.frame);
                       }}
                     >
                       ×

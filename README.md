@@ -45,7 +45,9 @@ In the viewer: `←`/`→` step a frame, space plays, `↑`/`↓` jump between t
 selected track's keyframes, `A` pins it where it is on this frame (`⇧A` to
 click the position instead), `I`/`O` set the working range, `+`/`-`/`0` and the
 wheel zoom, middle-drag pans. Correcting a track needs no mode: select it and
-click or drag on the frame (`Ctrl+Z` undoes).
+click or drag on the frame (`Ctrl+Z` undoes). Adding, dragging or deleting a
+keyframe re-tracks the point by itself — auto-track is on by default, so the
+path re-flows without hunting for a Track button.
 Each point's **pattern** and **search** sizes are per point, set on the sliders
 beside its patch thumbnails and drawn on the frame as a solid and a dashed box,
 so a feature bigger than the tracker's default window is a slider away rather
@@ -239,9 +241,11 @@ trackers' model code) — the frontend is already built into the package
 * **Raw output is immutable.** Track arrays are read-only. Manual edits are a
   typed correction layer applied on top, so undo is "drop a correction" and
   re-tracking never destroys the user's work.
-* **Multi-anchor by default.** A point holds several anchor keyframes; runs go
-  bidirectionally from each and are merged tracker-agnostically. The merged
-  track passes through every anchor exactly, and disagreement between
+* **Multi-keyframe by default.** A point holds several keyframes; runs go
+  bidirectionally from each and are merged tracker-agnostically (the engine's
+  own vocabulary for this, in `stable.trackers.merge`, is "multi-anchor
+  merge" — an anchor there is just a keyframe fed to the merge). The merged
+  track passes through every keyframe exactly, and disagreement between
   overlapping runs lowers confidence — that dip is the UI's "fix this" signal.
 * **One confidence scale.** Every plugin normalises its scores to *P(this
   position is accurate to within a few pixels)*, so the solver can weight a

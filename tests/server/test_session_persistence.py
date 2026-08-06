@@ -4,7 +4,7 @@ The plan said to check this before building anything, because a project already
 persists to disk continuously (:mod:`stable.server.storage`) rather than on an
 explicit save. That makes "pause and resume without losing progress" a claim
 about the *existing* design, and a claim is worth a test: this walks a full
-session (points, anchors, a track, a manual correction, solve settings,
+session (points, keyframes, a track, a manual correction, solve settings,
 smoothing, render options, template settings), throws the entire server away,
 and reopens the project from disk in a new one.
 
@@ -51,8 +51,8 @@ def test_a_whole_session_survives_the_server_being_thrown_away(tmp_path, tiny_cl
         mx, my = source.true_position(mid)
         ok(
             client.post(
-                f"/api/projects/{project_id}/points/p1/anchors",
-                json={"frame": mid, "x": mx, "y": my},
+                f"/api/projects/{project_id}/points/p1/keyframes",
+                json={"frame": mid, "x": mx, "y": my, "track": "none"},
             )
         )
         ok(
@@ -88,8 +88,8 @@ def test_a_whole_session_survives_the_server_being_thrown_away(tmp_path, tiny_cl
         assert reopened["solve"]["reference_frame"] == 2
 
         after = client.get(f"/api/projects/{project_id}/points/p1/track").json()
-        # The corrected path, the anchors it was pinned through, and the manual
-        # correction on top of it all came back byte for byte.
+        # The corrected path, the keyframes it was tracked through, and the
+        # manual correction on top of it all came back byte for byte.
         assert after["x"] == before["x"]
         assert after["y"] == before["y"]
         assert after["anchor_frames"] == before["anchor_frames"]

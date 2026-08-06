@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import * as api from "../api/client";
+import type { TrackMode } from "../api/client";
 import { useJobsSocket } from "../hooks/useJobsSocket";
 import { useLiveTracking, type LiveTracking } from "../hooks/useLiveTracking";
 import type {
@@ -16,6 +17,7 @@ import type {
   Correction,
   HistoryStatus,
   JobEvent,
+  KeyframeMutation,
   ProjectDetail,
   SmoothedTrack,
   SmoothingFilter,
@@ -27,7 +29,7 @@ import type {
 /**
  * What a left-click on the frame means (todo 4, fourth round).
  *
- * This was `PlacingMode` — `none | new-point | add-anchor` — which was already
+ * This was `PlacingMode` — `none | new-point | add-keyframe` — which was already
  * a tool palette, just without a palette: the two placing modes were reachable
  * only from buttons inside the Tracks panel, and "none" silently meant three
  * different things depending on what was selected and where the pointer was.
@@ -39,16 +41,16 @@ import type {
  *     correct it. The everyday tool, and the default.
  * `add-point`
  *     The next click starts a new track there.
- * `add-anchor`
- *     The next click pins the selected track at that position on this frame.
+ * `add-keyframe`
+ *     The next click states where the selected track truly is on this frame.
  * `delete`
- *     Click an anchor pin to remove it, or a track's marker to remove the whole
+ *     Click a keyframe to remove it, or a track's marker to remove the whole
  *     track (confirmed, since that one is not an undoable correction).
  * `pan`
  *     Left-drag pans the view. Middle-drag does this in every tool; the tool
  *     exists for trackpads and tablets with no middle button.
  */
-export type Tool = "move" | "add-point" | "add-anchor" | "delete" | "pan";
+export type Tool = "move" | "add-point" | "add-keyframe" | "delete" | "pan";
 
 /**
  * Which overlay elements are drawn for a track.
@@ -66,8 +68,8 @@ export interface Overlays {
   smoothed: boolean;
   /** Where the point is on this frame — independent of the trail. */
   markers: boolean;
-  /** Anchor keyframe pins. */
-  anchors: boolean;
+  /** The keyframe diamonds: every position the operator has stated. */
+  keyframes: boolean;
   /** The before/after ghost a correction leaves. */
   ghost: boolean;
   /** The pattern and search boxes (selected track only). */
@@ -78,7 +80,7 @@ export const ALL_OVERLAYS: Overlays = {
   paths: true,
   smoothed: true,
   markers: true,
-  anchors: true,
+  keyframes: true,
   ghost: true,
   windows: true,
 };
@@ -88,7 +90,7 @@ export const NO_OVERLAYS: Overlays = {
   paths: false,
   smoothed: false,
   markers: false,
-  anchors: false,
+  keyframes: false,
   ghost: false,
   windows: false,
 };
@@ -110,8 +112,8 @@ export type DragMode = "offset" | "replace";
  * The paths were always confidence-coloured, which is a genuinely useful signal
  * — green means trust it, red means go and look — but it means every track on
  * the frame is drawn from the same ramp and none of them can be told apart.
- * Each point already *has* a colour (`pointColor`, used for its anchor pins,
- * its timeline pins and its panel swatch); this is the switch that lets the
+ * Each point already *has* a colour (`pointColor`, used for its keyframes,
+ * its timeline ticks and its panel swatch); this is the switch that lets the
  * path use it. The timeline's heat strip stays confidence-coloured either way,
  * so the signal is never entirely given up.
  */
@@ -189,16 +191,44 @@ interface ProjectContextValue {
   tool: Tool;
   setTool: (tool: Tool) => void;
   /**
-   * Pin a point where it already is on the current frame (the `A` shortcut and
-   * the panel's "+ anchor" both go through this).
+   * Whether a keyframe edit re-tracks its point by itself (todo_6).
+   *
+   * On by default, and the whole feel of the thing: push a keyframe around and
+   * the path follows, because the server re-runs the point's track from every
+   * keyframe and the result streams back over the jobs socket that is already
+   * open. Off leaves the Track button as the only thing that moves a path,
+   * which is what a slow tracker on a long clip wants.
+   */
+  autoTrack: boolean;
+  setAutoTrack: (on: boolean) => void;
+  /**
+   * State that a point is where it already is on the current frame (the `A`
+   * shortcut and the panel's "+ keyframe" both go through this).
    *
    * Returns false when the point has no position on this frame — an untracked
    * point, or a gap — which is the caller's cue to arm click-to-place instead:
-   * there is nowhere to pin it *to* without being told where.
+   * there is nowhere to key it *to* without being told where.
    */
-  addAnchorHere: (pointId?: string | null) => Promise<boolean>;
-  /** Add an anchor at an explicit position, e.g. from a click on the frame. */
-  addAnchorAt: (pointId: string, frame: number, x: number, y: number) => Promise<void>;
+  addKeyframeHere: (pointId?: string | null) => Promise<boolean>;
+  /** Set a keyframe at an explicit position, e.g. from a click on the frame. */
+  addKeyframeAt: (pointId: string, frame: number, x: number, y: number) => Promise<void>;
+  /**
+   * Move the keyframe on `frame` — to another frame, another position, or both.
+   *
+   * One atomic request, which is what a drag on the canvas fires on release.
+   */
+  moveKeyframe: (
+    pointId: string,
+    frame: number,
+    to: { frame?: number; x?: number; y?: number },
+  ) => Promise<void>;
+  /**
+   * Remove the keyframe on `frame`, whatever is backing it.
+   *
+   * Returns the server's refusal (a point must keep one truth position) as a
+   * message rather than throwing, so every caller can say the same thing.
+   */
+  deleteKeyframe: (pointId: string, frame: number) => Promise<string | null>;
 
   stabilizedPreview: boolean;
   setStabilizedPreview: (on: boolean) => void;
@@ -324,6 +354,9 @@ export function ProjectProvider({
   }, []);
   const [selectedPointId, setSelectedPointId] = useState<string | null>(null);
   const [tool, setTool] = useState<Tool>("move");
+  // On by default: "the path follows the keyframes" is the product, and having
+  // to find a button for it is the complaint todo_6 is about.
+  const [autoTrack, setAutoTrack] = useState(true);
   const [stabilizedPreview, setStabilizedPreview] = useState(false);
   const [overlays, setOverlays] = useState<Overlays>(ALL_OVERLAYS);
   const [overlaysEnabled, setOverlaysEnabled] = useState(true);
@@ -597,27 +630,82 @@ export function ProjectProvider({
     [],
   );
 
-  // -- anchors ----------------------------------------------------------------
+  // -- keyframes (todo_6) -----------------------------------------------------
   //
-  // Adding an anchor goes through `settle`, not a bare `refresh`. The pins live
-  // on the point, but the *keyframe list* the panel and the timeline draw is
-  // the server's `ground_truth` (pins plus promoted corrections) and comes with
-  // the track — so refreshing only the project left a just-placed anchor
-  // invisible in the list until the next track run replaced the cached track.
-  const addAnchorAt = useCallback(
-    async (pointId: string, frame: number, x: number, y: number) => {
-      setEditError(null);
-      try {
-        await api.addAnchor(projectId, pointId, frame, x, y);
-        await settle(pointId);
-      } catch (err) {
-        setEditError(err instanceof Error ? err.message : String(err));
-      }
+  // One concept, one code path. Every edit here answers with the point summary,
+  // the resulting keyframe list *and* the resulting correction list — a keyframe
+  // edit may discard the correction that was backing one — plus the id of the
+  // auto-track it triggered. Adopting that response is what makes the chip and
+  // the diamond move the instant the mouse comes up, without a round trip per
+  // panel; the path itself re-flows a moment later, live, as the job reports.
+  const adoptKeyframes = useCallback(
+    (pointId: string, result: KeyframeMutation) => {
+      const { keyframes, corrections, job_id: _jobId, ...summary } = result;
+      setProject((prev) =>
+        prev
+          ? { ...prev, points: prev.points.map((p) => (p.id === pointId ? summary : p)) }
+          : prev,
+      );
+      setTracks((prev) => {
+        const track = prev[pointId];
+        if (!track) return prev;
+        return { ...prev, [pointId]: { ...track, keyframes, corrections } };
+      });
+      // A discarded correction changes what undo would do, and every curve view
+      // derives from the edit counter.
+      setEditRevision((n) => n + 1);
+      api.getHistory(projectId).then(setHistory).catch(() => undefined);
     },
-    [projectId, settle],
+    [projectId],
   );
 
-  const addAnchorHere = useCallback(
+  // The auto-track job needs no subscription of its own: `useJobsSocket` is
+  // already carrying every job for this project, so a run the server started on
+  // its own arrives on exactly the path a run started by the Track button does —
+  // `useLiveTracking` draws its partial path, and the done-job effect below
+  // re-reads the finished track. The one thing not done here is dropping the
+  // cached track: the old path stays on screen, and is drawn over by the live
+  // one as it arrives, so a drag never blanks the canvas it is being judged on.
+  const mutateKeyframe = useCallback(
+    async (pointId: string, call: (track: TrackMode) => Promise<KeyframeMutation>) => {
+      setEditError(null);
+      try {
+        adoptKeyframes(pointId, await call(autoTrack ? "auto" : "none"));
+        return null;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setEditError(message);
+        return message;
+      }
+    },
+    [adoptKeyframes, autoTrack],
+  );
+
+  const addKeyframeAt = useCallback(
+    async (pointId: string, frame: number, x: number, y: number) => {
+      await mutateKeyframe(pointId, (track) =>
+        api.addKeyframe(projectId, pointId, frame, x, y, track),
+      );
+    },
+    [projectId, mutateKeyframe],
+  );
+
+  const moveKeyframe = useCallback(
+    async (pointId: string, frame: number, to: { frame?: number; x?: number; y?: number }) => {
+      await mutateKeyframe(pointId, (track) =>
+        api.moveKeyframe(projectId, pointId, frame, to, track),
+      );
+    },
+    [projectId, mutateKeyframe],
+  );
+
+  const deleteKeyframe = useCallback(
+    (pointId: string, frame: number) =>
+      mutateKeyframe(pointId, (track) => api.deleteKeyframe(projectId, pointId, frame, track)),
+    [projectId, mutateKeyframe],
+  );
+
+  const addKeyframeHere = useCallback(
     async (pointId?: string | null) => {
       const id = pointId ?? selectedPointId;
       if (!id || !project) return false;
@@ -625,17 +713,17 @@ export function ProjectProvider({
       const x = track?.x[currentFrame];
       const y = track?.y[currentFrame];
       if (x != null && y != null) {
-        await addAnchorAt(id, currentFrame, x, y);
+        await addKeyframeAt(id, currentFrame, x, y);
         return true;
       }
-      // No tracked position here: an existing pin on this frame is already the
+      // No tracked position here: a keyframe already on this frame is the
       // answer, so report success rather than arming a pointless click.
-      const pinned = project.points
-        .find((p) => p.id === id)
-        ?.queries.some((q) => q.frame === currentFrame);
-      return Boolean(pinned);
+      const stated =
+        track?.keyframes?.some((k) => k.frame === currentFrame) ??
+        project.points.find((p) => p.id === id)?.queries.some((q) => q.frame === currentFrame);
+      return Boolean(stated);
     },
-    [project, tracks, currentFrame, selectedPointId, addAnchorAt],
+    [project, tracks, currentFrame, selectedPointId, addKeyframeAt],
   );
 
   // Ctrl/Cmd+Z and Ctrl+Shift+Z (or Ctrl+Y), ignored while typing in a field.
@@ -658,12 +746,11 @@ export function ProjectProvider({
   }, [undo, redo]);
 
   // Frame navigation (todo 9): left/right steps a frame, space plays/pauses,
-  // up/down jumps to the selected point's next/previous keyframe (its pins
-  // plus whatever manual corrections have been promoted to ground truth --
-  // W1's `ground_truth`, read the same locally-typed way Timeline.tsx and
-  // PointsPanel.tsx do, since it is not part of the shared `TrackData` type),
-  // home/end jump to the first/last frame. Ignored while typing in a field,
-  // same guard as undo/redo above.
+  // up/down jumps to the selected point's next/previous keyframe (the unified
+  // list that comes with the track — pins and the positions manual corrections
+  // state, which are one thing to the operator), home/end jump to the
+  // first/last frame. Ignored while typing in a field, same guard as undo/redo
+  // above.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (!project || event.ctrlKey || event.metaKey || event.altKey) return;
@@ -702,26 +789,26 @@ export function ProjectProvider({
         if (event.shiftKey) goToMarker("out");
         else void setRangeMarker("out", currentFrame + 1);
       } else if (event.key === "a" || event.key === "A") {
-        // Pin the selected point on this frame. Where it already has a
-        // position that needs no aiming, so plain `A` just does it; with
-        // Shift (or with nothing to pin, e.g. an untracked point) it arms
+        // State that the selected point is where it already is on this frame.
+        // That needs no aiming, so plain `A` just does it; with Shift (or with
+        // nothing tracked to state, e.g. an untracked point) it arms
         // click-to-place instead, which is the same two-step the panel button
         // uses. Pressing it again disarms, so the key is never a trap.
         if (!selectedPointId) return;
         event.preventDefault();
-        if (tool === "add-anchor") {
+        if (tool === "add-keyframe") {
           setTool("move");
           return;
         }
         if (event.shiftKey) {
-          setTool("add-anchor");
+          setTool("add-keyframe");
           return;
         }
-        void addAnchorHere(selectedPointId).then((done) => {
-          if (!done) setTool("add-anchor");
+        void addKeyframeHere(selectedPointId).then((done) => {
+          if (!done) setTool("add-keyframe");
         });
       } else if (event.key === "v" || event.key === "V") {
-        // The tool palette's shortcuts (todo 4). `A` is above, because pinning
+        // The tool palette's shortcuts (todo 4). `A` is above, because stating
         // where the point already is does not need the tool at all.
         event.preventDefault();
         setTool("move");
@@ -740,9 +827,8 @@ export function ProjectProvider({
       } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         if (!selectedPointId) return;
         const point = project.points.find((p) => p.id === selectedPointId);
-        const promoted = (tracks[selectedPointId] as (TrackData & { ground_truth?: { frame: number }[] }) | undefined)
-          ?.ground_truth;
-        const frames = (promoted ? promoted.map((q) => q.frame) : point?.queries.map((q) => q.frame)) ?? [];
+        const stated = tracks[selectedPointId]?.keyframes;
+        const frames = (stated ?? point?.queries)?.map((k) => k.frame) ?? [];
         const marks = [...new Set(frames)].sort((a, b) => a - b);
         if (marks.length === 0) return;
         event.preventDefault();
@@ -763,7 +849,7 @@ export function ProjectProvider({
     selectedPointId,
     tracks,
     tool,
-    addAnchorHere,
+    addKeyframeHere,
     setRangeMarker,
     goToMarker,
     setCurrentFrame,
@@ -851,8 +937,12 @@ export function ProjectProvider({
       setSelectedPointId,
       tool,
       setTool,
-      addAnchorHere,
-      addAnchorAt,
+      autoTrack,
+      setAutoTrack,
+      addKeyframeHere,
+      addKeyframeAt,
+      moveKeyframe,
+      deleteKeyframe,
       stabilizedPreview,
       setStabilizedPreview,
       overlays,
@@ -906,8 +996,11 @@ export function ProjectProvider({
     followTracker,
     selectedPointId,
     tool,
-    addAnchorHere,
-    addAnchorAt,
+    autoTrack,
+    addKeyframeHere,
+    addKeyframeAt,
+    moveKeyframe,
+    deleteKeyframe,
     stabilizedPreview,
     overlays,
     overlaysEnabled,
