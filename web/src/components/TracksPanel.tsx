@@ -5,6 +5,7 @@ import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackData, TrackerInfo } from "../types";
 import { JobProgress } from "./JobProgress";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
+import { TrackEdits } from "./TrackEdits";
 import { OVERLAY_LABELS } from "./Viewer";
 
 /** How far a keyframe may be from where a run landed before it is flagged. */
@@ -99,8 +100,8 @@ export function TracksPanel() {
     selectedPointId,
     setSelectedPointId,
     setCurrentFrame,
-    placingMode,
-    setPlacingMode,
+    tool,
+    setTool,
     addAnchorHere,
     afterEdit,
     latestJobFor,
@@ -115,6 +116,13 @@ export function TracksPanel() {
   const [runLimit, setRunLimit] = useState<RunLimit>("keyframe");
   const [runFrames, setRunFrames] = useState(10);
   const [runError, setRunError] = useState<string | null>(null);
+  // Which cards the operator has explicitly opened or closed (todo 5, fourth
+  // round). Tri-state, like the overlay overrides below: a card nobody has
+  // touched follows the old behaviour — open when its track is selected — and
+  // one that *has* been touched keeps what it was told, whatever the selection
+  // does next. That is the whole complaint: collapsing happened to you, and
+  // two cards could never be open at once to compare them.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   async function handleTrack(pointId: string) {
     await api.trackPoint(project.id, pointId, {});
@@ -123,11 +131,6 @@ export function TracksPanel() {
 
   async function handleTrackerChange(pointId: string, tracker: string) {
     await api.updatePoint(project.id, pointId, { tracker });
-    await refresh();
-  }
-
-  async function handleEnabledChange(pointId: string, enabled: boolean) {
-    await api.updatePoint(project.id, pointId, { enabled_for_solve: enabled });
     await refresh();
   }
 
@@ -177,10 +180,10 @@ export function TracksPanel() {
       <div className="panel__header">
         <h3>Tracks</h3>
         <button
-          className={placingMode === "new-point" ? "button--active" : ""}
-          onClick={() => setPlacingMode(placingMode === "new-point" ? "none" : "new-point")}
+          className={tool === "add-point" ? "button--active" : ""}
+          onClick={() => setTool(tool === "add-point" ? "move" : "add-point")}
         >
-          {placingMode === "new-point" ? "Click video to place…" : "+ Add track"}
+          {tool === "add-point" ? "Click video to place…" : "+ Add track"}
         </button>
       </div>
 
@@ -212,19 +215,39 @@ export function TracksPanel() {
           );
           const flagged = new Set(track?.flagged_anchors ?? []);
           const violations = track?.anchor_violations ?? [];
+          const isOpen = expanded[point.id] ?? isSelected;
           return (
             <li
               key={point.id}
-              className={`points-list__item ${isSelected ? "points-list__item--selected" : ""}`}
+              className={`points-list__item ${isSelected ? "points-list__item--selected" : ""} ${
+                isOpen ? "" : "points-list__item--collapsed"
+              }`}
               onClick={() => setSelectedPointId(point.id)}
             >
               <div className="points-list__row">
+                <button
+                  className="points-list__disclose"
+                  aria-expanded={isOpen}
+                  title={isOpen ? "Collapse this track" : "Expand this track"}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setExpanded((prev) => ({ ...prev, [point.id]: !isOpen }));
+                  }}
+                >
+                  {isOpen ? "▾" : "▸"}
+                </button>
                 <span className="points-list__swatch" style={{ background: pointColor(point.id) }} />
                 <span className="points-list__id">{point.id}</span>
+                {!isOpen && point.has_track && (
+                  <span className="points-list__confidence">
+                    {point.tracked_frames}f · {(point.mean_confidence * 100).toFixed(0)}%
+                  </span>
+                )}
                 <select
                   value={point.tracker}
                   onClick={(e) => e.stopPropagation()}
                   onChange={(e) => handleTrackerChange(point.id, e.target.value)}
+                  style={isOpen ? undefined : { display: "none" }}
                 >
                   {trackers.map((t) => (
                     <option
@@ -249,14 +272,10 @@ export function TracksPanel() {
                     ⚠ not installed
                   </span>
                 )}
-                <label className="points-list__enabled" onClick={(e) => e.stopPropagation()}>
-                  <input
-                    type="checkbox"
-                    checked={point.enabled_for_solve}
-                    onChange={(e) => handleEnabledChange(point.id, e.target.checked)}
-                  />
-                  solve
-                </label>
+                {/* The "solve" checkbox used to be here (todo 6, fourth
+                    round). Choosing which tracks go into the solve now happens
+                    on the Solve tab, next to the button that runs it, so the
+                    two halves of one decision are on one screen. */}
                 <button
                   className="points-list__delete"
                   onClick={(e) => {
@@ -269,6 +288,7 @@ export function TracksPanel() {
                 </button>
               </div>
 
+              {isOpen && (
               <div className="points-list__anchors" onClick={(e) => e.stopPropagation()}>
                 {anchors.map((q) => {
                   const missed = flagged.has(q.frame);
@@ -306,30 +326,32 @@ export function TracksPanel() {
                 })}
                 <button
                   className={`anchor-add ${
-                    placingMode === "add-anchor" && isSelected ? "button--active" : ""
+                    tool === "add-anchor" && isSelected ? "button--active" : ""
                   }`}
                   title={`Pin this point at frame ${currentFrame} where it already is (shortcut: A), or click the frame to place it somewhere else (⇧A)`}
                   onClick={async () => {
                     setSelectedPointId(point.id);
-                    if (placingMode === "add-anchor" && isSelected) {
-                      setPlacingMode("none");
+                    if (tool === "add-anchor" && isSelected) {
+                      setTool("move");
                       return;
                     }
                     // Same rule as the shortcut: pin where the point already
                     // is, and only ask for a click when there is nothing there
                     // to pin.
-                    if (!(await addAnchorHere(point.id))) setPlacingMode("add-anchor");
+                    if (!(await addAnchorHere(point.id))) setTool("add-anchor");
                   }}
                 >
                   + anchor
                 </button>
               </div>
+              )}
 
               {/* What this track draws on the canvas (todo 9). The row above
                   the canvas sets the defaults; these override them for this
                   track alone, which is what makes a busy shot readable. A
                   toggle showing the default is not "off", it is "same as
                   everyone" — hence the tri-state title. */}
+              {isOpen && (
               <div className="track-overlays" onClick={(e) => e.stopPropagation()}>
                 {OVERLAY_LABELS.map(([key, label, help]) => {
                   const override = trackOverrides[point.id]?.[key];
@@ -355,14 +377,16 @@ ${
                   );
                 })}
               </div>
+              )}
 
               {/* The patches this point is tracked on (todo 14). Shown for
                   every tracker, not just template matching: "what does the
                   tracker see here" is the same question whatever is doing the
-                  looking. Only for the selected point, so the list stays
-                  scannable when a shot has a dozen points. */}
-              {isSelected && <PatchPanel pointId={point.id} />}
+                  looking. Behind the card's own disclosure since todo 5, so two
+                  tracks' patches can be compared side by side. */}
+              {isOpen && <PatchPanel pointId={point.id} />}
 
+              {isOpen && (
               <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                 <button onClick={() => handleTrack(point.id)}>
                   {point.has_track ? "Re-track" : "Track"}
@@ -384,8 +408,9 @@ ${
                 )}
                 <JobProgress job={trackJob} />
               </div>
+              )}
 
-              {point.has_track && isSelected && (
+              {point.has_track && isOpen && (
                 <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                   <button
                     title={`Track backwards from frame ${currentFrame}`}
@@ -426,7 +451,13 @@ ${
                 </div>
               )}
 
-              {violations.length > 0 && (
+              {/* This track's gaps, range repairs and corrections (todo 4,
+                  sixth round) — what the Edit tab held that was not already
+                  somewhere better. All of it is per point, so it belongs on the
+                  point's card next to its keyframes and its patches. */}
+              {isOpen && <TrackEdits pointId={point.id} />}
+
+              {isOpen && violations.length > 0 && (
                 <ul className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                   {violations.map((v) => (
                     <li

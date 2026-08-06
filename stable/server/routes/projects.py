@@ -206,6 +206,28 @@ def get_job(project_id: str, job_id: str, jobs: JobManager = Depends(_jobs)) -> 
     return job.to_event()
 
 
+@router.post("/{project_id}/jobs/{job_id}/cancel")
+def cancel_job(project_id: str, job_id: str, jobs: JobManager = Depends(_jobs)) -> dict[str, Any]:
+    """Drop a job that has not started yet.
+
+    What makes an export *queue* a queue rather than a list of regrets: several
+    renders can be lined up, and one that turns out to be wrong can be taken out
+    again before it costs any minutes (todo 8, fourth round).
+
+    Raises:
+        HTTPException: 404 if the job is unknown or belongs to another project,
+            409 if it has already started — a half-written encode is worse than
+            one that finishes, so a running job is never interrupted.
+    """
+    job = jobs.get(job_id)
+    if job is None or job.project_id != project_id:
+        raise HTTPException(status_code=404, detail=f"no job {job_id!r} for project {project_id!r}")
+    try:
+        return jobs.cancel(job_id).to_event()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 # -- the working range: In / Out markers (todo 1) -------------------------------
 
 

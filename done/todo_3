@@ -14,3 +14,7 @@ Remove the Solve checkbox from the Tracks panel. Selecting which tracks to solve
 During the export, when setting two target points for example, if the user adjusts the Crop size, the UI flickers and the target points become unset (even though they are still within the target area). The warning is also displayed "this render would not move the picture at all, so it would just re-encode the source: the stabilisation warp is 'smoothed motion' minus 'solved motion', and nothing has asked them to differ. Enable at least one smoothing filter in the Smoothing panel (Butterworth at ~1 Hz is the usual starting point), or set a stabilisation target so a tracked point is held still."
 Adjusting the crop size should not unset the target points.
 
+Exporting videos should be a queable process, allowing users to queue multiple export jobs and have them processed in the background. This will enable users to continue working on other tasks while exports are being processed, improving overall productivity.
+
+When the user clicks on a keyframe image in the track card they should be able to hit delete to remove that keyframe. There should also be an icon to delete the keyframe directly from the track card.
+

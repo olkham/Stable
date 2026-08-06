@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../api/client";
-import { CHANNEL_LABEL } from "../colors";
+import { CHANNEL_LABEL, pointColor } from "../colors";
 import type { Channel, SolveCurves } from "../types";
 import { CHANNELS } from "../types";
 import { useProjectContext } from "../state/ProjectContext";
@@ -55,6 +55,28 @@ export function SolvePanel() {
     await api.runSolve(project.id);
   }
 
+  /**
+   * Include or exclude one track (todo 6, fourth round).
+   *
+   * This checkbox used to live on every card in the Tracks panel, where it was
+   * one decision split across two screens: you chose the tracks over there and
+   * pressed Solve over here, and the empty state on this tab literally told you
+   * to go back and tick a box. It is the same `enabled_for_solve` flag and the
+   * same endpoint — only now it sits next to the button it governs.
+   */
+  async function setEnabled(pointId: string, enabled: boolean) {
+    await api.updatePoint(project.id, pointId, { enabled_for_solve: enabled });
+    await refresh();
+  }
+
+  async function setAllEnabled(enabled: boolean) {
+    for (const point of project.points) {
+      if (point.enabled_for_solve === enabled) continue;
+      await api.updatePoint(project.id, point.id, { enabled_for_solve: enabled });
+    }
+    await refresh();
+  }
+
   // `residual` is null on frames nothing was fitted for, so those are skipped
   // rather than counted as a perfect zero.
   const measured = (curves?.residual ?? []).filter((v): v is number => v !== null);
@@ -78,6 +100,53 @@ export function SolvePanel() {
         reference frame. Smoothing then decides which parts of that move to
         keep, and the export warps each frame by the difference. Without a
         solve there is nothing to smooth and nothing to stabilise.
+      </p>
+
+      <h4 className="solve-panel__heading">Tracks in the solve</h4>
+      {project.points.length === 0 ? (
+        <p className="field-help">No tracks yet — add one on the Tracks tab.</p>
+      ) : (
+        <>
+          <ul className="solve-tracks">
+            {project.points.map((point) => (
+              <li key={point.id} className={point.has_track ? "" : "solve-tracks__untracked"}>
+                <label
+                  title={
+                    point.has_track
+                      ? `${point.tracked_frames} frames · ${(point.mean_confidence * 100).toFixed(0)}% confidence`
+                      : "Not tracked yet — track it on the Tracks tab and it becomes available here"
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={point.enabled_for_solve}
+                    disabled={!point.has_track}
+                    onChange={(e) => void setEnabled(point.id, e.target.checked)}
+                  />
+                  <span
+                    className="points-list__swatch"
+                    style={{ background: pointColor(point.id) }}
+                  />
+                  <span className="solve-tracks__id">{point.id}</span>
+                  <span className="solve-tracks__stats">
+                    {point.has_track
+                      ? `${point.tracked_frames}f · ${(point.mean_confidence * 100).toFixed(0)}%`
+                      : "not tracked"}
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          <div className="field-row">
+            <button onClick={() => void setAllEnabled(true)}>All</button>
+            <button onClick={() => void setAllEnabled(false)}>None</button>
+          </div>
+        </>
+      )}
+      <p className="field-help">
+        Which tracks the camera move is fitted from. Untracked ones are listed but cannot be
+        chosen — "why is that point not in my solve?" is a question this list should answer rather
+        than dodge by hiding it.
       </p>
 
       <div className="field-row">
@@ -134,8 +203,8 @@ export function SolvePanel() {
       </button>
       {trackedCount === 0 && (
         <p className="field-help">
-          Nothing to solve yet: track at least one point (and leave its{" "}
-          <em>solve</em> box ticked) on the Tracks tab first.
+          Nothing to solve yet: track at least one point on the Tracks tab, then tick it in the
+          list above.
         </p>
       )}
       <JobProgress job={job} />

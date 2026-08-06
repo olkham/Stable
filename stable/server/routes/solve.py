@@ -21,8 +21,10 @@ Note:
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 
@@ -30,10 +32,17 @@ from ...core.errors import StableError
 from ...core.project import Project, SmoothingSpec
 from ...render.fill import FILL_MODES
 from ...render.options import CROP_CENTRES, TARGET_MODES, RenderOptions
-from ...render.warp import rescale_transform, warp_frame
-from ...smoothing.motion import SmoothedMotion
-from ...solver.motion import MotionSolve
 from .. import motion as motion_glue
+from ..frames import (
+    FrameUnavailable,
+    load_options,
+    load_smoothed,
+    load_solve,
+    output_frame_jpeg,
+    preview_plan,
+    smoothing_cache_path,
+    solve_cache_path,
+)
 from ..jobs import JobManager, get_job_manager
 from ..schemas import SmoothingUpdate, SolveSettingsUpdate
 from ..storage import Workspace, get_workspace
@@ -59,54 +68,6 @@ def _jobs() -> JobManager:
     return get_job_manager()
 
 
-def _solve_path(workspace: Workspace, project_id: str) -> Any:
-    return workspace.project_dir(project_id) / motion_glue.SOLVE_CACHE
-
-
-def _smoothing_path(workspace: Workspace, project_id: str) -> Any:
-    return workspace.project_dir(project_id) / motion_glue.SMOOTHING_CACHE
-
-
-def _options_path(workspace: Workspace, project_id: str) -> Any:
-    return motion_glue.options_path(workspace.project_dir(project_id))
-
-
-def load_options(workspace: Workspace, project_id: str) -> RenderOptions:
-    """Return a project's stabilisation options (target / crop / fill).
-
-    Shared with :mod:`stable.server.routes.export`, so the preview and the
-    export are planned from exactly the same choices.
-    """
-    return motion_glue.load_render_options(workspace.project_dir(project_id))
-
-
-def load_solve(workspace: Workspace, project_id: str) -> MotionSolve | None:
-    """Return a project's cached raw solve, or ``None`` if it has not been solved.
-
-    Shared with :mod:`stable.server.routes.export`, which needs the same cache.
-    """
-    payload = motion_glue.read_json(_solve_path(workspace, project_id))
-    return None if payload is None else motion_glue.solve_from_cache(payload)
-
-
-def load_smoothed(
-    workspace: Workspace, project_id: str, project: Project | None = None
-) -> SmoothedMotion | None:
-    """Return a project's smoothed motion, or ``None`` if it has not been solved.
-
-    The smoothed *curves* are cached, but the object handed back is rebuilt on
-    top of the cached solve so callers get the real
-    :class:`~stable.smoothing.motion.SmoothedMotion` — the thing that knows how
-    to produce a stabilisation warp — rather than four bare lists.
-    """
-    solve = load_solve(workspace, project_id)
-    if solve is None:
-        return None
-    if not _smoothing_path(workspace, project_id).is_file():
-        return None
-    return motion_glue.smooth_solve(project or workspace.load_project(project_id), solve)
-
-
 def recompute_smoothed(
     workspace: Workspace, project_id: str, project: Project
 ) -> dict[str, Any] | None:
@@ -116,7 +77,7 @@ def recompute_smoothed(
         return None
     smoothed = motion_glue.smooth_solve(project, solve)
     payload = motion_glue.smoothed_payload(smoothed)
-    motion_glue.write_json(_smoothing_path(workspace, project_id), payload)
+    motion_glue.write_json(smoothing_cache_path(workspace, project_id), payload)
     motion_glue.clear_plan_cache(project_id)
     return payload
 
@@ -192,7 +153,7 @@ def run_solve(
 
         solve = motion_glue.solve_tracks(proj, tracks, progress=fit_progress)
         motion_glue.write_json(
-            _solve_path(workspace, project_id), motion_glue.solve_to_cache(solve)
+            solve_cache_path(workspace, project_id), motion_glue.solve_to_cache(solve)
         )
         recompute_smoothed(workspace, project_id, proj)
         progress(1.0, "done")
@@ -210,7 +171,7 @@ def get_smoothing(project_id: str, workspace: Workspace = Depends(_workspace)) -
     """Return the current smoothing filter list plus cached raw/smoothed curves."""
     project = workspace.load_project(project_id)
     solve = load_solve(workspace, project_id)
-    smoothed = motion_glue.read_json(_smoothing_path(workspace, project_id))
+    smoothed = motion_glue.read_json(smoothing_cache_path(workspace, project_id))
     return {
         "filters": [s.to_dict() for s in project.smoothing],
         "curves": {
@@ -268,42 +229,55 @@ def update_smoothing(
     }
 
 
-# -- stabilized frame preview --------------------------------------------------
+@router.get("/smoothing/tracks")
+def get_smoothed_tracks(
+    project_id: str, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Return every tracked point's path after the smoothing's stabilisation warp.
 
+    The smoothing produces four *camera* curves, not a path per point, so
+    "what did the smoothing do to this track?" has no answer until the warp
+    ``smoothed(t) . raw(t)^-1`` is applied to the track itself. That is what this
+    returns: where each feature ends up once the shot is stabilised, which is
+    what the canvas draws over the source trail (todo 3, fourth round).
 
-def _scaled_fill(fill: Any, scale: float) -> Any:
-    """Re-express a border fill for a proxy's resolution.
+    Deliberately *not* the render's ``output_transform``: that folds in the
+    export's stabilisation target and crop fit, so the trail would move whenever
+    the crop moved. The export preview owns that; this owns the smoothing.
 
-    ``blur`` and ``feather`` are pixel distances, so they scale with the frame;
-    the mode, colour and tint are dimensionless and pass through untouched.
+    Returns:
+        ``n_frames`` and one ``{point_id, x, y}`` row per tracked point, with
+        ``null`` on frames the point has no position for.
+
+    Raises:
+        HTTPException: 409 if the project has not been solved and smoothed yet —
+            there is no warp to apply, which is a state rather than a failure.
     """
-    if fill is None or scale == 1.0:
-        return fill
-    from dataclasses import replace  # noqa: PLC0415 - one caller, keeps the import local
-
-    return replace(fill, blur=fill.blur * scale, feather=fill.feather * scale)
-
-
-def preview_plan(workspace: Workspace, project_id: str, project: Project, motion: SmoothedMotion):
-    """Return the render plan for the preview, memoised on the caches' mtimes.
-
-    The same call the export uses, so "what you see is what you get" survives
-    the stabilisation target, the crop scale and the border fill as well as the
-    border policy.
-    """
-    options_file = _options_path(workspace, project_id)
-    key = (
-        _solve_path(workspace, project_id).stat().st_mtime_ns,
-        _smoothing_path(workspace, project_id).stat().st_mtime_ns,
-        options_file.stat().st_mtime_ns if options_file.is_file() else 0,
-        project.render.border,
-        project.video.w,
-        project.video.h,
-    )
-    options = load_options(workspace, project_id)
-    return motion_glue.cached_plan(
-        project_id, key, lambda: motion_glue.build_plan(project, motion, options=options)
-    )
+    project = workspace.load_project(project_id)
+    motion = load_smoothed(workspace, project_id, project)
+    if motion is None:
+        raise HTTPException(
+            status_code=409, detail="solve and smooth this project to see the smoothed tracks"
+        )
+    warps = motion.stabilization_transforms()
+    rows: list[dict[str, Any]] = []
+    for point in project.points:
+        track = load_display_track(project, point)
+        if track is None:
+            continue
+        positions = np.asarray(track.points, dtype=np.float64)
+        count = min(len(warps), positions.shape[0])
+        xs: list[float | None] = [None] * positions.shape[0]
+        ys: list[float | None] = [None] * positions.shape[0]
+        for frame in range(count):
+            source = positions[frame]
+            if not np.isfinite(source).all():
+                continue
+            moved = warps[frame].apply(source)
+            xs[frame] = float(moved[0])
+            ys[frame] = float(moved[1])
+        rows.append({"point_id": point.id, "x": xs, "y": ys})
+    return {"n_frames": motion.n_frames, "points": rows}
 
 
 # -- stabilisation options (target / crop / fill) -------------------------------
@@ -379,11 +353,26 @@ def get_render_options(
     return _options_payload(workspace, project_id, project)
 
 
+_OPTIONS_LOCK = threading.Lock()
+"""Serialises the read-merge-write below.
+
+Each request loads the whole sidecar, replaces the block it was given and writes
+all three back, so two overlapping updates would each carry the other's stale
+copy of a block neither touched — "I moved the crop slider and my placed targets
+disappeared" (todo 7, fourth round). One lock for every project: these are
+sub-millisecond file writes, and a per-project map would be more bookkeeping
+than the contention it saves.
+"""
+
+
 @router.put("/render/options")
 def update_render_options(
     project_id: str, body: RenderOptionsUpdate, workspace: Workspace = Depends(_workspace)
 ) -> dict[str, Any]:
     """Update the stabilisation target, crop scale and/or border fill.
+
+    Only the blocks named in the body change: adjusting the crop leaves the
+    placed stabilisation targets exactly as they were, and vice versa.
 
     These drive the stabilized preview as well as the export, so the memoised
     render plan is dropped here — the same rule the border policy follows.
@@ -393,24 +382,25 @@ def update_render_options(
             (validated by :mod:`stable.render.options`, not re-implemented here).
     """
     project = workspace.load_project(project_id)
-    current = load_options(workspace, project_id).to_dict()
-    for block, update in (("target", body.target), ("crop", body.crop), ("fill", body.fill)):
-        if update is None:
-            continue
-        current[block] = {
-            **current[block],
-            **{k: v for k, v in update.model_dump(exclude_unset=True).items()},
-        }
-    try:
-        options = RenderOptions.from_dict(current)
-        # Fail now, with a message naming the target, rather than inside the
-        # export job twenty seconds later.
-        if motion_glue.resolve_mapped_targets(project, options.target) is None:
-            motion_glue.resolve_target_positions(project, options.target)
-    except StableError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    motion_glue.save_render_options(workspace.project_dir(project_id), options)
-    motion_glue.clear_plan_cache(project_id)
+    with _OPTIONS_LOCK:
+        current = load_options(workspace, project_id).to_dict()
+        for block, update in (("target", body.target), ("crop", body.crop), ("fill", body.fill)):
+            if update is None:
+                continue
+            current[block] = {
+                **current[block],
+                **{k: v for k, v in update.model_dump(exclude_unset=True).items()},
+            }
+        try:
+            options = RenderOptions.from_dict(current)
+            # Fail now, with a message naming the target, rather than inside the
+            # export job twenty seconds later.
+            if motion_glue.resolve_mapped_targets(project, options.target) is None:
+                motion_glue.resolve_target_positions(project, options.target)
+        except StableError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        motion_glue.save_render_options(workspace.project_dir(project_id), options)
+        motion_glue.clear_plan_cache(project_id)
     return _options_payload(workspace, project_id, project)
 
 
@@ -426,48 +416,16 @@ def get_stabilized_frame(
     :func:`stable.render.warp.rescale_transform`, so what the preview shows is
     what the export will produce, border fill and all.
 
+    The pixels themselves come from :func:`stable.server.frames.output_frame_jpeg`,
+    which is also what the frame WebSocket serves — one implementation, so the
+    streamed picture and the one this route answers with cannot drift apart.
+
     Raises:
         HTTPException: 409 if the project has not been solved yet; 404 if the
             frame index or proxy tier is invalid.
     """
-    project = workspace.load_project(project_id)
-    motion = load_smoothed(workspace, project_id, project)
-    if motion is None:
-        raise HTTPException(
-            status_code=409, detail="run solve and smoothing before requesting a stabilized preview"
-        )
-    if not 0 <= index < motion.n_frames:
-        raise HTTPException(status_code=404, detail=f"frame {index} outside the solved range")
     try:
-        store = workspace.get_proxy_store(project_id, tier)
-        frame = store.get_frame(index)
-        plan = preview_plan(workspace, project_id, project, motion)
-    except StableError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except IndexError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    scale = float(store.manifest.scale)
-    warped = warp_frame(
-        frame,
-        rescale_transform(plan.output_transform(index), scale),
-        size=(
-            max(int(round(plan.geometry.width * scale)), 1),
-            max(int(round(plan.geometry.height * scale)), 1),
-        ),
-        border=plan.border,
-        interpolation=plan.interpolation,
-        # The fill's blur and feather are in pixels, so a proxy needs them
-        # scaled or the preview shows a softer edge than the export will.
-        fill=_scaled_fill(plan.fill, scale),
-    )
-
-    import cv2  # noqa: PLC0415 - lazy, matches the rest of the video stack
-
-    # JPEG carries no alpha, so the transparent policy's uncovered area is shown
-    # as the black it was composited against rather than failing the request.
-    rgb = warped[:, :, :3] if warped.shape[2] == 4 else warped
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    if not ok:  # pragma: no cover - encoder failure only
-        raise HTTPException(status_code=500, detail="could not encode stabilized frame")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
+        payload, _revision = output_frame_jpeg(workspace, project_id, index, tier)
+    except FrameUnavailable as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return Response(content=payload, media_type="image/jpeg")

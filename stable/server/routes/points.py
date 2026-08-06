@@ -17,7 +17,10 @@ from __future__ import annotations
 import io
 import math
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +116,10 @@ def create_point(
         workspace.save_project(project_id, project)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Render its patch now rather than when the panel first asks for it (todo 3,
+    # sixth round): making a keyframe is the moment the pixels it names are
+    # known, and it is not a moment anybody is waiting on a thumbnail.
+    warm_patches(workspace, project_id, point_id, [(body.frame, body.x, body.y)])
     return point_summary(project, project.point(point_id))
 
 
@@ -206,6 +213,9 @@ def add_anchor(
         project = workspace.update_project(project_id, _mutate)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Same as placing a point: the patch is rendered while the operator is still
+    # looking at the frame they pinned, not when they next open the card.
+    warm_patches(workspace, project_id, point_id, [(body.frame, body.x, body.y)])
     return point_summary(project, project.point(point_id))
 
 
@@ -456,6 +466,13 @@ def get_point_patches(
             current = entry(found[0], frame, found[1])
 
     window_setting = next((s for s in settings if s["role"] == "window"), None)
+    # The grid this describes is about to ask for one image per keyframe, and on
+    # a cold cache each of those is a seek into the clip. Rendering them now, in
+    # the background, is what makes the panel appear filled rather than filling
+    # (todo 3, sixth round) — and it covers the keyframes that pre-date the
+    # warm-on-create above, plus every server restart, which an eager hook at
+    # creation time cannot.
+    warm_patches(workspace, project_id, point_id, [(p["frame"], p["x"], p["y"]) for p in patches])
     return {
         "point_id": point_id,
         "tracker": point.tracker,
@@ -591,6 +608,121 @@ def clear_patch_cache() -> None:
         _PATCH_CACHE.clear()
 
 
+# -- warming the cache (todo 3, sixth round) -----------------------------------
+#
+# The cache above answers "has this patch been rendered before?", and until now
+# the only thing that ever filled it was the first request for a patch — the slow
+# one. That is what "patches are slow to load, they seem to come from the video
+# file" describes: the panel that judges texture asks for ``source="original"``,
+# which is a random-access seek into the full-resolution clip per keyframe, so
+# opening a card with eight of them is eight seeks queued behind the decoder's
+# single lock, on every fresh server.
+#
+# So the patch is rendered when the keyframe is *made* (and, for the anchors that
+# pre-date this and for every restart, when the grid that will show them is
+# listed). One worker, because the cost being avoided is contention for the
+# decoder — several warmers would recreate exactly the pile-up they exist to
+# prevent — and a de-duplicating set, because listing a grid twice in a row must
+# not queue it twice.
+
+_WARM_WORKERS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="patch-warm")
+_WARM_PENDING: set[tuple[Any, ...]] = set()
+_WARM_LOCK = threading.Lock()
+
+_WARM_QUEUE_LIMIT = 64
+"""How many patches may be waiting to be warmed at once.
+
+A bound rather than a budget: warming is a head start, and a backlog of them is
+a head start on frames nobody is looking at any more. It also keeps process
+shutdown prompt — the executor is joined at exit, so an unbounded queue would be
+an unbounded wait to quit. Anything turned away here is simply rendered on
+demand, exactly as it was before this existed."""
+
+
+def _warm_patch(
+    workspace: Workspace,
+    project_id: str,
+    key: tuple[Any, ...],
+    frame: int,
+    position: tuple[float, float],
+    radius: int,
+    source: str,
+) -> None:
+    """Render one patch into the cache, or give up quietly.
+
+    Everything about *where* the patch is has already been decided by the caller
+    and is passed in. That is not tidiness: this runs on a background thread
+    while request threads are writing the project file, and on Windows a reader
+    holding it open makes the writer's atomic ``os.replace`` fail outright. A
+    warmer that can break the save it was triggered by is worse than no warmer,
+    so this one never opens the project.
+    """
+    try:
+        if _cache_get(key) is not None:
+            return
+        patch = _render_patch(workspace, project_id, frame, position, radius, source)
+        if patch is not None:
+            _cache_put(key, _encode_png(patch))
+    except Exception:  # noqa: BLE001 - a warm cache is an optimisation, never a failure
+        return
+    finally:
+        with _WARM_LOCK:
+            _WARM_PENDING.discard(key)
+
+
+def warm_patches(
+    workspace: Workspace,
+    project_id: str,
+    point_id: str,
+    positions: Iterable[tuple[int, float, float]],
+) -> None:
+    """Render the given keyframes' patches in the background, if it is worth it.
+
+    Args:
+        positions: ``(frame, x, y)`` per patch, in source pixels — resolved by
+            the caller, which already has them, so the background work is
+            nothing but "read pixels, encode, store".
+
+    Skipped entirely for a tracker with no local window: it matches whole frames,
+    the UI draws no patch for it (todo 5, sixth round), and rendering images
+    nothing will show is the opposite of the point.
+    """
+    try:
+        project = workspace.load_project(project_id)
+        stored = point_options(workspace.project_dir(project_id), point_id)
+        radius, source_attribute = tracker_window(project.point(point_id).tracker, stored)
+    except StableError:
+        return
+    if source_attribute is None:
+        return
+    stale = _stale_key(workspace, project_id, point_id)
+    for frame, x, y in positions:
+        for source in PATCH_SOURCES:
+            key = (project_id, point_id, int(frame), radius, source, stale)
+            with _WARM_LOCK:
+                if key in _WARM_PENDING or len(_WARM_PENDING) >= _WARM_QUEUE_LIMIT:
+                    continue
+                _WARM_PENDING.add(key)
+            _WARM_WORKERS.submit(
+                _warm_patch, workspace, project_id, key, int(frame), (x, y), radius, source
+            )
+
+
+def drain_patch_warmup(timeout: float = 30.0) -> bool:
+    """Wait until nothing is queued for warming. For tests, which cannot guess.
+
+    Returns:
+        Whether the queue emptied within ``timeout`` seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with _WARM_LOCK:
+            if not _WARM_PENDING:
+                return True
+        time.sleep(0.01)
+    return False
+
+
 def _stale_key(workspace: Workspace, project_id: str, point_id: str) -> tuple[float, float]:
     """Return a key that changes whenever a point's patches could have changed.
 
@@ -669,19 +801,7 @@ def get_point_patch_image(
             raise HTTPException(
                 status_code=404, detail=f"point {point_id!r} has no position on frame {frame}"
             )
-        patch = None
-        if source == "proxy":
-            try:
-                store = workspace.get_proxy_store(project_id, "half")
-            except StableError:
-                store = None
-            if store is not None:
-                patch = proxy_patch(store, frame, found[0], size)
-        if patch is None:
-            # Either the caller asked for source pixels, or the proxy could not
-            # supply them (not generated yet, or the scaled patch fell off the
-            # edge). The source is always able to answer.
-            patch = template_patch(workspace.get_video_source(project_id), frame, found[0], size)
+        patch = _render_patch(workspace, project_id, frame, found[0], size, source)
         if patch is None:
             raise HTTPException(
                 status_code=400,
@@ -691,6 +811,35 @@ def get_point_patch_image(
         _cache_put(key, payload)
 
     return Response(content=payload, media_type="image/png", headers=headers)
+
+
+def _render_patch(
+    workspace: Workspace,
+    project_id: str,
+    frame: int,
+    position: tuple[float, float],
+    size: int,
+    source: str,
+) -> Any:
+    """Cut one patch out of the pixels, or return ``None`` if it falls off the frame.
+
+    Shared by the route above and the background warmer, so a warmed patch and a
+    requested one are byte-identical — a warmer that rendered anything different
+    would be a cache that serves the wrong picture.
+    """
+    if source == "proxy":
+        try:
+            store = workspace.get_proxy_store(project_id, "half")
+        except StableError:
+            store = None
+        if store is not None:
+            patch = proxy_patch(store, frame, position, size)
+            if patch is not None:
+                return patch
+    # Either the caller asked for source pixels, or the proxy could not supply
+    # them (not generated yet, or the scaled patch fell off the edge). The
+    # source is always able to answer.
+    return template_patch(workspace.get_video_source(project_id), frame, position, size)
 
 
 def _encode_png(patch: Any) -> bytes:

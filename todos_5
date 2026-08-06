@@ -1,0 +1,25 @@
+Add checkbox on the playback timeline to play only between in/out markers
+
+When a patch/keyframe is made it should be cached on the server, it appears that we're loading patches on the fly from the video file as they are slow to load. This may have already been resolved with performance improvements, check and verify.
+
+For algos that don't use patches we don't need to show the patch/keyframe image in the side panel.
+
+The Edit tab doesn't really serve a purpose right now. Points can be moved and deleted directly on the canvas. Hide the edit tab and move the functionality to the canvas. The edit tab can be reintroduced later if we add more editing features that require a dedicated panel. This also means allowing patches to be moved and deleted directly on the canvas and track cards in the sidepanel.
+And moving the setting to blend/hard move points when editing to the toolbar.
+
+In the new export side-by-side view, show the target points on the right output canvas too. They should be in sync with the left canvas. The target points should also be editable in the right (output) view canvas so the user can be really specific about where they want the points to be in the final output. The 'show thirds' option should also apply to the right (output) canvas too.
+
+When scrolling the timeline reasonably quickly, but not unreasonably fast, when in the export view, the interface goes blank and we get the error in dev tools 
+react-dom.production.min.js:188 InvalidStateError: Failed to execute 'drawImage' on 'CanvasRenderingContext2D': The image source is detached
+    at Av.p.useEffect.B (Viewer.tsx:314:11)
+    at qs (react-dom.production.min.js:243:332)
+    at Sr (react-dom.production.min.js:285:111)
+    at react-dom.production.min.js:281:391
+    at z (scheduler.production.min.js:13:203)
+    at MessagePort.W (scheduler.production.min.js:14:128)
+Li @ react-dom.production.min.js:188
+react-dom.production.min.js:127 Uncaught InvalidStateError: Failed to execute 'drawImage' on 'CanvasRenderingContext2D': The image source is detached
+    at Av.p.useEffect.B (Viewer.tsx:314:11)
+
+When the user adjusts the crop size in the export view, the preview doesn't get updated until the user releases the mouse button. It would be better if the preview updated in real-time as the user adjusts the crop size.
+

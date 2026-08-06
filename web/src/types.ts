@@ -201,6 +201,14 @@ export interface PointPatch {
   kind: "keyframe" | "tracked";
   /** False when the patch would fall off the edge of the frame at this size. */
   available: boolean;
+  /**
+   * Whether this keyframe is one of the point's own pins, and so deletable.
+   *
+   * The grid also shows keyframes that manual corrections were *promoted* to;
+   * those belong to a correction, not to the point, and are removed by deleting
+   * the correction on the Edit tab (todo 9, fourth round).
+   */
+  pinned: boolean;
 }
 
 /**
@@ -434,4 +442,22 @@ export interface SmoothedCurves {
 export interface SmoothingResponse {
   filters: SmoothingFilter[];
   curves: { raw: SolveCurves | null; smoothed: SmoothedCurves | null };
+}
+
+/**
+ * One point's path after the smoothing's stabilisation warp (todo 3).
+ *
+ * Where the feature ends up once the shot is stabilised — the residual motion
+ * the filters left behind. `null` on frames the point has no position for, the
+ * same convention `TrackData` uses.
+ */
+export interface SmoothedTrack {
+  point_id: string;
+  x: (number | null)[];
+  y: (number | null)[];
+}
+
+export interface SmoothedTracksResponse {
+  n_frames: number;
+  points: SmoothedTrack[];
 }

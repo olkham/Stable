@@ -17,11 +17,38 @@ import type {
   HistoryStatus,
   JobEvent,
   ProjectDetail,
+  SmoothedTrack,
+  SmoothingFilter,
+  SmoothingResponse,
   TrackData,
   TrackerInfo,
 } from "../types";
 
-export type PlacingMode = "none" | "new-point" | "add-anchor";
+/**
+ * What a left-click on the frame means (todo 4, fourth round).
+ *
+ * This was `PlacingMode` — `none | new-point | add-anchor` — which was already
+ * a tool palette, just without a palette: the two placing modes were reachable
+ * only from buttons inside the Tracks panel, and "none" silently meant three
+ * different things depending on what was selected and where the pointer was.
+ * Naming all five makes the canvas able to say which one is in force, in the
+ * toolbar and in the cursor.
+ *
+ * `move`
+ *     Select a track by clicking it, and drag (or click) the selected one to
+ *     correct it. The everyday tool, and the default.
+ * `add-point`
+ *     The next click starts a new track there.
+ * `add-anchor`
+ *     The next click pins the selected track at that position on this frame.
+ * `delete`
+ *     Click an anchor pin to remove it, or a track's marker to remove the whole
+ *     track (confirmed, since that one is not an undoable correction).
+ * `pan`
+ *     Left-drag pans the view. Middle-drag does this in every tool; the tool
+ *     exists for trackpads and tablets with no middle button.
+ */
+export type Tool = "move" | "add-point" | "add-anchor" | "delete" | "pan";
 
 /**
  * Which overlay elements are drawn for a track.
@@ -35,6 +62,8 @@ export type PlacingMode = "none" | "new-point" | "add-anchor";
 export interface Overlays {
   /** The trail through the whole clip. */
   paths: boolean;
+  /** The same trail after the smoothing's stabilisation warp (todo 3). */
+  smoothed: boolean;
   /** Where the point is on this frame — independent of the trail. */
   markers: boolean;
   /** Anchor keyframe pins. */
@@ -47,6 +76,7 @@ export interface Overlays {
 
 export const ALL_OVERLAYS: Overlays = {
   paths: true,
+  smoothed: true,
   markers: true,
   anchors: true,
   ghost: true,
@@ -56,6 +86,7 @@ export const ALL_OVERLAYS: Overlays = {
 /** Every overlay off — what "hide this track" resolves to. */
 export const NO_OVERLAYS: Overlays = {
   paths: false,
+  smoothed: false,
   markers: false,
   anchors: false,
   ghost: false,
@@ -102,6 +133,8 @@ interface ProjectContextValue {
 
   jobs: Record<string, JobEvent>;
   latestJobFor: (kind: string, target?: string | null) => JobEvent | undefined;
+  /** Drop a job that has not started yet — the export queue's cancel (todo 8). */
+  cancelJob: (jobId: string) => Promise<void>;
   /** In-flight track/retrack runs, by point id — their live cursor and partial path. */
   liveTracking: Record<string, LiveTracking>;
 
@@ -112,6 +145,17 @@ interface ProjectContextValue {
   /** Playback speed as a multiple of the clip's own frame rate (todo 3). */
   playbackRate: number;
   setPlaybackRate: (rate: number) => void;
+  /**
+   * Whether Play stays inside the In/Out markers (todo 1, sixth round).
+   *
+   * Tracking and the export have honoured the range since it existed; playback
+   * was the last thing that did not, so reviewing the section you are actually
+   * working on meant watching the whole clip go past it. Lives here rather than
+   * in the timeline because the range does, and because the two have to agree
+   * about what "inside" means — `out` is exclusive.
+   */
+  playRangeOnly: boolean;
+  setPlayRangeOnly: (on: boolean) => void;
 
   // -- the working range: In/Out markers (todo 1) --
   /** What tracking and export are limited to, or null before it has loaded. */
@@ -141,8 +185,9 @@ interface ProjectContextValue {
   selectedPointId: string | null;
   setSelectedPointId: (id: string | null) => void;
 
-  placingMode: PlacingMode;
-  setPlacingMode: (mode: PlacingMode) => void;
+  /** What a left-click on the frame does; see :type:`Tool`. */
+  tool: Tool;
+  setTool: (tool: Tool) => void;
   /**
    * Pin a point where it already is on the current frame (the `A` shortcut and
    * the panel's "+ anchor" both go through this).
@@ -185,6 +230,30 @@ interface ProjectContextValue {
   tracks: Record<string, TrackData>;
   loadTrack: (pointId: string) => Promise<void>;
   invalidateTrack: (pointId: string) => void;
+
+  // -- smoothing, shared by every view of it (todo 2, fourth round) --
+  //
+  // The smoothing panel and the curve editor used to hold a copy each, fetched
+  // separately and refreshed on different triggers, so changing a filter in one
+  // left the other showing the previous answer until it remounted — "the curves
+  // view doesn't get updates until the user closes and reopens it". One copy,
+  // written through one function, makes that impossible to reintroduce.
+  /** The filter list plus the raw and smoothed curves, or null before it loads. */
+  smoothing: SmoothingResponse | null;
+  smoothingError: string | null;
+  reloadSmoothing: () => Promise<void>;
+  /** Replace the whole filter list and adopt the curves the server computes. */
+  commitSmoothing: (filters: SmoothingFilter[]) => Promise<void>;
+  /** Bumped whenever the smoothed curves change — what re-reads derive from. */
+  smoothingRevision: number;
+  /**
+   * Each point's track after the smoothing's stabilisation warp (todo 3).
+   *
+   * Where the feature ends up once the shot is stabilised, which is the only
+   * per-point thing the smoothing actually produces — the filters themselves
+   * act on four camera curves, not on any one track.
+   */
+  smoothedTracks: Record<string, SmoothedTrack>;
 
   // -- manual editing (Phase 5) --
   //
@@ -236,6 +305,7 @@ export function ProjectProvider({
   const [currentFrame, setCurrentFrameState] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [playRangeOnly, setPlayRangeOnly] = useState(false);
   const [clipRange, setClipRange] = useState<ClipRangeInfo | null>(null);
   const [followTracker, setFollowTracker] = useState(true);
   // Set by the follow-the-tracker effect so the setter below can tell its own
@@ -253,7 +323,7 @@ export function ProjectProvider({
     setCurrentFrameState(frame);
   }, []);
   const [selectedPointId, setSelectedPointId] = useState<string | null>(null);
-  const [placingMode, setPlacingMode] = useState<PlacingMode>("none");
+  const [tool, setTool] = useState<Tool>("move");
   const [stabilizedPreview, setStabilizedPreview] = useState(false);
   const [overlays, setOverlays] = useState<Overlays>(ALL_OVERLAYS);
   const [overlaysEnabled, setOverlaysEnabled] = useState(true);
@@ -267,6 +337,10 @@ export function ProjectProvider({
   const [history, setHistory] = useState<HistoryStatus>(EMPTY_HISTORY);
   const [editError, setEditError] = useState<string | null>(null);
   const [editRevision, setEditRevision] = useState(0);
+  const [smoothing, setSmoothing] = useState<SmoothingResponse | null>(null);
+  const [smoothingError, setSmoothingError] = useState<string | null>(null);
+  const [smoothingRevision, setSmoothingRevision] = useState(0);
+  const [smoothedTracks, setSmoothedTracks] = useState<Record<string, SmoothedTrack>>({});
 
   const jobs = useJobsSocket(projectId);
   const liveTracking = useLiveTracking(jobs);
@@ -378,6 +452,63 @@ export function ProjectProvider({
 
   const undo = useCallback(() => step("undo"), [step]);
   const redo = useCallback(() => step("redo"), [step]);
+
+  // -- smoothing (todo 2, fourth round) -----------------------------------------
+
+  const adoptSmoothing = useCallback((response: SmoothingResponse) => {
+    setSmoothing(response);
+    setSmoothingError(null);
+    setSmoothingRevision((n) => n + 1);
+  }, []);
+
+  const reloadSmoothing = useCallback(async () => {
+    try {
+      adoptSmoothing(await api.getSmoothing(projectId));
+    } catch (err) {
+      setSmoothingError(err instanceof Error ? err.message : String(err));
+    }
+  }, [projectId, adoptSmoothing]);
+
+  const commitSmoothing = useCallback(
+    async (filters: SmoothingFilter[]) => {
+      try {
+        adoptSmoothing(await api.updateSmoothing(projectId, filters));
+      } catch (err) {
+        setSmoothingError(err instanceof Error ? err.message : String(err));
+        // A rejected filter list leaves the server holding the previous one, so
+        // re-read rather than leaving the panels showing an edit that did not land.
+        await reloadSmoothing();
+      }
+    },
+    [projectId, adoptSmoothing, reloadSmoothing],
+  );
+
+  // A track edit changes the raw solve's inputs, so the curves are stale too.
+  useEffect(() => {
+    void reloadSmoothing();
+  }, [reloadSmoothing, editRevision]);
+
+  // Where each point ends up once the shot is stabilised (todo 3). Re-read
+  // whenever the smoothing changes, because that is the only thing that moves it.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getSmoothedTracks(projectId)
+      .then((response) => {
+        if (cancelled) return;
+        setSmoothedTracks(
+          Object.fromEntries(response.points.map((track) => [track.point_id, track])),
+        );
+      })
+      .catch(() => {
+        // Not solved (or not smoothed) yet: there is no stabilised path to draw,
+        // which is a state, not an error.
+        if (!cancelled) setSmoothedTracks({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, smoothingRevision]);
 
   // -- the working range (todo 1) ---------------------------------------------
 
@@ -578,17 +709,34 @@ export function ProjectProvider({
         // uses. Pressing it again disarms, so the key is never a trap.
         if (!selectedPointId) return;
         event.preventDefault();
-        if (placingMode === "add-anchor") {
-          setPlacingMode("none");
+        if (tool === "add-anchor") {
+          setTool("move");
           return;
         }
         if (event.shiftKey) {
-          setPlacingMode("add-anchor");
+          setTool("add-anchor");
           return;
         }
         void addAnchorHere(selectedPointId).then((done) => {
-          if (!done) setPlacingMode("add-anchor");
+          if (!done) setTool("add-anchor");
         });
+      } else if (event.key === "v" || event.key === "V") {
+        // The tool palette's shortcuts (todo 4). `A` is above, because pinning
+        // where the point already is does not need the tool at all.
+        event.preventDefault();
+        setTool("move");
+      } else if (event.key === "n" || event.key === "N") {
+        event.preventDefault();
+        setTool("add-point");
+      } else if (event.key === "d" || event.key === "D") {
+        event.preventDefault();
+        setTool("delete");
+      } else if (event.key === "h" || event.key === "H") {
+        event.preventDefault();
+        setTool("pan");
+      } else if (event.key === "Escape") {
+        // Always a way back to the harmless tool, from anywhere.
+        setTool("move");
       } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         if (!selectedPointId) return;
         const point = project.points.find((p) => p.id === selectedPointId);
@@ -614,7 +762,7 @@ export function ProjectProvider({
     currentFrame,
     selectedPointId,
     tracks,
-    placingMode,
+    tool,
     addAnchorHere,
     setRangeMarker,
     goToMarker,
@@ -637,11 +785,30 @@ export function ProjectProvider({
         api.getHistory(projectId).then(setHistory).catch(() => undefined);
         setEditRevision((n) => n + 1);
       }
+      if (job.kind === "solve") {
+        // A new solve is new raw curves, so every view of them is stale — and
+        // the smoothed ones were recomputed server-side by the same job.
+        void reloadSmoothing();
+      }
       if (["track", "retrack", "proxy", "solve"].includes(job.kind)) {
         refresh().catch(() => undefined);
       }
     }
-  }, [jobs, invalidateTrack, loadTrack, refresh, projectId]);
+  }, [jobs, invalidateTrack, loadTrack, refresh, reloadSmoothing, projectId]);
+
+  const cancelJob = useCallback(
+    async (jobId: string) => {
+      setEditError(null);
+      try {
+        await api.cancelJob(projectId, jobId);
+      } catch (err) {
+        // Most often "it already started", which is a fact about the queue
+        // rather than a failure of the click.
+        setEditError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [projectId],
+  );
 
   const latestJobFor = useCallback(
     (kind: string, target?: string | null) => {
@@ -664,6 +831,7 @@ export function ProjectProvider({
       trackers,
       jobs,
       latestJobFor,
+      cancelJob,
       liveTracking,
       currentFrame,
       setCurrentFrame,
@@ -671,6 +839,8 @@ export function ProjectProvider({
       setIsPlaying,
       playbackRate,
       setPlaybackRate,
+      playRangeOnly,
+      setPlayRangeOnly,
       clipRange,
       setRangeMarker,
       clearRange,
@@ -679,8 +849,8 @@ export function ProjectProvider({
       setFollowTracker,
       selectedPointId,
       setSelectedPointId,
-      placingMode,
-      setPlacingMode,
+      tool,
+      setTool,
       addAnchorHere,
       addAnchorAt,
       stabilizedPreview,
@@ -697,6 +867,12 @@ export function ProjectProvider({
       tracks,
       loadTrack,
       invalidateTrack,
+      smoothing,
+      smoothingError,
+      reloadSmoothing,
+      commitSmoothing,
+      smoothingRevision,
+      smoothedTracks,
       dragMode,
       setDragMode,
       falloff,
@@ -716,18 +892,20 @@ export function ProjectProvider({
     trackers,
     jobs,
     latestJobFor,
+    cancelJob,
     liveTracking,
     currentFrame,
     setCurrentFrame,
     isPlaying,
     playbackRate,
+    playRangeOnly,
     clipRange,
     setRangeMarker,
     clearRange,
     goToMarker,
     followTracker,
     selectedPointId,
-    placingMode,
+    tool,
     addAnchorHere,
     addAnchorAt,
     stabilizedPreview,
@@ -740,6 +918,12 @@ export function ProjectProvider({
     tracks,
     loadTrack,
     invalidateTrack,
+    smoothing,
+    smoothingError,
+    reloadSmoothing,
+    commitSmoothing,
+    smoothingRevision,
+    smoothedTracks,
     dragMode,
     falloff,
     history,

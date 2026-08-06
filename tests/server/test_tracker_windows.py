@@ -233,6 +233,14 @@ def test_a_deep_trackers_point_offers_no_window_control(client, project):
     assert body["radius_source"] is None
     assert body["search"]["radius"] is None
 
+    # The same "there is no window here" on the point summary, which is what the
+    # all-points patch strip filters on (todo 5, sixth round): a tracker with no
+    # region to match has no patch to show, so neither the strip nor the card's
+    # grid draws one for it. Two views of one fact, and only one place it is
+    # decided.
+    listed = client.get(f"/api/projects/{project_id}/points").json()
+    assert next(p for p in listed if p["id"] == point_id)["window"]["attribute"] is None
+
 
 @pytest.mark.parametrize("tracker", ["cotracker3", "tapir", "raft", "klt"])
 def test_switching_to_another_tracker_does_not_carry_a_setting_it_cannot_take(

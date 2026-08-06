@@ -340,6 +340,38 @@ class JobManager:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def cancel(self, job_id: str) -> Job:
+        """Drop a job that has not started yet.
+
+        Only a *queued* job can be cancelled. Interrupting a running one would
+        mean abandoning an encode part-way through its file or a tracking run
+        part-way through its merge, and there is no safe point to do that at —
+        so this refuses rather than pretending. The queue entry stays in the
+        list, marked ``cancelled``, because "I cancelled that" is something the
+        operator should still be able to see (todo 8, fourth round).
+
+        Args:
+            job_id: The job to drop.
+
+        Returns:
+            The job, now ``cancelled``.
+
+        Raises:
+            KeyError: If no such job is tracked.
+            RuntimeError: If the job is already running or finished.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status != "queued":
+                raise RuntimeError(f"job {job_id} is already {job.status}")
+            job.status = "cancelled"
+            job.message = "cancelled before it started"
+            job.updated_at = time.time()
+            self._fns.pop(job_id, None)
+            return job
+
     def jobs_for_project(self, project_id: str) -> list[Job]:
         """Return every tracked job for a project, oldest first."""
         with self._lock:
@@ -365,33 +397,47 @@ class JobManager:
             with self._lock:
                 job = self._jobs.get(job_id)
                 fn = self._fns.get(job_id)
-            if job is None or fn is None:  # pragma: no cover - evicted before running
+            # `fn` is dropped by both eviction and `cancel`, which is what makes
+            # a cancelled job a no-op here rather than a special case.
+            if job is None or fn is None or job.status != "queued":
                 continue
             self._run_job(job, fn)
 
     def _run_job(self, job: Job, fn: JobFn) -> None:
         """Execute one job, recording its outcome and never letting it kill the worker."""
         if job.exclusive:
+            # Waiting for the slot happens *before* the job is claimed, so an
+            # export sitting behind three others still reads as "queued" — and
+            # is still cancellable, which is the whole point of a queue.
             self._enter_exclusive(job.kind)
-        job.status = "running"
-        job.updated_at = time.time()
-        progress = JobProgress(job)
         try:
-            with watching_frames(_FrameCursor(progress)):
-                result = fn(progress)
-            job.status = "done"
-            job.fraction = 1.0
-            job.result = result
-        except Exception as exc:  # noqa: BLE001 - a job's failure must not kill the worker
-            logger.warning("job %s (%s) failed: %s", job.id, job.kind, exc)
-            logger.debug("job %s traceback:\n%s", job.id, traceback.format_exc())
-            job.status = "error"
-            job.error = str(exc)
-        finally:
-            job.partial = None
-            job.updated_at = time.time()
+            # Claim it, atomically against `cancel`. Between being taken off the
+            # queue and reaching here the job may have been cancelled; whichever
+            # of the two takes the lock first wins, and the other sees it.
             with self._lock:
-                self._fns.pop(job.id, None)
+                if job.status != "queued":
+                    return
+                job.status = "running"
+                job.updated_at = time.time()
+
+            progress = JobProgress(job)
+            try:
+                with watching_frames(_FrameCursor(progress)):
+                    result = fn(progress)
+                job.status = "done"
+                job.fraction = 1.0
+                job.result = result
+            except Exception as exc:  # noqa: BLE001 - a failure must not kill the worker
+                logger.warning("job %s (%s) failed: %s", job.id, job.kind, exc)
+                logger.debug("job %s traceback:\n%s", job.id, traceback.format_exc())
+                job.status = "error"
+                job.error = str(exc)
+            finally:
+                job.partial = None
+                job.updated_at = time.time()
+                with self._lock:
+                    self._fns.pop(job.id, None)
+        finally:
             if job.exclusive:
                 self._leave_exclusive(job.kind)
 

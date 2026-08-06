@@ -15,6 +15,7 @@ import type {
   ProjectDetail,
   ProjectMeta,
   RenderSettings,
+  SmoothedTracksResponse,
   SmoothingFilter,
   SmoothingResponse,
   PointPatches,
@@ -136,6 +137,16 @@ export const listJobs = (projectId: string): Promise<JobEvent[]> =>
 export const getJob = (projectId: string, jobId: string): Promise<JobEvent> =>
   request(`/api/projects/${projectId}/jobs/${jobId}`);
 
+/**
+ * Drop a job that has not started yet.
+ *
+ * Only a queued one: work already running cannot be interrupted safely — an
+ * encode half-way through a file is worse than one that finishes — so the
+ * server answers 409 for it rather than pretending (todo 8, fourth round).
+ */
+export const cancelJob = (projectId: string, jobId: string): Promise<JobEvent> =>
+  postJson(`/api/projects/${projectId}/jobs/${jobId}/cancel`);
+
 // -- points -----------------------------------------------------------------
 
 export const listPoints = (projectId: string): Promise<PointSummary[]> =>
@@ -213,19 +224,26 @@ export const updatePointPatches = (
  * URL of the patch at one frame — a keyframe's, or wherever the tracker put it.
  *
  * `radius` previews a size that has not been saved yet, so dragging the slider
- * updates the grid live. `rev` busts the browser cache: the pixels change when
- * an edit moves the track, and that alone would not change the URL.
+ * updates the grid live.
+ *
+ * `rev` busts the browser cache, because the pixels change when an edit moves
+ * the track and that alone would not change the URL. Pass the *narrowest* thing
+ * that identifies those pixels — the patch's own position, not a project-wide
+ * edit counter. A counter re-fetches every thumbnail in the grid on every edit
+ * anywhere, and at `source=original` each one is a full-resolution seek deep
+ * into the clip; one correction cost twenty of them, which is most of why
+ * editing a point felt slow (todo 2, fifth round).
  */
 export function pointPatchUrl(
   projectId: string,
   pointId: string,
   frame: number,
   radius?: number,
-  rev?: number,
+  rev?: number | string,
   source?: "proxy" | "original",
 ): string {
   const size = radius === undefined ? "" : `&radius=${radius}`;
-  const revision = rev === undefined ? "" : `&rev=${rev}`;
+  const revision = rev === undefined ? "" : `&rev=${encodeURIComponent(String(rev))}`;
   // The server defaults to the proxy tier, which is what a 48px strip thumbnail
   // wants: a JPEG read instead of a full-resolution seek that would queue behind
   // the decoder while scrubbing. `original` is for judging texture.
@@ -330,6 +348,16 @@ export const updateSmoothing = (
   projectId: string,
   filters: SmoothingFilter[],
 ): Promise<SmoothingResponse> => putJson(`/api/projects/${projectId}/smoothing`, { filters });
+
+/**
+ * Every tracked point's path after the smoothing's stabilisation warp — where
+ * each feature ends up once the shot is stabilised (todo 3, fourth round).
+ *
+ * 409 before there is a solve and a smoothing to warp with, which callers read
+ * as "nothing to draw yet" rather than as a failure.
+ */
+export const getSmoothedTracks = (projectId: string): Promise<SmoothedTracksResponse> =>
+  request(`/api/projects/${projectId}/smoothing/tracks`);
 
 export const updateRenderSettings = (
   projectId: string,

@@ -51,6 +51,8 @@ export function Timeline() {
     setIsPlaying,
     playbackRate,
     setPlaybackRate,
+    playRangeOnly,
+    setPlayRangeOnly,
     clipRange,
     setRangeMarker,
     clearRange,
@@ -97,11 +99,24 @@ export function Timeline() {
   // decides how many frames to advance, dropping frames rather than drifting.
   // The current frame is read from a ref so the loop is not rebuilt on every
   // advance.
+  //
+  // What it plays is the In/Out range when the operator asks for that (todo 1,
+  // sixth round) and the whole clip otherwise. `out` is exclusive everywhere in
+  // this app — the strip dims from it, tracking and the export stop before it —
+  // so the last frame played is `out - 1`, and reaching it stops and returns to
+  // `in`, which is exactly what reaching the end of the clip already does.
   const frameRef = useRef(currentFrame);
   frameRef.current = currentFrame;
+  const playFrom = playRangeOnly && ranged ? ranged.in : 0;
+  const playTo = playRangeOnly && ranged ? ranged.out : project.video.frames;
   useEffect(() => {
     if (!isPlaying) return;
     const fps = Math.max(1, (project.video.fps || 24) * playbackRate);
+    // Starting outside the range is "play it from the top", not "play nothing".
+    if (frameRef.current < playFrom || frameRef.current >= playTo) {
+      frameRef.current = playFrom;
+      setCurrentFrame(playFrom);
+    }
     let raf = 0;
     let last = performance.now();
     let carry = 0;
@@ -111,9 +126,9 @@ export function Timeline() {
       last = now;
       if (advance > 0) {
         const next = frameRef.current + advance;
-        if (next >= project.video.frames) {
+        if (next >= playTo) {
           setIsPlaying(false);
-          setCurrentFrame(0);
+          setCurrentFrame(playFrom);
           return;
         }
         setCurrentFrame(next);
@@ -123,7 +138,7 @@ export function Timeline() {
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, project.video.fps, project.video.frames, playbackRate]);
+  }, [isPlaying, project.video.fps, playbackRate, playFrom, playTo]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -320,6 +335,26 @@ export function Timeline() {
               reset
             </button>
           )}
+          {/* Play the range rather than the clip (todo 1, sixth round). Offered
+              whatever the range is, and disabled when there is none, so it is
+              discoverable before the markers are set rather than appearing out
+              of nowhere once they are. */}
+          <label
+            className="channel-check"
+            title={
+              ranged
+                ? "Play only the frames between the In and Out markers. Play stops at the out point and returns to the in point."
+                : "Set In and Out markers first — with no range there is nothing to limit playback to."
+            }
+          >
+            <input
+              type="checkbox"
+              checked={playRangeOnly}
+              disabled={!ranged}
+              onChange={(e) => setPlayRangeOnly(e.target.checked)}
+            />
+            play range
+          </label>
         </span>
       </div>
       <div

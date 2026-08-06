@@ -31,17 +31,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
 
-from ...core.errors import ProjectError, RenderError, StableError
+from ...core.errors import RenderError, StableError
 from ...core.project import Project
 from ...core.trackdata import AE_FORMAT, after_effects_keyframes
 from ...render.stabilize import render_stabilized
 from ...video.encode import AudioPlan, plan_audio
 from .. import motion as motion_glue
 from ..clip_range import effective_range
+from ..frames import frame_geometry
 from ..jobs import JobManager, get_job_manager
 from ..schemas import ExportVideoRequest
 from ..storage import Workspace, get_workspace
@@ -247,16 +247,25 @@ def export_video_route(
     body: ExportVideoRequest,
     workspace: Workspace = Depends(_workspace),
     jobs: JobManager = Depends(_jobs),
-) -> dict[str, str]:
-    """Submit a background job that renders the stabilized MP4.
+) -> dict[str, Any]:
+    """Queue a background job that renders the stabilized MP4.
 
     The whole render is planned before a pixel is read (see
     :class:`stable.render.StabilizationPlan`), because the minimal auto-zoom is
     only knowable once every frame's warp is — then frames are streamed to the
-    encoder one at a time, so clip length is bounded by disk, not memory. It is
-    planned *here*, at submit time, rather than only inside the job: planning is
-    the cheap part (no pixels), and it is what tells us whether the render is
-    worth running at all.
+    encoder one at a time, so clip length is bounded by disk, not memory.
+
+    Everything the render depends on is captured **here, at submit time**: the
+    plan, the frame range and the encode settings (todo 8, fourth round). It
+    used to be re-read inside the worker, which is fine for one export and a lie
+    for a queue — line up "this crop" and then "that crop" and both would render
+    whichever was last saved. What you queued is what gets rendered, and the
+    O(T) plan built for the checks below is the one that runs, not a second copy
+    of it.
+
+    The job is ``exclusive``, so several exports wait for each other rather than
+    running at once: two FFmpeg encodes fight over the same cores to nobody's
+    benefit, and a queue that all starts together is not a queue.
 
     Raises:
         HTTPException: 400 if the project has not been solved, if its border
@@ -280,24 +289,19 @@ def export_video_route(
         )
     options = solve_routes.load_options(workspace, project_id)
     try:
-        planned = motion_glue.build_plan(project, motion, options=options)
+        plan = motion_glue.build_plan(project, motion, options=options)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if planned.is_no_op:
+    if plan.is_no_op:
         raise HTTPException(status_code=400, detail=NO_OP_DETAIL)
     filename = unique_render_name(workspace.renders_dir(project_id), body.filename)
+    codec, crf = body.codec, body.crf
+    clip = workspace.get_video_source(project_id)
+    render_range = _render_range(workspace, project_id, min(plan.n_frames, clip.frame_count))
 
     def _run(progress: Any) -> dict[str, Any]:
         proj = workspace.load_project(project_id)
         video = workspace.get_video_source(project_id)
-        smoothed = solve_routes.load_smoothed(workspace, project_id, proj)
-        if smoothed is None:  # pragma: no cover - re-checked at submit
-            raise ProjectError("solve/smoothing cache missing")
-
-        plan = motion_glue.build_plan(
-            proj, smoothed, options=solve_routes.load_options(workspace, project_id)
-        )
-        render_range = _render_range(workspace, project_id, min(plan.n_frames, video.frame_count))
         out_dir = workspace.renders_dir(project_id)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / filename
@@ -310,13 +314,13 @@ def export_video_route(
             video,
             plan,
             out_path,
-            codec=body.codec,
-            crf=body.crf,
+            codec=codec,
+            crf=crf,
             audio_source=source_clip,
-            # The In/Out markers, or the whole clip when none are set (todo
-            # 1). The plan still covers every frame — the warp for frame N is
-            # the warp for frame N whatever is written out — so this narrows the
-            # *render*, not the stabilisation.
+            # The In/Out markers as they were when this was queued, or the whole
+            # clip when none were set (todo 1). The plan still covers every
+            # frame — the warp for frame N is the warp for frame N whatever is
+            # written out — so this narrows the *render*, not the stabilisation.
             frame_range=render_range,
             progress=progress,
         )
@@ -339,10 +343,10 @@ def export_video_route(
         }
 
     try:
-        job = jobs.submit(project_id, "export", _run)
+        job = jobs.submit(project_id, "export", _run, target=filename, exclusive=True)
     except RenderError as exc:  # pragma: no cover - planning happens inside the job
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"job_id": job.id}
+    return {"job_id": job.id, "filename": filename}
 
 
 def plan_target(options: Any) -> str:
@@ -391,6 +395,23 @@ def export_preview(
     *planned* rather than rendered — no pixels are touched, so this is cheap
     enough to re-ask on every drag of a target.
 
+    "Cheap" is only true because the plan is memoised. A plan is an O(T) fit
+    over the whole clip (the minimal auto-zoom cannot be known otherwise), and
+    this route used to build one per request while the export screen asked for
+    one per frame of a drag; it now goes through
+    :func:`stable.server.routes.solve.preview_plan`, which exists for exactly
+    that and re-plans only when the caches or the options change.
+
+    The per-frame half of the answer — ``rect``, ``warp`` and ``targets`` — is
+    :func:`stable.server.frames.frame_geometry`, which is also what rides along
+    with the pixels on the frame WebSocket. That is deliberate: the socket
+    delivers a frame and the geometry drawn over it in **one message**, so they
+    cannot be a frame apart on the canvas, and this route cannot describe the
+    frame differently from the way the socket does.
+
+    Everything else here is a property of the whole clip, not of ``frame``, so a
+    client that is scrubbing has no reason to re-ask this at all.
+
     Returns:
         ``output``/``source`` sizes; ``rect``, the output rectangle mapped back
         into source pixels so the screen can draw it over the frame; the
@@ -412,46 +433,13 @@ def export_preview(
         )
     options = solve_routes.load_options(workspace, project_id)
     try:
-        plan = motion_glue.build_plan(project, motion, options=options)
+        plan = solve_routes.preview_plan(workspace, project_id, project, motion)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    total = len(plan.transforms)
-    index = max(0, min(int(frame), total - 1)) if total else 0
     geometry = plan.geometry
-    output_transform = plan.output_transform(index)
-    corners = [
-        [0.0, 0.0],
-        [float(geometry.width), 0.0],
-        [float(geometry.width), float(geometry.height)],
-        [0.0, float(geometry.height)],
-    ]
-    # Where the output rectangle sits *on the source frame*: the inverse of the
-    # transform that put the source there. This is what makes the preview an
-    # answer to "what will be kept?" rather than a picture of the same frame.
-    inverse = output_transform.inverse()
-    rect = [[float(x), float(y)] for x, y in inverse.apply(np.asarray(corners))]
-
-    # A mapped target's destination is stated in the space the stabilisation
-    # warp lands in — *before* the crop/zoom fit, which cannot be known until
-    # after the transforms exist. The screen draws and drags in source pixels,
-    # so it needs that warp itself; four numbers describe it exactly, and
-    # sending them beats the screen inferring it from the output rectangle
-    # (which carries the fit, and so would place every crosshair slightly off
-    # whenever the render crops).
-    warp = plan.transforms[index] if plan.transforms else output_transform
     return {
-        "frame": index,
-        "frames": total,
-        "source": {"width": plan.source_size[0], "height": plan.source_size[1]},
-        "output": {"width": geometry.width, "height": geometry.height},
-        "rect": rect,
-        "warp": {
-            "tx": float(warp.tx),
-            "ty": float(warp.ty),
-            "rotation": float(warp.rotation),
-            "scale": float(warp.scale),
-        },
+        **frame_geometry(project, plan, options, frame),
         "coverage": float(geometry.coverage),
         "crop_scale": float(geometry.crop_scale),
         "zoom": float(geometry.zoom),
@@ -461,10 +449,6 @@ def export_preview(
         "is_no_op": bool(plan.is_no_op),
         "no_op_detail": NO_OP_DETAIL if plan.is_no_op else None,
         "target": options.target.to_dict(),
-        # Two or more pairs is what turns a translation into a mapping that can
-        # rotate and scale; the screen says which the operator has asked for.
-        "uses_rotation_and_scale": bool(options.target.uses_rotation_and_scale),
-        "targets": motion_glue.target_residuals(project, plan, options.target, index),
     }
 
 

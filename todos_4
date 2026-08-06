@@ -1,0 +1,19 @@
+add a side-by-side view in the export panel. It will create a second canvas right of the main canvas. It will show what the exported video will look like after applying the current settings. Keep the main canvas on the left with the frame overlay exactly as we have now already. We just want the second canvas to show the actual output for the current frame.
+
+
+We also need to work on performance. Is there a better way to stream the video frames to the canvas than making many GETs e.g.
+INFO:     127.0.0.1:53070 - "GET /api/projects/2f4959553536/export/preview?frame=247 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58199 - "GET /api/projects/2f4959553536/export/preview?frame=244 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64031 - "GET /api/projects/2f4959553536/export/preview?frame=259 HTTP/1.1" 200 OK
+Could we consider using a WebSocket connection to stream the video frames to the canvas in real-time, rather than making multiple GET requests. This would reduce the overhead of establishing multiple connections and allow for smoother playback of the video preview? The absolute MUST, no-negotiation, is the frames must be in sync with the track data.
+
+when the track size is adjusted on the panel update it on the canvas
+
+cotracker3
+[W806 09:48:20.000000000 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 2720006144 bytes (free: 19275972608, total: 25769476096).
+[W806 09:48:20.000000000 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 2720006144 bytes (free: 19275972608, total: 25769476096).
+[W806 09:48:20.000000000 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 2720006144 bytes (free: 19275972608, total: 25769476096).
+[W806 09:48:20.000000000 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 2720006144 bytes (free: 19275972608, total: 25769476096).
+job dbd63eeeb904 (retrack) failed: [Errno 12] Cannot allocate memory
+
+

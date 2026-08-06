@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "../api/client";
 import { CHANNEL_COLOR, CHANNEL_LABEL } from "../colors";
 import { isActive, joinSpecs, splitSpecs, type SmoothingModel } from "../smoothing";
 import { useProjectContext } from "../state/ProjectContext";
-import type { Channel, FilterInfo, SmoothedCurves, SolveCurves } from "../types";
+import type { Channel, FilterInfo } from "../types";
 import { CHANNELS } from "../types";
 
 /**
@@ -17,15 +17,18 @@ import { CHANNELS } from "../types";
  *
  * The sub-range and pins a channel may also carry belong to the curve editor;
  * this panel preserves them untouched when it writes the filter list back.
+ *
+ * The filter list and the curves are the context's, not this panel's (todo 2,
+ * fourth round). They used to be local state fetched here and again in the
+ * curve editor, so a change made in one was invisible to the other until it
+ * remounted — "the curves view doesn't get updates until you close and reopen
+ * it". Both now read and write the same copy.
  */
 export function SmoothingPanel() {
-  const { project, currentFrame, setCurrentFrame, editRevision } = useProjectContext();
+  const { currentFrame, setCurrentFrame, smoothing, smoothingError, commitSmoothing } =
+    useProjectContext();
 
   const [catalogue, setCatalogue] = useState<FilterInfo[]>([]);
-  const [model, setModel] = useState<SmoothingModel | null>(null);
-  const [raw, setRaw] = useState<SolveCurves | null>(null);
-  const [smoothed, setSmoothed] = useState<SmoothedCurves | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api
@@ -34,16 +37,13 @@ export function SmoothingPanel() {
       .catch(() => setCatalogue([]));
   }, []);
 
-  const load = useCallback(async () => {
-    const response = await api.getSmoothing(project.id);
-    setRaw(response.curves.raw);
-    setSmoothed(response.curves.smoothed);
-    setModel(splitSpecs(response.filters));
-  }, [project.id]);
-
-  useEffect(() => {
-    load().catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [load, editRevision]);
+  const raw = smoothing?.curves.raw ?? null;
+  const smoothed = smoothing?.curves.smoothed ?? null;
+  const model = useMemo(
+    () => (smoothing ? splitSpecs(smoothing.filters) : null),
+    [smoothing],
+  );
+  const error = smoothingError;
 
   const defaultsFor = useCallback(
     (name: string): Record<string, number> => {
@@ -55,23 +55,6 @@ export function SmoothingPanel() {
     [catalogue],
   );
 
-  const commit = useCallback(
-    async (next: SmoothingModel) => {
-      setModel(next);
-      setError(null);
-      try {
-        const response = await api.updateSmoothing(project.id, joinSpecs(next));
-        setRaw(response.curves.raw);
-        setSmoothed(response.curves.smoothed);
-        setModel(splitSpecs(response.filters));
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        await load().catch(() => undefined);
-      }
-    },
-    [project.id, load],
-  );
-
   function update(channel: Channel, mutate: (config: SmoothingModel[Channel]) => void) {
     if (!model) return;
     const next: SmoothingModel = { ...model, [channel]: { ...model[channel] } };
@@ -80,7 +63,7 @@ export function SmoothingPanel() {
       params: { ...spec.params },
     }));
     mutate(next[channel]);
-    void commit(next);
+    void commitSmoothing(joinSpecs(next));
   }
 
   if (!model) {

@@ -1,0 +1,21 @@
+In the tracking config, change the pyramid levels to search radius. The pyramid levels are not really relevant to the user, but the search radius is. The search radius is the number of pixels around the point that the tracker will look for a match. The pyramid levels are an implementation detail of the tracker algorithm. The search radius should be a single integer value that is easy for the user to understand and adjust.
+
+Add the option to cancel tracking processing. Currently, if the user starts tracking and then realizes they need to change a setting or adjust the points, they have to wait for the tracking to finish before they can make any changes. This can be frustrating and time-consuming. We should add a cancel button that allows the user to stop the tracking process at any time. This will give the user more control and flexibility when working with the tracking feature.
+
+Add one toggle show/hide per track item in the side panel. This will allow the user to quickly show or hide the points for a specific track without having to go into the settings for that track. This will make it easier for the user to focus on specific tracks and make adjustments as needed.
+
+Prevent edits being made to a track if it's hidden. If a track is hidden, the user should not be able to make any edits to it. This will prevent accidental changes to tracks that the user is not currently working on and will help keep the project organized.
+
+On the tracks we can Track forwards or backwards from the current frame. We should let the user track forwards and backwards with a single button. 
+
+Add option to refresh all tracks between keyframes and anchor points, this will track forwards and backwards from the keyframe/anchor point to the next keyframe/anchor point. This will allow the user to quickly update all tracks in a specific range without having to manually track each one individually.
+
+we still have the UI preventing us deleting keyframes and anchor points. The X is blocked with the message to "This keyframes comes from a manual correction - delete thge correction from the Edit tab". However, the Edit tab is hidden and the functionality has been moved to the canvas. We need to allow the user to delete keyframes and anchor points directly from the canvas without having to go to a separate tab. This will make it easier for the user to manage their keyframes and anchor points and will improve the overall user experience.
+
+Is the tracking done on the proxy images or the full resolution images? It should be done on the full resolution images to ensure the best possible tracking accuracy. 
+
+
+We want to be able to track objects that vary in size over time. 
+If the user sets the start keyframe with a certain size, and then the object grows or shrinks over time, we want the tracker to be able to adjust the size of the tracking window accordingly. This will allow for more accurate tracking of objects that change in size throughout the video.
+It should linearly interpolate the size of the tracking window between keyframes, so that the tracker can adjust the size of the window as the object changes size over time. This will allow for more accurate tracking of objects that change in size throughout the video.
+

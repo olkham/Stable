@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { CurveEditor } from "./components/CurveEditor";
-import { EditPanel } from "./components/EditPanel";
-import { ExportDialog } from "./components/ExportDialog";
+import { ExportPanel } from "./components/ExportPanel";
 import { ModelManager } from "./components/ModelManager";
 import { TracksPanel } from "./components/TracksPanel";
 import { ProjectPicker } from "./components/ProjectPicker";
@@ -9,15 +8,31 @@ import { SmoothingPanel } from "./components/SmoothingPanel";
 import { SolvePanel } from "./components/SolvePanel";
 import { Timeline } from "./components/Timeline";
 import { Viewer } from "./components/Viewer";
+import { ExportProvider } from "./state/ExportContext";
+import { FrameStreamProvider } from "./state/FrameStreamContext";
 import { ProjectProvider, useProjectContext } from "./state/ProjectContext";
 
-type Tab = "points" | "edit" | "solve" | "smoothing";
+/**
+ * The sidebar's tabs.
+ *
+ * There was an "Edit" one (todo 4, sixth round). It is gone, not hidden: three
+ * of the four things on it had grown a better home elsewhere — undo/redo is in
+ * the header below, "retrack from here" is the bounded run on the track card,
+ * and moving or deleting a point is something the canvas does directly — and
+ * the fourth, a track's corrections and range repairs, is per point and now
+ * lives on the point's own card. What was global about it, what a drag on the
+ * frame *means*, is in the viewer's toolbar beside the tools that use it. If a
+ * future editing feature needs a panel of its own, it can have one; until then
+ * a tab that mostly duplicates two others is a tab that costs a click to learn
+ * it had nothing new.
+ */
+type Tab = "points" | "solve" | "smoothing" | "export";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "points", label: "Tracks" },
-  { id: "edit", label: "Edit" },
   { id: "solve", label: "Solve" },
   { id: "smoothing", label: "Smoothing" },
+  { id: "export", label: "Export" },
 ];
 
 export default function App() {
@@ -29,7 +44,15 @@ export default function App() {
 
   return (
     <ProjectProvider projectId={projectId} onClose={() => setProjectId(null)}>
-      <Workspace onClose={() => setProjectId(null)} />
+      {/* The frame stream sits between the two: it follows the project's
+          playhead, and the export reads each frame's geometry off the same
+          message the pixels arrived in rather than asking for it separately
+          (todo 2, fifth round). */}
+      <FrameStreamProvider>
+        <ExportProvider>
+          <Workspace onClose={() => setProjectId(null)} />
+        </ExportProvider>
+      </FrameStreamProvider>
     </ProjectProvider>
   );
 }
@@ -39,7 +62,6 @@ function Workspace({ onClose }: { onClose: () => void }) {
     useProjectContext();
   const [tab, setTab] = useState<Tab>("points");
   const [curvesOpen, setCurvesOpen] = useState(false);
-  const [exportOpen, setExportOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
 
   return (
@@ -82,9 +104,6 @@ function Workspace({ onClose }: { onClose: () => void }) {
           Curves
         </button>
         <button onClick={() => setModelsOpen(true)}>Models</button>
-        <button className="workspace__export" onClick={() => setExportOpen(true)}>
-          Export
-        </button>
       </header>
 
       <div className="workspace__body">
@@ -106,13 +125,14 @@ function Workspace({ onClose }: { onClose: () => void }) {
             ))}
           </nav>
           {tab === "points" && <TracksPanel />}
-          {tab === "edit" && <EditPanel />}
           {tab === "solve" && <SolvePanel />}
           {tab === "smoothing" && <SmoothingPanel />}
+          {/* The export is a tab, not a modal (todo 1, fourth round): its
+              preview is the viewer to the left, so it must not cover it. */}
+          {tab === "export" && <ExportPanel />}
         </aside>
       </div>
 
-      {exportOpen && <ExportDialog onClose={() => setExportOpen(false)} />}
       {modelsOpen && <ModelManager onClose={() => setModelsOpen(false)} />}
     </div>
   );

@@ -14,12 +14,14 @@ slow down serving frames.
 from __future__ import annotations
 
 import time
+from unittest import mock
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from stable.server.routes.points import clear_patch_cache
+from stable.server.routes.points import clear_patch_cache, drain_patch_warmup
+from stable.server.storage import Workspace
 
 from ._helpers import decode_jpeg, upload_clip, wait_job
 
@@ -117,6 +119,111 @@ def test_moving_the_point_invalidates_its_cached_patches(client, tracked):
     assert after.status_code == 200
     assert after.headers["ETag"] != before.headers["ETag"]
     assert after.content != before.content
+
+
+def test_a_new_keyframes_patch_is_rendered_before_anything_asks_for_it(client, tracked):
+    """Todo 3, sixth round: "when a patch/keyframe is made it should be cached".
+
+    The cache was already there and already correct — what filled it was the
+    first *request*, which on the panel that judges texture is a seek into the
+    full-resolution clip. So a card with eight keyframes cost eight of those on
+    every fresh server, which is the "slow to load" being reported.
+
+    Placing the keyframe is the moment its pixels are known and the moment
+    nobody is waiting on a thumbnail, so that is when it is rendered. The
+    assertion is that the *first* request for it is already a cache hit: it is
+    answered with no proxy store and no video source available at all, which
+    only a cached payload can be.
+    """
+    project_id, _source = tracked
+    clear_patch_cache()
+
+    added = client.post(
+        f"/api/projects/{project_id}/points/p1/anchors", json={"frame": 11, "x": 24.0, "y": 21.0}
+    )
+    assert added.status_code == 200, added.text
+    assert drain_patch_warmup(), "the warmer never finished"
+
+    for source in ("proxy", "original"):
+        with (
+            mock.patch.object(
+                Workspace, "get_video_source", side_effect=AssertionError("read the clip")
+            ),
+            mock.patch.object(
+                Workspace, "get_proxy_store", side_effect=AssertionError("read the proxy")
+            ),
+        ):
+            served = client.get(patch_url(project_id, 11, source=source))
+        assert served.status_code == 200, f"{source}: {served.text}"
+        assert served.content
+
+
+def test_listing_a_grid_warms_the_keyframes_it_lists(client, tracked):
+    """Which is what covers a restart, and every keyframe placed before this existed.
+
+    Warming on creation cannot help a cache that starts empty every time the
+    server does. The panel asks for its grid before it asks for any image in it,
+    so that call is the other place where "these are about to be wanted" is
+    known for certain.
+    """
+    project_id, _source = tracked
+    clear_patch_cache()
+
+    listed = client.get(f"/api/projects/{project_id}/points/p1/patches?frame=4")
+    assert listed.status_code == 200, listed.text
+    frames = [patch["frame"] for patch in listed.json()["patches"]]
+    assert frames, "the fixture point has no keyframes to warm"
+    assert drain_patch_warmup(), "the warmer never finished"
+
+    with (
+        mock.patch.object(
+            Workspace, "get_video_source", side_effect=AssertionError("read the clip")
+        ),
+        mock.patch.object(
+            Workspace, "get_proxy_store", side_effect=AssertionError("read the proxy")
+        ),
+    ):
+        for frame in frames:
+            served = client.get(patch_url(project_id, frame, source="original"))
+            assert served.status_code == 200, served.text
+
+
+def test_the_crop_scale_round_trip_is_quick_enough_to_drag(client, tracked):
+    """Todo 7, sixth round: the crop preview follows the slider.
+
+    The panel now stores the crop *during* the drag rather than only on release,
+    throttled to one request at a time. That is only reasonable if a store plus
+    the re-plan it triggers is cheap — this is the number behind that claim,
+    measured rather than asserted, on a project small enough that it is the plan
+    and the write being timed rather than the clip.
+
+    Loose bound on purpose: it is a guard against the plan memoisation being
+    lost (which would make every step an O(T) fit from scratch), not a benchmark.
+    """
+    project_id, _source = tracked
+    solved = client.post(f"/api/projects/{project_id}/solve")
+    if solved.status_code != 200:
+        pytest.skip("one point is not enough to solve; the timing needs a real plan")
+    assert wait_job(client, project_id, solved.json()["job_id"])["status"] == "done"
+    client.put(
+        f"/api/projects/{project_id}/smoothing",
+        json={"filters": [{"channel": "x", "filter": "butterworth", "params": {"cutoff_hz": 1.0}}]},
+    )
+
+    start = time.perf_counter()
+    steps = 8
+    for step in range(steps):
+        scale = 0.6 + step * 0.02
+        assert (
+            client.put(
+                f"/api/projects/{project_id}/render/options", json={"crop": {"scale": scale}}
+            ).status_code
+            == 200
+        )
+        assert client.get(f"/api/projects/{project_id}/export/preview").status_code == 200
+    each = (time.perf_counter() - start) / steps
+
+    assert each < 0.5, f"a crop step costs {each * 1000:.0f} ms — too slow to drag against"
 
 
 def test_serving_patches_does_not_slow_down_serving_frames(client, tracked):

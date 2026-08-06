@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import * as api from "../api/client";
 import { CHANNEL_COLOR, CHANNEL_LABEL } from "../colors";
 import { joinSpecs, splitSpecs, type ChannelConfig, type SmoothingModel } from "../smoothing";
 import { useProjectContext } from "../state/ProjectContext";
-import type { Channel, SmoothedCurves, SolveCurves } from "../types";
+import type { Channel, SmoothedCurves } from "../types";
 import { CHANNELS } from "../types";
 
 const LANE_HEIGHT = 84;
@@ -29,13 +28,15 @@ interface View {
  * shift-drag selects a frame range, clicking a lane moves the playhead. The
  * selected range and the pinned keyframes are per channel and are stored in the
  * project file as smoothing directives, so they survive a reload.
+ *
+ * The curves themselves come from the context (todo 2, fourth round), which is
+ * also what the smoothing panel writes through — so a filter changed over there
+ * redraws these lanes at once instead of on the next remount.
  */
 export function CurveEditor() {
-  const { project, currentFrame, setCurrentFrame, editRevision } = useProjectContext();
+  const { project, currentFrame, setCurrentFrame, smoothing, smoothingError, commitSmoothing } =
+    useProjectContext();
 
-  const [raw, setRaw] = useState<SolveCurves | null>(null);
-  const [smoothed, setSmoothed] = useState<SmoothedCurves | null>(null);
-  const [model, setModel] = useState<SmoothingModel | null>(null);
   const [visible, setVisible] = useState<Record<Channel, boolean>>({
     x: true,
     y: true,
@@ -44,25 +45,27 @@ export function CurveEditor() {
   });
   const [view, setView] = useState<View>({ start: 0, end: Math.max(project.video.frames - 1, 1) });
   const [selection, setSelection] = useState<[number, number] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+
+  const raw = smoothing?.curves.raw ?? null;
+  const smoothed = smoothing?.curves.smoothed ?? null;
+  const model = useMemo(() => (smoothing ? splitSpecs(smoothing.filters) : null), [smoothing]);
+  const error = smoothingError;
 
   // The previous smoothed curves, kept so a change can be shown against what it
   // replaced ("before/after ghosting") rather than only against the raw solve.
+  // This is a property of *this view's* history, not of the project, so it stays
+  // local — an effect captures whatever the shared curves were a moment ago.
   const previous = useRef<SmoothedCurves | null>(null);
+  const latest = useRef<SmoothedCurves | null>(null);
+  useEffect(() => {
+    if (smoothed !== latest.current) {
+      previous.current = latest.current;
+      latest.current = smoothed;
+    }
+  }, [smoothed]);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-
-  const load = useCallback(async () => {
-    const response = await api.getSmoothing(project.id);
-    setRaw(response.curves.raw);
-    setSmoothed(response.curves.smoothed);
-    setModel(splitSpecs(response.filters));
-  }, [project.id]);
-
-  useEffect(() => {
-    load().catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [load, editRevision]);
 
   const frames = raw ? raw.x.length : project.video.frames;
 
@@ -73,27 +76,6 @@ export function CurveEditor() {
   }, [frames]);
 
   const lanes = useMemo(() => CHANNELS.filter((channel) => visible[channel]), [visible]);
-
-  /** Push the current model to the server and adopt the curves it computes. */
-  const commit = useCallback(
-    async (next: SmoothingModel) => {
-      setBusy(true);
-      setError(null);
-      previous.current = smoothed;
-      try {
-        const response = await api.updateSmoothing(project.id, joinSpecs(next));
-        setRaw(response.curves.raw);
-        setSmoothed(response.curves.smoothed);
-        setModel(splitSpecs(response.filters));
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-        await load().catch(() => undefined);
-      } finally {
-        setBusy(false);
-      }
-    },
-    [project.id, smoothed, load],
-  );
 
   // -- drawing -----------------------------------------------------------------
 
@@ -362,7 +344,7 @@ export function CurveEditor() {
       next[channel] = { ...next[channel], filters: [...next[channel].filters] };
       mutate(next[channel], channel);
     }
-    void commit(next);
+    void commitSmoothing(joinSpecs(next));
   }
 
   function smoothSelection() {
@@ -419,18 +401,18 @@ export function CurveEditor() {
         ))}
         <span className="curve-editor__spacer" />
         <button onClick={() => setView({ start: 0, end: Math.max(frames - 1, 1) })}>Fit</button>
-        <button onClick={smoothSelection} disabled={!selection || busy}>
+        <button onClick={smoothSelection} disabled={!selection || !model}>
           {selection
             ? `Smooth ${Math.min(selection[0], selection[1])}–${Math.max(selection[0], selection[1])}`
             : "Smooth range"}
         </button>
-        <button onClick={clearRange} disabled={busy}>
+        <button onClick={clearRange} disabled={!model}>
           Whole clip
         </button>
-        <button onClick={togglePin} disabled={busy || !model}>
+        <button onClick={togglePin} disabled={!model}>
           {pinnedHere ? `Unpin ${currentFrame}` : `Pin ${currentFrame}`}
         </button>
-        <button onClick={clearPins} disabled={busy}>
+        <button onClick={clearPins} disabled={!model}>
           Clear pins
         </button>
       </div>

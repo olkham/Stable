@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
 import { pointColor } from "../colors";
+import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
 import type { PointPatches, TrackerSetting } from "../types";
 
@@ -33,8 +34,12 @@ const SETTLE_MS = 150;
  * purpose: at this size, smoothing would hide exactly the texture being judged.
  */
 export function PatchPanel({ pointId }: { pointId: string }) {
-  const { project, currentFrame, setCurrentFrame, editRevision, refresh } = useProjectContext();
+  const { project, currentFrame, setCurrentFrame, editRevision, refresh, afterEdit } =
+    useProjectContext();
   const [info, setInfo] = useState<PointPatches | null>(null);
+  // The keyframe image the operator has clicked, so `Delete` has something to
+  // act on (todo 9, fourth round). Null once it is gone or the point changes.
+  const [selectedKeyframe, setSelectedKeyframe] = useState<number | null>(null);
   // Pending edits to the settings, keyed by the plugin's own argument name.
   // Only what has been touched lives here, so a reload never fights the user.
   const [draft, setDraft] = useState<Record<string, number>>({});
@@ -68,11 +73,64 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   // A different point (or a tracker change) invalidates every pending edit:
   // the settings are per point and named per plugin.
   useEffect(() => setDraft({}), [pointId, info?.tracker]);
+  useEffect(() => setSelectedKeyframe(null), [pointId]);
+
+  /**
+   * Remove one of this point's own keyframe pins.
+   *
+   * Goes through `afterEdit`, not a bare refresh: the keyframe list the panel
+   * and the timeline draw comes with the *track*, which is cached separately
+   * from the project, so refreshing only the project would leave a deleted pin
+   * on screen until the next tracking run replaced that cache.
+   */
+  const deleteKeyframe = useCallback(
+    async (frame: number) => {
+      try {
+        await api.deleteAnchor(project.id, pointId, frame);
+        setSelectedKeyframe(null);
+        await afterEdit(pointId);
+        await reload();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [project.id, pointId, afterEdit, reload],
+  );
+
+  // Delete/Backspace removes the selected keyframe image. Ignored while typing
+  // in a field, the same guard the rest of the app's shortcuts use.
+  useEffect(() => {
+    if (selectedKeyframe === null) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      const target = event.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      event.preventDefault();
+      void deleteKeyframe(selectedKeyframe as number);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedKeyframe, deleteKeyframe]);
 
   if (error) return <div className="error-text">{error}</div>;
   if (!info) return <div className="patch-panel">Loading patches…</div>;
 
   const settings = info.settings;
+  /**
+   * Whether this point's tracker matches a *region* at all (todo 5, sixth round).
+   *
+   * `radius_source` is the constructor argument the window came from, and the
+   * server sends null for the trackers that have none — the deep ones, which see
+   * whole frames. For those there is no patch: the radius below is a preview
+   * size this panel invented, and a grid of thumbnails of it is a picture of
+   * something the algorithm never looks at. The keyframes themselves still
+   * matter (they are where the point is pinned, and deleting one has to keep
+   * working), so they are listed — as frames, which is what they are here.
+   */
+  const hasWindow = info.radius_source !== null;
+  // Pins only: the last one cannot be deleted, and a promoted correction is not
+  // one of them, so counting the whole grid would get that limit wrong.
+  const keyframeCount = info.patches.filter((p) => p.pinned).length;
   const windowSetting = settings.find((s) => s.role === "window");
   const value = (setting: TrackerSetting) => draft[setting.attribute] ?? setting.value;
   const dirty = settings.some((s) => value(s) !== s.value);
@@ -80,9 +138,6 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   // the pending window value while the slider is being dragged.
   const previewRadius =
     (windowSetting ? radiusOf(windowSetting, value(windowSetting)) : 0) || info.radius;
-  // Cache-buster: a patch URL is (point, frame, radius), but the *pixels* also
-  // change when the track moves, and that does not alter the URL.
-  const rev = editRevision;
 
   async function commit(body: Record<string, number | null>) {
     setBusy(true);
@@ -112,19 +167,54 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   /** Clear every override this point has, restoring the plugin's own defaults. */
   const reset = () => commit(Object.fromEntries(settings.map((s) => [s.attribute, null])));
 
+  /** Why a keyframe's × is unavailable, or null when it can be deleted. */
+  function undeletableReason(patch: PointPatches["patches"][number]): string | null {
+    if (patch.kind !== "keyframe") return "Only keyframes can be deleted";
+    if (!patch.pinned) {
+      return "This keyframe comes from a manual correction — delete the correction on the Edit tab";
+    }
+    if (keyframeCount <= 1) {
+      return "A point needs at least one keyframe to track from — this is its last one";
+    }
+    return null;
+  }
+
   function thumb(patch: PointPatches["patches"][number], key: string) {
     const isCurrent = patch.frame === currentFrame;
+    const isKeyframe = patch.kind === "keyframe";
+    const isSelected = isKeyframe && patch.frame === selectedKeyframe;
+    const blocked = undeletableReason(patch);
     return (
       <figure
         key={key}
-        className={`patch-thumb ${isCurrent ? "patch-thumb--current" : ""} patch-thumb--${patch.kind}`}
-        onClick={() => setCurrentFrame(patch.frame)}
+        className={`patch-thumb ${isCurrent ? "patch-thumb--current" : ""} ${
+          isSelected ? "patch-thumb--selected" : ""
+        } patch-thumb--${patch.kind}`}
+        onClick={() => {
+          setCurrentFrame(patch.frame);
+          // Clicking a keyframe image also *selects* it, which is what gives
+          // `Delete` something to remove (todo 9).
+          if (isKeyframe) setSelectedKeyframe(patch.frame);
+        }}
         title={
-          patch.kind === "keyframe"
-            ? `Keyframe ${patch.frame} — the position you set. Click to jump there.`
+          isKeyframe
+            ? `Keyframe ${patch.frame} — the position you set. Click to jump there and select it; Delete removes it.`
             : `Frame ${patch.frame} — where the tracker put it. Click to jump there.`
         }
       >
+        {isKeyframe && (
+          <button
+            className="patch-thumb__delete"
+            disabled={blocked !== null}
+            title={blocked ?? `Delete keyframe ${patch.frame}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!blocked) void deleteKeyframe(patch.frame);
+            }}
+          >
+            ×
+          </button>
+        )}
         {patch.available ? (
           <img
             src={api.pointPatchUrl(
@@ -132,7 +222,15 @@ export function PatchPanel({ pointId }: { pointId: string }) {
               pointId,
               patch.frame,
               previewRadius,
-              rev,
+              // This patch's own centre, so its URL changes when — and only
+              // when — the pixels it shows do. It used to be the project's edit
+              // counter, which every correction bumped, so correcting one point
+              // on one frame re-fetched the *whole* grid; at `original` that is
+              // a full-resolution seek per thumbnail, twenty deep-clip seeks for
+              // one drag, and it is what made editing feel laggy. A pin does not
+              // move when a correction is made elsewhere, so now it does not
+              // reload either.
+              `${patch.x.toFixed(1)}x${patch.y.toFixed(1)}`,
               // 1:1 source pixels here: this panel is where the operator judges
               // whether the patch has enough texture to track, which is exactly
               // what proxy scaling takes away. It is a handful of URLs for one
@@ -186,7 +284,7 @@ export function PatchPanel({ pointId }: { pointId: string }) {
           </label>
         ))}
 
-        {settings.length === 0 && (
+        {settings.length === 0 && hasWindow && (
           <span className="patch-panel__size" title={patchSizeExplanation(info)}>
             {info.patch_size}px window · {info.tracker}
           </span>
@@ -223,7 +321,7 @@ export function PatchPanel({ pointId }: { pointId: string }) {
         )}
       </div>
 
-      {info.current && (
+      {hasWindow && info.current && (
         <div className="patch-panel__now">
           <span className="patch-panel__label">This frame</span>
           {thumb(info.current, "current")}
@@ -239,18 +337,52 @@ export function PatchPanel({ pointId }: { pointId: string }) {
 
       {info.patches.length === 0 ? (
         <p className="patch-panel__empty">
-          No keyframes yet — place one to see the patch it would track from.
+          No keyframes yet — place one to see {hasWindow ? "the patch it would track from" : "it listed here"}.
         </p>
-      ) : (
+      ) : hasWindow ? (
         <>
-          <span className="patch-panel__label">Keyframes</span>
+          <span className="patch-panel__label">
+            Keyframes — click one, then Delete, or use its ×
+          </span>
           <div className="patch-panel__grid">
             {info.patches.map((patch) => thumb(patch, `k${patch.frame}`))}
           </div>
         </>
+      ) : (
+        <>
+          {/* No thumbnails, because there is no patch (todo 5, sixth round) —
+              but the keyframes are still the point's ground truth, and removing
+              one has to be possible from here whatever the tracker is. */}
+          <span className="patch-panel__label">Keyframes</span>
+          <div className="patch-panel__keyframes">
+            {info.patches.map((patch) => {
+              const blocked = undeletableReason(patch);
+              return (
+                <span key={`k${patch.frame}`} className="anchor-chip">
+                  <button className="link-button" onClick={() => setCurrentFrame(patch.frame)}>
+                    {patch.pinned ? "◆" : "✎"}f{patch.frame}
+                  </button>
+                  {patch.kind === "keyframe" && (
+                    <button
+                      className="anchor-chip__delete"
+                      disabled={blocked !== null}
+                      title={blocked ?? `Delete keyframe ${patch.frame}`}
+                      onClick={() => {
+                        if (!blocked) void deleteKeyframe(patch.frame);
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
+                </span>
+              );
+            })}
+          </div>
+          <p className="patch-panel__note">{patchSizeExplanation(info)}</p>
+        </>
       )}
 
-      {info.patches.some((p) => !p.available) && (
+      {hasWindow && info.patches.some((p) => !p.available) && (
         <p className="patch-panel__warning">
           ✕ marks a keyframe too close to the frame edge for this size — the tracker would refuse
           it too. Reduce the size or move the keyframe inward.
@@ -264,34 +396,55 @@ export function PatchPanel({ pointId }: { pointId: string }) {
 const STRIP_PX = 48;
 
 /**
- * Every tracked point's patch on the current frame, side by side.
+ * Every tracked point's patch on the frame being shown, side by side.
  *
  * The per-point panel above answers "is *this* point still on target"; this
  * answers "which of my points has drifted", which is the question you actually
- * have on a shot with eight of them. One row, current frame, click to select.
+ * have on a shot with eight of them. One row, click to select.
  *
- * Each thumbnail is fetched at the point's own effective radius (the image
- * endpoint defaults to it), so no metadata round trip is needed — a point whose
- * patch cannot be built at this frame simply hides itself via `onError`, which
- * is the right outcome for a strip that is a glance rather than a report.
+ * **Cropped from the frame already on the canvas, not fetched.** Each thumbnail
+ * used to be an `<img>` whose `src` carried the frame number, so the strip fired
+ * one server-side crop *per point per frame*: four points at 24 fps is ~100
+ * requests a second, each a decode and a re-encode, and it was enough on its own
+ * to starve the frame stream and stall playback (todo 2, fifth round). Every
+ * pixel it needs is already here — the proxy frame is decoded on the canvas, the
+ * point's position comes with its track, and the pattern radius is on the point
+ * itself — so the crop is a `drawImage` and the strip costs nothing at all.
+ *
+ * It also draws `viewFrame`, so it shows the same frame as the canvas rather
+ * than one the playhead has moved past.
  */
 export function AllPatchesStrip() {
-  const { project, currentFrame, selectedPointId, setSelectedPointId, editRevision } =
+  const { project, selectedPointId, setSelectedPointId, tracks, loadTrack, stabilizedPreview } =
     useProjectContext();
-  const [broken, setBroken] = useState<Record<string, boolean>>({});
+  const { view, viewFrame } = useFrameStream();
+  const picture = view?.images.source ?? null;
 
-  // A frame change or an edit makes every previous failure stale.
-  useEffect(() => setBroken({}), [currentFrame, editRevision]);
+  // Only the points whose tracker actually matches a region (todo 5, sixth
+  // round). `window.attribute` is null for the trackers that see whole frames,
+  // and a thumbnail of a patch such a tracker never looks at answers "which one
+  // has drifted" with a picture that has nothing to do with why it drifted.
+  const tracked = project.points.filter(
+    (point) =>
+      (point.has_track || point.queries.length > 0) && point.window?.attribute !== null,
+  );
 
-  const tracked = project.points.filter((point) => point.has_track || point.queries.length > 0);
+  // The strip needs each point's path to know where to crop.
+  useEffect(() => {
+    for (const point of tracked) if (point.has_track && !(point.id in tracks)) void loadTrack(point.id);
+  }, [tracked, tracks, loadTrack]);
+
   if (tracked.length === 0) return null;
-  const visible = tracked.filter((point) => !broken[point.id]);
+  // The proxy is a scaled copy of the clip, and radii and track positions are in
+  // source pixels, so everything below is converted once here.
+  const proxy = project.proxy["half"];
+  const scale = proxy?.width && project.video.w ? proxy.width / project.video.w : 1;
 
   return (
     <div className="patch-strip">
       <span className="patch-panel__label">
-        Tracking on frame {currentFrame}
-        {visible.length === 0 && " — no patch available here"}
+        Tracking on frame {viewFrame}
+        {stabilizedPreview && " — turn the stabilized preview off to see the tracked patches"}
       </span>
       <div className="patch-strip__row">
         {tracked.map((point) => (
@@ -300,17 +453,15 @@ export function AllPatchesStrip() {
             className={`patch-thumb ${
               point.id === selectedPointId ? "patch-thumb--current" : ""
             }`}
-            style={{ display: broken[point.id] ? "none" : undefined }}
             onClick={() => setSelectedPointId(point.id)}
             title={`${point.id} (${point.tracker}) — click to select`}
           >
-            <img
-              src={api.pointPatchUrl(project.id, point.id, currentFrame, undefined, editRevision)}
-              width={STRIP_PX}
-              height={STRIP_PX}
-              alt={`${point.id} patch`}
-              style={{ imageRendering: "pixelated" }}
-              onError={() => setBroken((prev) => ({ ...prev, [point.id]: true }))}
+            <PatchThumb
+              picture={picture}
+              x={tracks[point.id]?.x[viewFrame] ?? null}
+              y={tracks[point.id]?.y[viewFrame] ?? null}
+              radius={point.window?.radius || DEFAULT_PREVIEW_RADIUS}
+              scale={scale}
             />
             <figcaption style={{ color: pointColor(point.id) }}>{point.id}</figcaption>
           </figure>
@@ -318,6 +469,68 @@ export function AllPatchesStrip() {
       </div>
     </div>
   );
+}
+
+/** Fallback pattern radius, matching the server's for a tracker with no window. */
+const DEFAULT_PREVIEW_RADIUS = 16;
+
+/**
+ * One point's patch, cut out of the decoded frame.
+ *
+ * Drawn unsmoothed for the same reason the fetched thumbnails were drawn
+ * `pixelated`: at 48 px, smoothing hides exactly the texture being judged.
+ */
+function PatchThumb({
+  picture,
+  x,
+  y,
+  radius,
+  scale,
+}: {
+  picture: { image: CanvasImageSource; width: number; height: number } | null;
+  x: number | null;
+  y: number | null;
+  radius: number;
+  scale: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, STRIP_PX, STRIP_PX);
+    if (!picture || x == null || y == null) {
+      // No position on this frame is a real answer — "the tracker has nothing
+      // here" — so it is drawn as an empty cell rather than a missing one.
+      ctx.fillStyle = "rgba(255,255,255,0.05)";
+      ctx.fillRect(0, 0, STRIP_PX, STRIP_PX);
+      return;
+    }
+    const half = Math.max(1, (radius + 0.5) * scale);
+    ctx.imageSmoothingEnabled = false;
+    try {
+      ctx.drawImage(
+        picture.image,
+        x * scale - half,
+        y * scale - half,
+        half * 2,
+        half * 2,
+        0,
+        0,
+        STRIP_PX,
+        STRIP_PX,
+      );
+    } catch {
+      // The frame's pixels are gone (see `drawPicture` in Viewer.tsx): a thumbnail
+      // that cannot be cropped is an empty cell, never an unmounted application.
+      ctx.fillStyle = "rgba(255,255,255,0.05)";
+      ctx.fillRect(0, 0, STRIP_PX, STRIP_PX);
+    }
+  }, [picture, x, y, radius, scale]);
+
+  return <canvas ref={canvasRef} width={STRIP_PX} height={STRIP_PX} />;
 }
 
 function patchSizeExplanation(info: PointPatches): string {

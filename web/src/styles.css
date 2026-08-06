@@ -231,6 +231,45 @@ button:disabled {
   flex: 1;
 }
 
+/* The picture, and — while the export tab is up — the output beside it (todo 1,
+   fifth round). One row, equal halves, so composing the shot and seeing what
+   gets written are the same screen rather than two modes of it. */
+.viewer__canvases {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+.viewer__canvases > .viewer__canvas-wrap {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* The file, plus the one thing composed on it. It draws no track overlay and
+   does not share the left canvas's zoom or pan — the two are in different
+   coordinate spaces the moment the render crops — but the stabilisation
+   crosshairs are draggable here too (todo 4, sixth round), because "put this
+   feature *there* in the delivered frame" is what composing a shot means, and
+   the left canvas can only say it inside a rectangle drawn on the source.
+   The --grab / --dragging modifiers above supply the cursor over one. */
+.viewer__canvas-wrap--output canvas {
+  cursor: default;
+}
+
+.viewer__canvas-label {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--text-dim);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .viewer__canvas-wrap {
   position: relative;
   flex: 1;
@@ -243,16 +282,61 @@ button:disabled {
   overflow: hidden;
 }
 
+/* The cursor answers "what does a click here do?" (todo 4, fourth round). It
+   used to come from the mode alone, so it was a grab hand over bare picture
+   where a click would move a point rather than grab one. */
+
 .viewer__canvas-wrap--placing canvas {
   cursor: crosshair;
 }
 
-.viewer__canvas-wrap--editing canvas {
+.viewer__canvas-wrap--grab canvas {
   cursor: grab;
+}
+
+.viewer__canvas-wrap--select canvas {
+  cursor: pointer;
+}
+
+.viewer__canvas-wrap--delete canvas {
+  cursor: pointer;
+}
+
+.viewer__canvas-wrap--inert canvas {
+  cursor: not-allowed;
 }
 
 .viewer__canvas-wrap--dragging canvas {
   cursor: grabbing;
+}
+
+/* -- the tool palette (todo 4) --------------------------------------------- */
+
+.viewer__tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* What a drag on the frame means, beside the tools that do the dragging (todo
+   4, sixth round) — it used to be on the Edit tab, away from the picture. */
+.viewer__drag-mode {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+.viewer__drag-mode input[type="number"] {
+  width: 3.2rem;
+}
+
+.viewer__tools button {
+  min-width: 30px;
+  padding: 4px 6px;
+  font-size: 0.95rem;
+  line-height: 1;
 }
 
 .viewer__canvas-wrap canvas {
@@ -404,6 +488,21 @@ button:disabled {
 
 .points-list__item--selected {
   border-color: var(--accent);
+}
+
+/* -- collapsible track cards (todo 5, fourth round) ------------------------ */
+
+.points-list__disclose {
+  border: none;
+  background: transparent;
+  padding: 0 2px;
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  line-height: 1;
+}
+
+.points-list__item--collapsed {
+  padding-bottom: 4px;
 }
 
 .points-list__row {
@@ -670,44 +769,34 @@ button:disabled {
   line-height: 1;
 }
 
-.edit-panel__history {
-  display: flex;
-  gap: 4px;
-}
-
-.edit-panel__history button {
-  font-size: 0.75rem;
-  padding: 3px 8px;
-}
-
-.edit-panel__toggle {
-  margin: 4px 0 8px;
-}
-
-.edit-panel__section {
+/* One track's edits, on its card (todo 4, sixth round). The Edit tab's own
+   chrome — its header, its undo pair, its per-section rules — went with the tab;
+   what is left is a disclosure inside a card that already has several, so it is
+   deliberately quieter than a panel of its own would be. */
+.track-edits {
   border-top: 1px solid var(--border);
-  padding-top: 10px;
-  margin-top: 10px;
+  padding-top: 8px;
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
-.edit-panel__section h4 {
-  margin: 0 0 6px;
-  font-size: 0.8rem;
-  font-weight: 600;
+.track-edits__toggle {
+  font-size: 0.75rem;
   color: var(--text-dim);
+  text-align: left;
+}
+
+.track-edits__gaps {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
 .edit-panel__revert {
   font-size: 0.72rem;
-}
-
-.edit-panel__gaps {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+  margin-left: 6px;
 }
 
 .corrections-list {
@@ -993,7 +1082,11 @@ button:disabled {
   border-color: var(--accent, #4da3ff);
 }
 
-.patch-thumb img {
+/* The all-points strip cuts its thumbnails out of the frame already decoded on
+   the canvas rather than fetching one per point per frame, so those are
+   canvases; the per-point keyframe grid still fetches images at fixed frames. */
+.patch-thumb img,
+.patch-thumb canvas {
   display: block;
   border-radius: 2px;
   background: #000;
@@ -1050,6 +1143,14 @@ button:disabled {
   outline-offset: -1px;
 }
 
+/* Keyframes with no patch to show (todo 5, sixth round): a tracker that matches
+   whole frames has no region to draw, so the pins are listed as what they are. */
+.patch-panel__keyframes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
 .patch-strip {
   padding: 0 8px 6px;
   border-bottom: 1px solid var(--border);
@@ -1068,49 +1169,22 @@ button:disabled {
 
 /* -- export screen (todo 5) ------------------------------------------------- */
 
-.export-screen {
-  display: grid;
-  /* Wider than it was: every export control lives in this column now, not on a
-     separate tab (todo 1, second round). */
-  grid-template-columns: minmax(0, 1fr) 380px;
-  gap: 12px;
-  padding: 10px;
-  min-height: 60vh;
-}
+/* -- the export panel (todo 1, fourth round) --------------------------------
+   The export used to be a modal with a canvas of its own. It is a sidebar tab
+   now, drawing on the viewer, so what is left here is a column of controls that
+   has to behave like the other four panels. */
 
-.export-screen__canvas {
-  position: relative;
-  min-height: 320px;
-  background: #000;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.export-screen__canvas canvas {
-  display: block;
-  cursor: crosshair;
-}
-
-.export-screen__placeholder {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  padding: 20px;
-  color: var(--text-dim);
-}
-
-.export-screen__side {
-  overflow-y: auto;
-  max-height: 70vh;
+.export-panel {
   font-size: 0.85rem;
 }
 
-.export-screen__side h4 {
+.export-panel h4 {
   margin: 14px 0 6px;
+}
+
+.export-panel__saving {
+  color: var(--text-dim);
+  font-size: 0.78rem;
 }
 
 .export-screen__stats {
@@ -1163,17 +1237,7 @@ button:disabled {
   white-space: nowrap;
 }
 
-.export-screen__frame-nav {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-  color: var(--text-dim);
-}
-
-/* The settings that moved off the Video tab keep that tab's field layout, only
-   narrower — the column is 380px, not the dialog's old 420px. */
-.export-screen__side .field-row {
+.export-panel .field-row {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1181,22 +1245,22 @@ button:disabled {
   margin: 4px 0;
 }
 
-.export-screen__side .field-row > label {
+.export-panel .field-row > label {
   min-width: 5.5rem;
   color: var(--text-dim);
 }
 
-.export-screen__side .field-row input[type="number"] {
+.export-panel .field-row input[type="number"] {
   width: 4.5rem;
 }
 
-.export-screen__side .field-row input[type="range"] {
+.export-panel .field-row input[type="range"] {
   flex: 1;
   min-width: 90px;
 }
 
-.export-screen__side .field-row > input:not([type]),
-.export-screen__side .field-row > input[type="text"] {
+.export-panel .field-row > input:not([type]),
+.export-panel .field-row > input[type="text"] {
   flex: 1;
   min-width: 8rem;
 }
@@ -1206,10 +1270,66 @@ button:disabled {
   margin-top: 10px;
 }
 
-/* The preview tab needs the room; the other tabs keep the old dialog width. */
-.modal:has(.export-screen) {
-  width: min(1200px, 95vw);
-  max-width: 95vw;
+/* -- the export queue (todo 8, fourth round) -------------------------------- */
+
+.export-queue {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.export-queue__job {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-alt);
+}
+
+.export-queue__status {
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  min-width: 4.2rem;
+}
+
+.export-queue__job--running .export-queue__status {
+  color: var(--accent);
+}
+
+.export-queue__job--error .export-queue__status {
+  color: #d64545;
+}
+
+.export-queue__job--cancelled {
+  opacity: 0.55;
+}
+
+.export-queue__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.export-queue__bar {
+  flex-basis: 100%;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.export-queue__bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
 }
 
 /* -- per-track overlay toggles (todo 9) ------------------------------------- */
@@ -1290,4 +1410,81 @@ button:disabled {
 .timeline__goto {
   padding: 2px 6px;
   min-width: 0;
+}
+
+/* -- choosing what goes into the solve (todo 6, fourth round) --------------- */
+
+.solve-panel__heading {
+  margin: 14px 0 6px;
+  font-size: 0.9rem;
+}
+
+.solve-tracks {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 6px;
+  display: grid;
+  gap: 2px;
+}
+
+.solve-tracks label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+
+.solve-tracks__untracked label {
+  opacity: 0.55;
+}
+
+.solve-tracks__id {
+  min-width: 2.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.solve-tracks__stats {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* -- deleting a keyframe from its image (todo 9, fourth round) -------------- */
+
+.patch-thumb {
+  position: relative;
+}
+
+.patch-thumb--selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.patch-thumb__delete {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  z-index: 1;
+  padding: 0 4px;
+  line-height: 1.1;
+  font-size: 0.75rem;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.65);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  opacity: 0;
+}
+
+.patch-thumb:hover .patch-thumb__delete,
+.patch-thumb--selected .patch-thumb__delete {
+  opacity: 1;
+}
+
+.patch-thumb__delete:hover:not(:disabled) {
+  color: #fff;
+  background: #d64545;
+  border-color: #d64545;
+}
+
+.patch-thumb__delete:disabled {
+  opacity: 0.35;
 }

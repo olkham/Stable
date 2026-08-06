@@ -1,0 +1,14 @@
+We have a fundamental UX issue. We have the concept of keyframes and anchor points, but the user doesn't understand what they are or how to use them. 
+
+They are essentially the same thing. We need to simplify the UI/UX and remove the concept of anchor points. We should just have keyframes, and the user should be able to set a keyframe at any point in time. The keyframe will then be used as a reference point for tracking, and the user can track forwards or backwards from that keyframe.
+
+We might rename these to anything in the future "tracking reference points" or "tracking anchors" etc. but for now we should just remove the concept of anchor points and just have keyframes.
+
+The core concept of the UX is the user should be able to set a keyframe at any point in time, and then track forwards or backwards from that keyframe. The user should also be able to delete keyframes, and the tracking should update accordingly.
+
+The tracking engine should support tracking backwards i.e. from Pt1 to Pt0 and tracking forwards i.e. from Pt0 to Pt1. The track paths should agree with each other. If they dont the system should automatically attempt to reconcile the differences and produce a single track path that is the best fit for both directions, but flag any discrepancies to the user so they can make manual adjustments or add new keyframes to correct the track path. The user should be able to set a keyframe at any point in time, and then track forwards or backwards from that keyframe.
+
+We should have an auto update feature that will automatically update the track path when a keyframe is added, deleted, or moved.
+
+The UX should feel like a magic, intuitive experience, where the user pushes and pulls a few keypoints around and the path magically updates to match the user's intent.
+
