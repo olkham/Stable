@@ -5,6 +5,14 @@
 export type Channel = "x" | "y" | "r" | "s";
 export const CHANNELS: Channel[] = ["x", "y", "r", "s"];
 
+/**
+ * One anchor: "on frame `frame`, this point is truly at `(x, y)`".
+ *
+ * `Query` is the name the project schema stores it under (`points[].queries`,
+ * locked at v1) and the only place that word appears. Everywhere the operator
+ * can see, this is an **anchor** — one word for one concept, which is the whole
+ * of todo 6, seventh round.
+ */
 export interface Query {
   frame: number;
   x: number;
@@ -44,6 +52,7 @@ export interface PointWindow {
 
 export interface PointSummary {
   id: string;
+  /** This point's own anchors. See `Query` for why the field is not `anchors`. */
   queries: Query[];
   tracker: string;
   enabled_for_solve: boolean;
@@ -52,6 +61,15 @@ export interface PointSummary {
   tracked_frames: number;
   mean_confidence: number;
   worst_frames: number[];
+  /**
+   * Whether the anchors have changed since this point was tracked.
+   *
+   * Anchors are the *input* to tracking, so adding, moving or removing one
+   * leaves the stored track answering a question nobody is asking any more. The
+   * card says so and offers the re-track rather than starting minutes of GPU
+   * work on its own.
+   */
+  anchors_changed: boolean;
 }
 
 /**
@@ -108,6 +126,22 @@ export interface ProjectMeta {
   original_filename: string;
 }
 
+/**
+ * One anchor a tracking run reached and disagreed with.
+ *
+ * The run stopped there rather than drifting past the operator's own word about
+ * where the feature is, so this is the "go and look at this" signal: the
+ * timeline paints the anchor red and the card lists the distance.
+ */
+export interface AnchorViolation {
+  frame: number;
+  anchor: [number, number];
+  tracked: [number, number];
+  distance: number;
+  origin: number;
+  direction: "fwd" | "bwd";
+}
+
 export interface TrackData {
   point_id: string;
   n_frames: number;
@@ -118,6 +152,19 @@ export interface TrackData {
   disagreement: (number | null)[];
   contributions: number[];
   anchor_frames: number[];
+  /**
+   * Every position the operator has stated for this point: its own anchors plus
+   * the ones its manual corrections were promoted to.
+   *
+   * On the shared type rather than re-declared by each component that reads it —
+   * three of them had their own copy of this field under the server's older
+   * name (`ground_truth`), which is how one list came to look like two.
+   */
+  anchors: Query[];
+  /** Anchors a run reached and disagreed with, with the frame and the distance. */
+  anchor_violations: AnchorViolation[];
+  /** Just the frames of `anchor_violations`, for the timeline's red marks. */
+  flagged_anchors: number[];
   /** The typed, non-destructive edit layer applied to this point, in order. */
   corrections: Correction[];
   /** Inclusive [start, end] runs of frames with no position, for one-click filling. */
@@ -197,18 +244,10 @@ export interface PointPatch {
   frame: number;
   x: number;
   y: number;
-  /** `keyframe` is a position you set; `tracked` is where the tracker put it. */
-  kind: "keyframe" | "tracked";
+  /** `anchor` is a position you set; `tracked` is where the tracker put it. */
+  kind: "anchor" | "tracked";
   /** False when the patch would fall off the edge of the frame at this size. */
   available: boolean;
-  /**
-   * Whether this keyframe is one of the point's own pins, and so deletable.
-   *
-   * The grid also shows keyframes that manual corrections were *promoted* to;
-   * those belong to a correction, not to the point, and are removed by deleting
-   * the correction on the Edit tab (todo 9, fourth round).
-   */
-  pinned: boolean;
 }
 
 /**
@@ -277,7 +316,7 @@ export interface PointPatches {
   search_radius_range: [number, number];
   /** Whether anything has been overridden, i.e. whether "reset" does anything. */
   custom: boolean;
-  /** One entry per keyframe. */
+  /** One entry per anchor. */
   patches: PointPatch[];
   /** The frame being viewed, when the point has a position there. */
   current: PointPatch | null;

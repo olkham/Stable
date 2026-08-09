@@ -12,41 +12,81 @@ import type { FrameGeometry } from "../api/frameStream";
 import { useFrameStream } from "./FrameStreamContext";
 import { useProjectContext } from "./ProjectContext";
 
+/**
+ * Where a mark sits in the delivered frame, as a fraction of it.
+ *
+ * A fraction rather than a pixel, exactly as `stable/render/options.py` stores
+ * it: the output's size is not known until the crop is planned, and a mark on
+ * the thirds line has to stay on the thirds line when the operator crops
+ * harder. Multiply by `geometry.output` to draw it; divide to read one back.
+ */
+export interface Placement {
+  u: number;
+  v: number;
+}
+
+/** One mark on the output. Mirrors `stable/render/options.TargetPoint`. */
+export interface TargetPoint {
+  id: string;
+  place: Placement;
+  /** The tracks held here; several means their mean, empty means all of them. */
+  point_ids: string[];
+  /** "raw" (the solid trail) or "smoothed" (the dashed one). */
+  source: string;
+  weight: number;
+}
+
 /** Mirrors stable/render/options.py. The server validates; this only edits. */
 export interface RenderOptions {
-  target: {
-    mode: string;
-    point_id: string | null;
-    anchor_frame: number | null;
-    pairs: TargetPair[];
-  };
-  crop: { scale: number | null; centre: string };
+  target: { points: TargetPoint[] };
+  crop: { scale: number | null; limit_to_range: boolean };
   fill: { mode: string; color: number[]; blur: number; tint: number; feather: number };
+  export_range: { start: number | null; end: number | null };
+  resolution: { width: number | null; height: number | null };
 }
 
 export interface OptionsResponse {
   options: RenderOptions;
-  target_modes: string[];
-  crop_centres: string[];
+  target_sources: string[];
   fill_modes: string[];
   points: { id: string; enabled_for_solve: boolean; frames: number }[];
+  source_size: [number, number];
+  clip_frames: number;
+  /** The In/Out markers, i.e. what the export range falls back to. */
+  clip_range: [number, number];
+  /** The frames a render would actually write with these options. */
+  export_window: [number, number];
 }
 
-export interface TargetPair {
-  point_id: string;
-  /** Destination x in the space the stabilisation warp lands in. */
-  x: number;
-  y: number;
+/**
+ * One crosshair on screen: the mark, and where it is drawn on this frame.
+ *
+ * `u`/`v` are what is stored; `atU`/`atV` are where the fit actually puts the
+ * held path this frame. They agree exactly for one or two marks, and can differ
+ * for three or more, where a similarity cannot satisfy them all.
+ */
+export interface TargetMark {
+  id: string;
+  /** The track this mark holds, when it holds exactly one; else null. */
+  pointId: string | null;
+  pointIds: string[];
+  source: string;
+  u: number;
+  v: number;
+  atU: number;
+  atV: number;
+  /** How far the held path misses this mark by, in output pixels. */
+  residual: number | null;
 }
 
 /**
  * The similarity the render applies to a frame, as the server sends it.
  *
- * Target destinations are stated in the space this lands in — *before* the
- * crop/zoom fit, which is only known once every frame's transform exists. So
- * placing a crosshair on the frame means inverting this, and dragging one means
- * applying it. Doing that with the output rectangle instead would fold the fit
- * in and put every target slightly off whenever the render crops.
+ * Two of these come with every frame. `warp` is the stabilisation alone, before
+ * the crop/zoom fit; `output_warp` is the whole thing, source pixels to output
+ * pixels. Marks are stated as a fraction of the *output* frame (todo 1, eighth round), so
+ * they go through `output_warp`: a mark is at `u × output.width` on the output
+ * canvas, and at `unapplyWarp(output_warp, …)` of that on the source canvas.
  */
 export interface Affine {
   tx: number;
@@ -81,16 +121,22 @@ export interface ExportPreview {
   output_warp: Affine;
   coverage: number;
   crop_scale: number;
+  /** How many frames the automatic crop was measured over. */
+  crop_measured_frames: number;
   zoom: number;
   gaps: boolean;
   border: string;
   max_displacement: number;
   is_no_op: boolean;
   no_op_detail: string | null;
-  target: { mode: string; point_id: string | null; pairs: TargetPair[] };
+  target: RenderOptions["target"];
+  target_label: string;
+  /** The frames this render would write, and the In/Out markers behind them. */
+  export_window: [number, number];
+  clip_range: [number, number];
   uses_rotation_and_scale: boolean;
   targets: {
-    point_id: string;
+    point_id: string | null;
     target: [number, number];
     landed: [number, number] | null;
     residual: number | null;
@@ -140,15 +186,15 @@ interface ExportContextValue {
   /** The stored options and the valid choices, or null before the first load. */
   opts: OptionsResponse | null;
   /**
-   * The placed stabilisation targets.
+   * The crosshairs on screen, one per target point.
    *
    * Read from the *options*, never from the preview (todo 7, fourth round).
-   * They used to come off `preview.target.pairs`, so any preview that failed or
-   * had not come back yet made the panel believe there were no targets: the
-   * crosshairs vanished and both rows flipped back to "+ target" while the
-   * server still held them. The preview is geometry; the options are truth.
+   * They used to come off the preview, so any preview that failed or had not
+   * come back yet made the panel believe there were no targets: the crosshairs
+   * vanished and every row flipped back to "+ target" while the server still
+   * held them. The preview is geometry; the options are truth.
    */
-  pairs: TargetPair[];
+  marks: TargetMark[];
   /** The planned geometry for the whole clip — output size, coverage, zoom. */
   preview: ExportPreview | null;
   /**
@@ -176,14 +222,31 @@ interface ExportContextValue {
    */
   sideBySide: boolean;
   setSideBySide: (on: boolean) => void;
-  /** Which target is being dragged on the canvas, for the viewer to highlight. */
+  /**
+   * Whether a dragged mark snaps to the centre, the thirds and the other
+   * points on screen. A composing aid, so it lives with the other view
+   * preferences rather than in the render options the server stores.
+   */
+  snap: boolean;
+  setSnap: (on: boolean) => void;
+  /** Which mark is being dragged, by target id, for the viewer to highlight. */
   dragging: string | null;
-  setDragging: (pointId: string | null) => void;
-  /** Move one target while the pointer is down, without a round trip per pixel. */
-  nudgeTarget: (pointId: string, x: number, y: number) => void;
+  setDragging: (id: string | null) => void;
+  /** Which mark the panel and the canvas are both pointing at. */
+  selected: string | null;
+  setSelected: (id: string | null) => void;
+  /** Move one mark while the pointer is down, without a round trip per pixel. */
+  nudgeMark: (id: string, u: number, v: number) => void;
+  /** Store where a mark ended up. */
+  commitMark: (id: string, u: number, v: number) => Promise<void>;
+  /** Add a mark, and select it. Returns its new id. */
+  addTarget: (patch: Partial<Omit<TargetPoint, "id">>) => Promise<string | null>;
+  /** Change one mark: where it is, which tracks it holds, raw or smoothed. */
+  patchTarget: (id: string, patch: Record<string, unknown>) => Promise<void>;
+  /** Remove one mark. */
+  deleteTarget: (id: string) => Promise<void>;
 
   patchOptions: (patch: Record<string, unknown>) => Promise<void>;
-  putPairs: (pairs: TargetPair[]) => Promise<void>;
   reloadPreview: () => Promise<void>;
   reloadOptions: () => void;
 
@@ -223,10 +286,12 @@ export function ExportProvider({ children }: { children: ReactNode }) {
   const [active, setActive] = useState(false);
   const [showGuides, setShowGuides] = useState(true);
   const [sideBySide, setSideBySide] = useState(true);
+  const [snap, setSnap] = useState(true);
   const [dragging, setDragging] = useState<string | null>(null);
-  // Where a target has been dragged to but not yet stored, so the crosshair can
+  const [selected, setSelected] = useState<string | null>(null);
+  // Where a mark has been dragged to but not yet stored, so the crosshair can
   // follow the pointer at screen rate while the server hears about it once.
-  const [nudged, setNudged] = useState<Record<string, TargetPair>>({});
+  const [nudged, setNudged] = useState<Record<string, Placement>>({});
 
   // Out-of-order guard. Every option change re-plans, and a plan is O(T); under
   // a slider drag the answers do not come back in the order they were asked
@@ -347,19 +412,106 @@ export function ExportProvider({ children }: { children: ReactNode }) {
     [project.id, reloadPreview, invalidateOutput],
   );
 
-  const putPairs = useCallback(
-    (pairs: TargetPair[]) =>
-      patchOptions({
-        // `map` with no pairs is refused by the server (there would be nothing
-        // to map), so removing the last one means going back to smoothing only.
-        target: pairs.length ? { mode: "map", pairs } : { mode: "frame", pairs: [] },
-      }),
-    [patchOptions],
+  const nudgeMark = useCallback((id: string, u: number, v: number) => {
+    setNudged((prev) => ({ ...prev, [id]: { u, v } }));
+  }, []);
+
+  /**
+   * Change one target point.
+   *
+   * A single-mark route rather than a whole-list PUT: two marks are edited
+   * independently, and sending the list back would make moving one of them
+   * carry a possibly stale copy of the other. The server mints ids and holds
+   * the lock, so this stays a patch of exactly what changed.
+   */
+  const patchTarget = useCallback(
+    async (id: string, patch: Record<string, unknown>) => {
+      const seq = ++optionsSeq.current;
+      setBusy(true);
+      try {
+        const next = await readJson<OptionsResponse>(
+          `/api/projects/${project.id}/render/targets/${encodeURIComponent(id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
+          },
+        );
+        if (seq !== optionsSeq.current) return;
+        setOpts(next);
+        setNudged({});
+        setError(null);
+        invalidateOutput();
+        await reloadPreview();
+      } catch (err) {
+        if (seq === optionsSeq.current) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (seq === optionsSeq.current) setBusy(false);
+      }
+    },
+    [project.id, reloadPreview, invalidateOutput],
   );
 
-  const nudgeTarget = useCallback((pointId: string, x: number, y: number) => {
-    setNudged((prev) => ({ ...prev, [pointId]: { point_id: pointId, x, y } }));
-  }, []);
+  const commitMark = useCallback(
+    (id: string, u: number, v: number) => patchTarget(id, { place: { u, v } }),
+    [patchTarget],
+  );
+
+  const addTarget = useCallback(
+    async (patch: Partial<Omit<TargetPoint, "id">>) => {
+      const seq = ++optionsSeq.current;
+      setBusy(true);
+      try {
+        const next = await readJson<OptionsResponse>(
+          `/api/projects/${project.id}/render/targets`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
+          },
+        );
+        if (seq !== optionsSeq.current) return null;
+        setOpts(next);
+        setError(null);
+        invalidateOutput();
+        await reloadPreview();
+        // The server minted the id, so the newest mark is the one it just made.
+        const added = next.options.target.points.at(-1)?.id ?? null;
+        setSelected(added);
+        return added;
+      } catch (err) {
+        if (seq === optionsSeq.current) setError(err instanceof Error ? err.message : String(err));
+        return null;
+      } finally {
+        if (seq === optionsSeq.current) setBusy(false);
+      }
+    },
+    [project.id, reloadPreview, invalidateOutput],
+  );
+
+  const deleteTarget = useCallback(
+    async (id: string) => {
+      const seq = ++optionsSeq.current;
+      setBusy(true);
+      try {
+        const next = await readJson<OptionsResponse>(
+          `/api/projects/${project.id}/render/targets/${encodeURIComponent(id)}`,
+          { method: "DELETE" },
+        );
+        if (seq !== optionsSeq.current) return;
+        setOpts(next);
+        setSelected((current) => (current === id ? null : current));
+        setError(null);
+        invalidateOutput();
+        await reloadPreview();
+      } catch (err) {
+        if (seq === optionsSeq.current) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (seq === optionsSeq.current) setBusy(false);
+      }
+    },
+    [project.id, reloadPreview, invalidateOutput],
+  );
 
   const deleteRender = useCallback(
     async (filename: string) => {
@@ -375,12 +527,6 @@ export function ExportProvider({ children }: { children: ReactNode }) {
     },
     [project.id, reloadRenders],
   );
-
-  const stored = opts?.options.target;
-  const pairs = useMemo(() => {
-    const base = stored?.mode === "map" ? (stored.pairs ?? []) : [];
-    return base.map((pair) => nudged[pair.point_id] ?? pair);
-  }, [stored, nudged]);
 
   /**
    * The geometry of the frame on the canvas.
@@ -406,10 +552,57 @@ export function ExportProvider({ children }: { children: ReactNode }) {
     };
   }, [streamedGeometry, preview]);
 
+  /**
+   * The crosshairs, each with the position it is drawn at on *this* frame.
+   *
+   * `atU`/`atV` differ from the stored mark only when the fit cannot satisfy
+   * every mark at once — three or more of them, or a delivery whose shape the
+   * marks cannot be squared with. The difference comes off the server's own
+   * per-frame report of where each held path lands, the same numbers the
+   * residual column shows, so the crosshair and the "N px off" beside it can
+   * never disagree. One or two marks read zero and the crosshair sits exactly
+   * where it was put.
+   *
+   * Rows come back in the order the marks were sent, so they line up by index:
+   * a mark over several tracks has no single point id to key on, and inventing
+   * one would be a second way for the two lists to fall out of step.
+   */
+  const marks = useMemo<TargetMark[]>(() => {
+    const points = opts?.options.target.points ?? [];
+    const output = frameGeometry?.output;
+    const rows = frameGeometry?.targets ?? [];
+    return points.map((point, index) => {
+      const place = nudged[point.id] ?? point.place;
+      const landed = rows[index]?.landed;
+      const wanted = rows[index]?.target;
+      const drift =
+        landed && wanted && output?.width && output?.height
+          ? {
+              u: (landed[0] - wanted[0]) / output.width,
+              v: (landed[1] - wanted[1]) / output.height,
+            }
+          : { u: 0, v: 0 };
+      return {
+        id: point.id,
+        // A mark over several tracks (or over all of them) belongs to no one
+        // point, so it gets no point colour — claiming one would say the
+        // crosshair was that track's.
+        pointId: point.point_ids.length === 1 ? point.point_ids[0] : null,
+        source: point.source,
+        pointIds: point.point_ids,
+        u: place.u,
+        v: place.v,
+        atU: place.u + drift.u,
+        atV: place.v + drift.v,
+        residual: rows[index]?.residual ?? null,
+      };
+    });
+  }, [opts, nudged, frameGeometry]);
+
   const value = useMemo<ExportContextValue>(
     () => ({
       opts,
-      pairs,
+      marks,
       preview,
       frameGeometry,
       error,
@@ -420,11 +613,18 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       setShowGuides,
       sideBySide,
       setSideBySide,
+      snap,
+      setSnap,
       dragging,
       setDragging,
-      nudgeTarget,
+      selected,
+      setSelected,
+      nudgeMark,
+      commitMark,
+      addTarget,
+      patchTarget,
+      deleteTarget,
       patchOptions,
-      putPairs,
       reloadPreview,
       reloadOptions,
       renders,
@@ -433,7 +633,7 @@ export function ExportProvider({ children }: { children: ReactNode }) {
     }),
     [
       opts,
-      pairs,
+      marks,
       preview,
       frameGeometry,
       error,
@@ -441,10 +641,15 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       active,
       showGuides,
       sideBySide,
+      snap,
       dragging,
-      nudgeTarget,
+      selected,
+      nudgeMark,
+      commitMark,
+      addTarget,
+      patchTarget,
+      deleteTarget,
       patchOptions,
-      putPairs,
       reloadPreview,
       reloadOptions,
       renders,

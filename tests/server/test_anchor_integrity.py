@@ -1,4 +1,4 @@
-"""W1: a user-placed keyframe is ground truth and is never silently overridden.
+"""W1: a user-placed anchor is ground truth and is never silently overridden.
 
 Todo 13 is the bug these tests were written against: anchors the operator placed
 up front were ignored by tracking runs started elsewhere in the clip. The merge
@@ -41,7 +41,7 @@ def place_point(client: TestClient, project_id: str, frame: int, x: float, y: fl
 
 
 def add_anchor(client: TestClient, project_id: str, point_id: str, frame, x, y) -> None:
-    """Pin an extra anchor keyframe onto a point."""
+    """Add an extra anchor to a point."""
     response = client.post(
         f"/api/projects/{project_id}/points/{point_id}/anchors",
         json={"frame": frame, "x": x, "y": y},
@@ -133,7 +133,7 @@ def test_a_disagreeing_run_stops_at_the_anchor_and_reports_it(client, project) -
     assert any(v["frame"] == 15 and v["distance"] > 6.0 for v in after["anchor_violations"])
 
 
-def test_an_agreeing_run_carries_straight_on_through_a_keyframe(client, project) -> None:
+def test_an_agreeing_run_carries_straight_on_through_an_anchor(client, project) -> None:
     """The guard is about disagreement, not about anchors as such."""
     project_id, source = project
     x0, y0 = source.true_position(0)
@@ -147,10 +147,10 @@ def test_an_agreeing_run_carries_straight_on_through_a_keyframe(client, project)
     assert job["result"]["covered_range"][1] > 15
 
 
-# -- todo 11: a manual correction becomes a ground-truth keyframe -----------------
+# -- todo 11: a manual correction becomes a ground-truth anchor -------------------
 
 
-def test_a_drag_is_promoted_to_a_ground_truth_keyframe(client, project) -> None:
+def test_a_drag_is_promoted_to_a_ground_truth_anchor(client, project) -> None:
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
@@ -167,10 +167,8 @@ def test_a_drag_is_promoted_to_a_ground_truth_keyframe(client, project) -> None:
     assert [c["kind"] for c in after["corrections"]] == ["offset", "replace"]
     expected = (before["x"][10] + 4.0, before["y"][10] - 3.0)
     assert (after["x"][10], after["y"][10]) == pytest.approx(expected, abs=1e-3)
-    assert [q["frame"] for q in after["ground_truth"]] == [0, 10]
-    assert (after["ground_truth"][1]["x"], after["ground_truth"][1]["y"]) == pytest.approx(
-        expected, abs=1e-3
-    )
+    assert [q["frame"] for q in after["anchors"]] == [0, 10]
+    assert (after["anchors"][1]["x"], after["anchors"][1]["y"]) == pytest.approx(expected, abs=1e-3)
 
 
 def test_a_retrack_does_not_overwrite_an_earlier_manual_correction(client, project) -> None:
@@ -192,7 +190,7 @@ def test_a_retrack_does_not_overwrite_an_earlier_manual_correction(client, proje
     assert 18 in after["flagged_anchors"]
 
 
-def test_a_re_track_plans_through_the_promoted_keyframe(client, project) -> None:
+def test_a_re_track_plans_through_the_promoted_anchor(client, project) -> None:
     """The point of promotion: the *next* full track passes through the fix."""
     project_id, source = project
     x0, y0 = source.true_position(0)
@@ -211,7 +209,7 @@ def test_a_re_track_plans_through_the_promoted_keyframe(client, project) -> None
     assert (after["raw_x"][12], after["raw_y"][12]) == pytest.approx(fixed, abs=1e-3)
 
 
-def test_undo_un_promotes_the_keyframe_in_one_step(client, project) -> None:
+def test_undo_un_promotes_the_anchor_in_one_step(client, project) -> None:
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
@@ -221,38 +219,38 @@ def test_undo_un_promotes_the_keyframe_in_one_step(client, project) -> None:
         f"/api/projects/{project_id}/points/{point_id}/corrections",
         json={"kind": "offset", "frame": 9, "dx": 5.0, "dy": 0.0},
     )
-    assert [q["frame"] for q in track_of(client, project_id, point_id)["ground_truth"]] == [0, 9]
+    assert [q["frame"] for q in track_of(client, project_id, point_id)["anchors"]] == [0, 9]
 
     undone = client.post(f"/api/projects/{project_id}/edits/undo")
     assert undone.status_code == 200
     restored = track_of(client, project_id, point_id)
     assert restored["corrections"] == []
-    assert [q["frame"] for q in restored["ground_truth"]] == [0]
+    assert [q["frame"] for q in restored["anchors"]] == [0]
 
 
 # -- todos 12 and 20: bounded runs -------------------------------------------------
 
 
-def test_a_run_can_stop_at_the_next_keyframe(client, project) -> None:
+def test_a_run_can_stop_at_the_next_anchor(client, project) -> None:
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
     add_anchor(client, project_id, point_id, 20, *source.true_position(20))
     track(client, project_id, point_id)
 
-    job = retrack(client, project_id, point_id, frame=6, direction="fwd", stop_at_keyframe=True)
+    job = retrack(client, project_id, point_id, frame=6, direction="fwd", stop_at_anchor=True)
     assert job["result"]["frame_range"] == [6, 21]
     assert job["result"]["covered_range"] == [6, 20]
 
 
-def test_a_run_can_stop_at_the_previous_keyframe(client, project) -> None:
+def test_a_run_can_stop_at_the_previous_anchor(client, project) -> None:
     project_id, source = project
     x0, y0 = source.true_position(0)
     point_id = place_point(client, project_id, 0, x0, y0)
     add_anchor(client, project_id, point_id, 8, *source.true_position(8))
     track(client, project_id, point_id)
 
-    job = retrack(client, project_id, point_id, frame=20, direction="bwd", stop_at_keyframe=True)
+    job = retrack(client, project_id, point_id, frame=20, direction="bwd", stop_at_anchor=True)
     assert job["result"]["frame_range"] == [8, 21]
     assert job["result"]["covered_range"] == [8, 20]
 
@@ -308,18 +306,18 @@ def test_a_retrack_with_no_position_starts_from_where_the_point_is(client, proje
     assert job["result"]["y"] == pytest.approx(baseline["y"][7], abs=1e-3)
 
 
-# -- todo 15: every keyframe must be intersected, or be flagged --------------------
+# -- todo 15: every anchor must be intersected, or be flagged ---------------------
 
 
-def test_every_keyframe_is_intersected_or_flagged(client, project) -> None:
-    """Tracking all keyframes forwards and backwards, with the misses named."""
+def test_every_anchor_is_intersected_or_flagged(client, project) -> None:
+    """Tracking all anchors forwards and backwards, with the misses named."""
     project_id, source = project
     frames = (0, 10, 20, 29)
     x0, y0 = source.true_position(frames[0])
     point_id = place_point(client, project_id, frames[0], x0, y0)
     for frame in frames[1:-1]:
         add_anchor(client, project_id, point_id, frame, *source.true_position(frame))
-    # The last keyframe is 25 px from where the feature actually is, so no run
+    # The last anchor is 25 px from where the feature actually is, so no run
     # can reach it: it is exactly the "needs manual review" case.
     bad_x, bad_y = source.true_position(frames[-1])
     add_anchor(client, project_id, point_id, frames[-1], bad_x + 25.0, bad_y)
@@ -328,7 +326,7 @@ def test_every_keyframe_is_intersected_or_flagged(client, project) -> None:
     assert sorted(job["result"]["anchor_frames"]) == sorted(frames)
 
     after = track_of(client, project_id, point_id)
-    # Every keyframe is still passed through exactly — that is a hard contract.
+    # Every anchor is still passed through exactly — that is a hard contract.
     for frame in frames[:-1]:
         assert (after["x"][frame], after["y"][frame]) == pytest.approx(
             source.true_position(frame), abs=1e-3
@@ -341,7 +339,7 @@ def test_every_keyframe_is_intersected_or_flagged(client, project) -> None:
     assert breach["direction"] == "fwd"
 
 
-def test_a_clean_multi_keyframe_track_flags_nothing(client, project) -> None:
+def test_a_clean_multi_anchor_track_flags_nothing(client, project) -> None:
     project_id, source = project
     frames = (0, 12, 24)
     x0, y0 = source.true_position(frames[0])

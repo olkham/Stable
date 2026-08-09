@@ -7,17 +7,19 @@ Headless entry point for::
         --smooth butterworth:cutoff_hz=0.8 --strength 0.9
     stable stabilize clip.mp4 --tracks tracks.json --out frames/ --border transparent
     stable stabilize clip.mp4 --tracks t.json --out s.mp4 \
-        --target point:2 --crop 0.85 --crop-centre target --fill blur --feather 8
+        --target track:2 --target-at top-left --crop 0.85 --width 1920 --fill blur
+    stable stabilize clip.mp4 --tracks t.json --out s.mp4 \
+        --frame-range 900:1600 --crop-to-range
 
 It is the whole Phase 3 pipeline in one command — solve, smooth, plan the border
 policy, warp, encode — and the audio of the source clip is passed through to the
 output untouched unless ``--no-audio`` says otherwise.
 
-The ``--target`` / ``--crop`` / ``--fill`` group is todo 17's: pin a tracked
-position instead of (or as well as) filtering the curves, choose how much of the
-frame survives, and decide what goes in the edge that is exposed. They are the
-same options the export dialog offers, so a headless render and a browser one
-produce the same file.
+The ``--target`` / ``--target-at`` / ``--crop`` / ``--fill`` group is the export
+screen's, headless: name the path to hold, say where in the *output* frame it
+goes, choose how much of the frame survives, and decide what goes in the edge
+that is exposed. They are the same options the export panel offers, so a
+headless render and a browser one produce the same file.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ import numpy as np
 from ..core.errors import StableError
 from ..core.project import BORDER_POLICIES
 from ..render.fill import FILL_MODES, BorderFill
-from ..render.options import CROP_CENTRES, CropSpec, average_positions
+from ..render.options import CropSpec, OutputResolution, average_positions
 from ..render.warp import INTERPOLATIONS
 from .motion import (
     DEFAULT_SMOOTHING,
@@ -59,28 +61,76 @@ def _parse_frame_range(spec: str) -> tuple[int, int]:
         ) from exc
 
 
+TARGET_SPECS = ("none", "track:INDEX", "smoothed:INDEX", "average")
+"""What ``--target`` accepts, for the help text and the error message."""
+
+
 def _parse_target(spec: str) -> tuple[str, int | None]:
-    """Parse a ``--target`` argument: ``frame``, ``centroid`` or ``point:INDEX``.
+    """Parse a ``--target`` argument.
+
+    ``none`` (or ``frame``/``off``) undoes only what the smoothing removed —
+    still reachable here, unlike in the UI, because a headless render of a
+    smoothing-only stabilisation is a perfectly good thing to ask for.
+    ``track:INDEX`` nails one point, ``smoothed:INDEX`` frames it and lets the
+    smoothing decide the rest, and ``average`` nails the mean of every point.
 
     The CLI addresses points by their index in the tracks file (the server
     addresses them by id), because a tracks file has no ids to offer.
     """
     mode, _, tail = spec.partition(":")
     mode = mode.strip().lower()
-    if mode in ("frame", "none", "off"):
-        return ("frame", None)
-    if mode in ("centroid", "average", "all"):
-        return ("centroid", None)
-    if mode == "point":
+    if mode in ("none", "frame", "off"):
+        return ("none", None)
+    if mode in ("average", "centroid", "all"):
+        return ("average", None)
+    if mode in ("track", "point", "smoothed", "smoothed_track"):
+        canonical = "smoothed_track" if mode.startswith("smoothed") else "track"
         try:
-            return ("point", int(tail))
+            return (canonical, int(tail))
         except ValueError as exc:
             raise argparse.ArgumentTypeError(
-                f"invalid --target {spec!r}: 'point' needs an index, e.g. 'point:0'"
+                f"invalid --target {spec!r}: {mode!r} needs a point index, e.g. '{mode}:0'"
             ) from exc
     raise argparse.ArgumentTypeError(
-        f"invalid --target {spec!r}: expected 'frame', 'centroid' or 'point:INDEX'"
+        f"invalid --target {spec!r}: expected one of {', '.join(TARGET_SPECS)}"
     )
+
+
+def _parse_placement(spec: str) -> tuple[float, float]:
+    """Parse a ``--target-at`` argument: ``U,V`` fractions, or a named position.
+
+    Named positions are the ones an operator actually reaches for — the centre
+    and the four thirds intersections — spelled the way they would say them.
+    """
+    text = spec.strip().lower()
+    named = {
+        "centre": (0.5, 0.5),
+        "center": (0.5, 0.5),
+        "top-left": (1 / 3, 1 / 3),
+        "top-right": (2 / 3, 1 / 3),
+        "bottom-left": (1 / 3, 2 / 3),
+        "bottom-right": (2 / 3, 2 / 3),
+    }
+    if text in named:
+        return named[text]
+    parts = text.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"invalid --target-at {spec!r}: expected 'U,V' fractions or one of "
+            f"{', '.join(sorted(named))}"
+        )
+    try:
+        u, v = float(parts[0]), float(parts[1])
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --target-at {spec!r}: U and V must be numbers"
+        ) from exc
+    if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"invalid --target-at {spec!r}: U and V are fractions of the output frame, so both "
+            "must be in [0, 1]"
+        )
+    return (u, v)
 
 
 def _parse_colour(spec: str) -> tuple[int, int, int]:
@@ -107,28 +157,47 @@ def _parse_colour(spec: str) -> tuple[int, int, int]:
     return (values[0], values[1], values[2])
 
 
-def _target_positions(tracks: Any, mode: str, index: int | None) -> np.ndarray | None:
+def _target_positions(
+    tracks: Any, mode: str, index: int | None, motion: Any = None
+) -> np.ndarray | None:
     """Resolve ``--target`` against a loaded tracks file.
 
+    Args:
+        tracks: The loaded tracks file.
+        mode: The parsed ``--target`` mode.
+        index: The point index, for the per-point modes.
+        motion: The smoothed motion — what turns a raw path into the smoothed
+            estimate ``smoothed:INDEX`` holds, exactly as the browser's dashed
+            trail is produced.
+
     Returns:
-        A ``[T, 2]`` path in source pixels, or ``None`` for ``frame`` mode.
+        A ``[T, 2]`` path in source pixels, or ``None`` for ``none``.
 
     Raises:
         StableError: If the point index is out of range.
     """
-    if mode == "frame":
+    if mode == "none":
         return None
     n_points = int(tracks.n_points)
-    if mode == "point":
+    if mode in ("track", "smoothed_track"):
         if index is None or not 0 <= index < n_points:
             raise StableError(
-                f"--target point:{index} is out of range; the tracks file holds "
+                f"--target {mode}:{index} is out of range; the tracks file holds "
                 f"{n_points} point(s), so valid indices are 0..{n_points - 1}"
             )
-        return np.asarray(tracks.point(index).points, dtype=np.float64)
-    return average_positions(
-        [np.asarray(tracks.point(i).points, dtype=np.float64) for i in range(n_points)]
-    )
+        path = np.asarray(tracks.point(index).points, dtype=np.float64)
+    else:
+        path = average_positions(
+            [np.asarray(tracks.point(i).points, dtype=np.float64) for i in range(n_points)]
+        )
+    if mode != "smoothed_track":
+        return path
+    warps = motion.stabilization_transforms()
+    smoothed = np.full_like(path, np.nan)
+    for frame in range(min(len(warps), path.shape[0])):
+        if np.isfinite(path[frame]).all():
+            smoothed[frame] = warps[frame].apply(path[frame])
+    return smoothed
 
 
 def add_stabilize_parser(subparsers: Any) -> argparse.ArgumentParser:
@@ -191,13 +260,25 @@ def add_stabilize_parser(subparsers: Any) -> argparse.ArgumentParser:
     target_group.add_argument(
         "--target",
         type=_parse_target,
-        default=("frame", None),
+        default=("none", None),
         metavar="SPEC",
         help=(
-            "what to hold still: 'frame' (only undo what the smoothing removed, the default), "
-            "'centroid' (the average of every tracked point), or 'point:INDEX' (one point of "
-            "the tracks file). A target pins that position to its anchor frame, so it "
+            "which path to hold: 'none' (only undo what the smoothing removed, the default), "
+            "'track:INDEX' (nail one point of the tracks file to --target-at on every frame), "
+            "'smoothed:INDEX' (put it there at --target-frame and let the smoothing decide the "
+            "rest), or 'average' (nail the mean of every tracked point). A nailed target "
             "stabilises even with no smoothing filters at all"
+        ),
+    )
+    target_group.add_argument(
+        "--target-at",
+        type=_parse_placement,
+        default=(0.5, 0.5),
+        metavar="U,V",
+        help=(
+            "where the target sits in the *output* frame, as fractions of it, or one of "
+            "centre / top-left / top-right / bottom-left / bottom-right (the thirds "
+            "intersections). Default: centre"
         ),
     )
     target_group.add_argument(
@@ -205,7 +286,11 @@ def add_stabilize_parser(subparsers: Any) -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="frame whose target position is held (default: the solve's reference frame)",
+        help=(
+            "frame whose target position sets the framing (default: the solve's reference "
+            "frame). Only changes the result for 'smoothed:INDEX' — a nailed target agrees "
+            "on every frame by construction"
+        ),
     )
     target_group.add_argument(
         "--crop",
@@ -219,10 +304,29 @@ def add_stabilize_parser(subparsers: Any) -> argparse.ArgumentParser:
         ),
     )
     target_group.add_argument(
-        "--crop-centre",
-        choices=CROP_CENTRES,
-        default="frame",
-        help="centre the output on the frame or on the stabilisation target (default: %(default)s)",
+        "--width",
+        type=int,
+        default=None,
+        metavar="PX",
+        help=(
+            "deliver the crop window at this width; the height follows unless --height is "
+            "given too, in which case the crop takes that aspect ratio"
+        ),
+    )
+    target_group.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="deliver the crop window at this height (see --width)",
+    )
+    target_group.add_argument(
+        "--crop-to-range",
+        action="store_true",
+        help=(
+            "measure the automatic crop over --frame-range only, so frames that are not being "
+            "rendered stop dictating how much of the ones that are survives"
+        ),
     )
     target_group.add_argument(
         "--fill",
@@ -330,15 +434,17 @@ def run_stabilize(args: argparse.Namespace) -> int:
             print(f"smoothing: {channel_report(smoothed.settings)}  (at {fps:g} fps)")
 
         target_mode, target_index = args.target
+        placement = tuple(args.target_at)
+        held = _target_positions(tracks, target_mode, target_index, smoothed)
         plan = StabilizationPlan.build(
             smoothed,
             source_size=(video.width, video.height),
             border=args.border,
             max_zoom=args.max_zoom,
             interpolation=args.interpolation,
-            target_positions=_target_positions(tracks, target_mode, target_index),
-            anchor_frame=args.target_frame,
-            crop=CropSpec(scale=args.crop, centre=args.crop_centre),
+            sources=None if held is None else held[None, :, :],
+            placements=None if held is None else np.asarray([placement], dtype=np.float64),
+            crop=CropSpec(scale=args.crop, limit_to_range=args.crop_to_range),
             fill=BorderFill(
                 mode=args.fill,
                 color=args.fill_color,
@@ -346,16 +452,25 @@ def run_stabilize(args: argparse.Namespace) -> int:
                 tint=args.fill_tint,
                 feather=args.feather,
             ),
+            coverage_range=args.frame_range if args.crop_to_range else None,
+            resolution=OutputResolution(width=args.width, height=args.height),
         )
         if not args.quiet:
             geometry = plan.geometry
+            measured = (
+                f", measured over {geometry.measured_frames} frames" if args.crop_to_range else ""
+            )
             print(
                 f"border: {geometry.border}  output {geometry.width}x{geometry.height}  "
-                f"zoom {geometry.zoom:.4f}  (covers {geometry.coverage * 100:.1f}% of frame)"
+                f"zoom {geometry.zoom:.4f}  (covers {geometry.coverage * 100:.1f}% of frame"
+                f"{measured})"
             )
-            if target_mode != "frame":
-                held = "every point" if target_mode == "centroid" else f"point {target_index}"
-                print(f"target: holding {held} still (anchor frame {args.target_frame or 0})")
+            if target_mode != "none":
+                what = "every point" if target_mode == "average" else f"point {target_index}"
+                if target_mode == "smoothed_track":
+                    what = f"the smoothed estimate of {what}"
+                at = f"({placement[0] * 100:.0f}%, {placement[1] * 100:.0f}%) of the output"
+                print(f"target: holding {what} at {at}")
             if geometry.clamped:
                 print(
                     "warning: --max-zoom capped the zoom, so some frames will show gaps",

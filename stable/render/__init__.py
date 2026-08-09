@@ -16,13 +16,15 @@ Typical use::
     plan.is_no_op                           # True => nothing asked it to move
     render_stabilized(video, plan, "out.mp4", audio_source="in.mp4")
 
-The operator's three choices — what to hold still, how much to crop, what goes
-in the exposed edge — are :class:`~stable.render.options.RenderOptions`::
+The operator's choices — which path to hold, where in the delivered frame to put
+it, how much to crop, what goes in the exposed edge — are
+:class:`~stable.render.options.RenderOptions`::
 
     plan = StabilizationPlan.build(
         motion, source_size=(w, h), border="crop",
         target_positions=path_of_the_point_to_pin,   # [T, 2] in source pixels
-        crop=CropSpec(scale=0.9, centre="target"),
+        placement=(1 / 3, 0.5),                      # on the left thirds line
+        crop=CropSpec(scale=0.9),
         fill=BorderFill(mode="blur", feather=8.0),
     )
 
@@ -38,11 +40,14 @@ from __future__ import annotations
 
 from .fill import FILL_MODES, BorderFill, composite_fill
 from .options import (
-    CROP_CENTRES,
-    TARGET_MODES,
+    TARGET_SOURCES,
     CropSpec,
+    ExportRange,
+    OutputResolution,
+    Placement,
     RenderOptions,
     StabilizationTarget,
+    TargetPoint,
     average_positions,
     hold_gaps,
 )
@@ -63,6 +68,7 @@ from .warp import (
     plan_output,
     rescale_transform,
     warp_frame,
+    window_size,
 )
 
 __all__ = [
@@ -73,16 +79,20 @@ __all__ = [
     "plan_output",
     "warp_frame",
     "rescale_transform",
+    "window_size",
     "cuda_available",
     # border fill
     "FILL_MODES",
     "BorderFill",
     "composite_fill",
     # operator options
-    "TARGET_MODES",
-    "CROP_CENTRES",
+    "TARGET_SOURCES",
+    "Placement",
     "StabilizationTarget",
+    "TargetPoint",
     "CropSpec",
+    "ExportRange",
+    "OutputResolution",
     "RenderOptions",
     "average_positions",
     "hold_gaps",

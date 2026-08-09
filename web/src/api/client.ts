@@ -170,6 +170,7 @@ export const updatePoint = (
 export const deletePoint = (projectId: string, pointId: string): Promise<{ status: string }> =>
   request(`/api/projects/${projectId}/points/${pointId}`, { method: "DELETE" });
 
+/** Anchor a point at `(x, y)` on `frame`. An existing anchor there is replaced. */
 export const addAnchor = (
   projectId: string,
   pointId: string,
@@ -179,6 +180,14 @@ export const addAnchor = (
 ): Promise<PointSummary> =>
   postJson(`/api/projects/${projectId}/points/${pointId}/anchors`, { frame, x, y });
 
+/**
+ * Remove the anchor on `frame`, and whatever asserted it.
+ *
+ * An anchor can come from the point itself or from a manual correction that
+ * states a position there (a drag, a directional run); the server removes both,
+ * so a directional run's span goes away with the anchor it started from. 400
+ * when there is no anchor on that frame, or when it is the point's last one.
+ */
 export const deleteAnchor = (
   projectId: string,
   pointId: string,
@@ -221,7 +230,7 @@ export const updatePointPatches = (
   putJson(`/api/projects/${projectId}/points/${pointId}/patches`, body);
 
 /**
- * URL of the patch at one frame — a keyframe's, or wherever the tracker put it.
+ * URL of the patch at one frame — an anchor's, or wherever the tracker put it.
  *
  * `radius` previews a size that has not been saved yet, so dragging the slider
  * updates the grid live.
@@ -299,10 +308,35 @@ export const clearCorrections = (
 ): Promise<CorrectionsResponse> =>
   request(`/api/projects/${projectId}/points/${pointId}/corrections`, { method: "DELETE" });
 
+/** How far a directional run may reach (stable/server/tracking.py). */
+export interface RunBounds {
+  /** Stop at the next anchor forwards / the previous one backwards. */
+  stop_at_anchor?: boolean;
+  /** Cover at most this many frames beyond the start frame. */
+  max_frames?: number;
+}
+
+/**
+ * Track one direction from one frame — "track forwards/backwards from here".
+ *
+ * `x`/`y` are optional: omitted, the run starts from wherever the point already
+ * is on that frame, which is the anchor there when it has one. That is what the
+ * anchor chips' ◀ / ▶ send, and it is why they work on a point that has never
+ * been tracked at all.
+ *
+ * Unbounded it ploughs to the end of the clip, so callers pass a bound; the
+ * panel's default is `stop_at_anchor`.
+ */
 export const retrackPoint = (
   projectId: string,
   pointId: string,
-  opts: { frame: number; x: number; y: number; direction?: "fwd" | "bwd" | "bidir"; tracker?: string },
+  opts: RunBounds & {
+    frame: number;
+    x?: number;
+    y?: number;
+    direction?: "fwd" | "bwd" | "bidir";
+    tracker?: string;
+  },
 ): Promise<{ job_id: string }> =>
   postJson(`/api/projects/${projectId}/points/${pointId}/retrack`, opts);
 

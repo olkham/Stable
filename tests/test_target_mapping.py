@@ -19,7 +19,7 @@ import pytest
 
 from stable.core.errors import RenderError
 from stable.core.geometry import SimilarityTransform
-from stable.render.options import StabilizationTarget, TargetPair
+from stable.render.options import Placement, StabilizationTarget, TargetPoint
 from stable.render.stabilize import StabilizationPlan
 from stable.smoothing.channels import SmoothingSettings
 from stable.smoothing.motion import SmoothedMotion
@@ -71,6 +71,17 @@ def _moving_paths(transform_at) -> tuple[np.ndarray, np.ndarray]:
     return paths, start
 
 
+def _marks(destinations: np.ndarray) -> np.ndarray:
+    """State pixel destinations the way the plan takes them: output fractions.
+
+    The eighth round moved every mark into output coordinates, and the plan resolves them
+    against the frame size — so dividing here means ``plan.transforms`` still
+    puts the points on exactly the pixels these tests name, and the assertions
+    below stay about the *mapping* rather than about the units.
+    """
+    return np.asarray(destinations, dtype=np.float64).reshape(-1, 2) / np.array(SIZE, dtype=float)
+
+
 def test_one_pair_puts_the_point_exactly_where_it_was_asked_to_go():
     paths, _start = _moving_paths(lambda f: SimilarityTransform(tx=2.0 * f, ty=-1.0 * f))
     # Where it sat on frame 0 — far enough for the drift to matter, close enough
@@ -81,8 +92,8 @@ def test_one_pair_puts_the_point_exactly_where_it_was_asked_to_go():
         _identity_motion(),
         source_size=SIZE,
         border="crop",
-        mapped_sources=paths[:1],
-        mapped_destinations=destination,
+        sources=paths[:1],
+        placements=_marks(destination),
     )
 
     for frame in range(FRAMES):
@@ -97,8 +108,8 @@ def test_one_pair_only_translates_it_never_rotates_or_scales():
         _identity_motion(),
         source_size=SIZE,
         border="crop",
-        mapped_sources=paths[:1],
-        mapped_destinations=np.array([[160.0, 120.0]]),
+        sources=paths[:1],
+        placements=_marks(np.array([[160.0, 120.0]])),
     )
     for transform in plan.transforms:
         assert transform.rotation == pytest.approx(0.0, abs=1e-12)
@@ -131,8 +142,8 @@ def test_two_pairs_undo_a_rotating_zooming_camera():
         _identity_motion(),
         source_size=SIZE,
         border="crop",
-        mapped_sources=paths,
-        mapped_destinations=destinations,
+        sources=paths,
+        placements=_marks(destinations),
     )
 
     worst = 0.0
@@ -159,8 +170,8 @@ def test_three_pairs_that_disagree_are_least_squares_not_a_failure():
         _identity_motion(),
         source_size=SIZE,
         border="crop",
-        mapped_sources=sources,
-        mapped_destinations=destinations,
+        sources=sources,
+        placements=_marks(destinations),
     )
 
     landed = np.stack([plan.transforms[0].apply(sources[k, 0]) for k in range(3)])
@@ -177,8 +188,8 @@ def test_a_mapping_needs_both_halves_of_every_pair():
             _identity_motion(),
             source_size=SIZE,
             border="crop",
-            mapped_sources=paths,
-            mapped_destinations=np.array([[10.0, 10.0]]),
+            sources=paths,
+            placements=_marks(np.array([[10.0, 10.0]])),
         )
 
 
@@ -189,8 +200,8 @@ def test_a_mapping_over_a_different_clip_is_refused():
             _identity_motion(frames=FRAMES + 10),
             source_size=SIZE,
             border="crop",
-            mapped_sources=paths,
-            mapped_destinations=np.stack([paths[0, 0], paths[1, 0]]),
+            sources=paths,
+            placements=_marks(np.stack([paths[0, 0], paths[1, 0]])),
         )
 
 
@@ -204,8 +215,8 @@ def test_a_gap_in_a_mapped_track_is_held_not_lurched_through():
         _identity_motion(),
         source_size=SIZE,
         border="crop",
-        mapped_sources=holed,
-        mapped_destinations=np.stack([paths[0, 0], paths[1, 0]]),
+        sources=holed,
+        placements=_marks(np.stack([paths[0, 0], paths[1, 0]])),
     )
     for transform in plan.transforms:
         assert np.isfinite([transform.tx, transform.ty, transform.rotation, transform.scale]).all()
@@ -214,28 +225,78 @@ def test_a_gap_in_a_mapped_track_is_held_not_lurched_through():
 # -- the options model ---------------------------------------------------------
 
 
-def test_a_map_target_needs_at_least_one_pair():
-    with pytest.raises(RenderError, match="at least one"):
-        StabilizationTarget(mode="map")
-
-
-def test_a_point_cannot_be_mapped_to_two_places():
+def test_two_marks_cannot_share_an_id():
     with pytest.raises(RenderError, match="duplicates"):
         StabilizationTarget(
-            mode="map",
-            pairs=(TargetPair("p1", 10.0, 10.0), TargetPair("p1", 20.0, 20.0)),
+            points=(
+                TargetPoint(id="t1", place=Placement(0.1, 0.1)),
+                TargetPoint(id="t1", place=Placement(0.2, 0.2)),
+            )
         )
+
+
+def test_a_track_cannot_be_held_twice_by_one_mark():
+    with pytest.raises(RenderError, match="only be mapped once"):
+        TargetPoint(id="t1", point_ids=("p1", "p1"))
 
 
 def test_the_target_round_trips_through_its_dict_form():
     target = StabilizationTarget(
-        mode="map", pairs=(TargetPair("p1", 10.0, 20.0), TargetPair("p2", 30.0, 40.0))
+        points=(
+            TargetPoint(id="t1", place=Placement(0.1, 0.2), point_ids=("p1",)),
+            TargetPoint(id="t2", place=Placement(0.3, 0.4), point_ids=("p2",), source="smoothed"),
+        )
     )
     restored = StabilizationTarget.from_dict(target.to_dict())
     assert restored == target
     assert restored.uses_rotation_and_scale is True
-    single = StabilizationTarget(mode="map", pairs=(TargetPair("p1", 1.0, 2.0),))
+    single = StabilizationTarget(points=(TargetPoint(id="t1", place=Placement(0.1, 0.2)),))
     assert single.uses_rotation_and_scale is False
+    assert single.points[0].label() == "all tracks"
+    assert restored.points[1].label() == "smoothed(p2)"
+
+
+def test_two_marks_land_on_their_output_fractions_and_leave_no_zoom_to_apply():
+    """Todo 1, eighth round: two marks state the framing completely.
+
+    Each one is a fraction of the delivered frame, and with two of them the
+    similarity that satisfies both is unique — so an auto-zoom on top would
+    slide them both off. The plan therefore does not zoom, and reports the gaps
+    that leaves instead of hiding them.
+    """
+    paths, _start = _moving_paths(lambda f: SimilarityTransform(tx=3.0 * f, rotation=0.01 * f))
+    marks = np.array([[0.25, 0.3], [0.7, 0.65]])
+
+    plan = StabilizationPlan.build(
+        _identity_motion(),
+        source_size=SIZE,
+        border="auto_zoom",
+        sources=paths,
+        placements=marks,
+    )
+
+    assert plan.geometry.zoom == pytest.approx(1.0)
+    assert plan.geometry.gaps is True  # honest, rather than zoomed away
+    width, height = plan.geometry.width, plan.geometry.height
+    for frame in (0, 11, FRAMES - 1):
+        for k in range(2):
+            landed = plan.output_transform(frame).apply(paths[k, frame])
+            assert landed == pytest.approx([marks[k, 0] * width, marks[k, 1] * height], abs=1e-6)
+
+
+def test_one_mark_still_gets_the_auto_zoom():
+    """A single correspondence only translates, so the zoom is still free."""
+    paths, _start = _moving_paths(lambda f: SimilarityTransform(tx=2.0 * f))
+    plan = StabilizationPlan.build(
+        _identity_motion(),
+        source_size=SIZE,
+        border="auto_zoom",
+        sources=paths[:1],
+        placements=np.array([[0.5, 0.5]]),
+    )
+    assert plan.geometry.zoom > 1.0
+    landed = plan.output_transform(FRAMES - 1).apply(paths[0, FRAMES - 1])
+    assert landed == pytest.approx([plan.geometry.width / 2, plan.geometry.height / 2], abs=1e-6)
 
 
 def test_a_frame_with_no_confidence_still_gets_a_transform():
@@ -255,9 +316,9 @@ def test_a_frame_with_no_confidence_still_gets_a_transform():
         _identity_motion(),
         source_size=SIZE,
         border="crop",
-        mapped_sources=paths,
-        mapped_destinations=destinations,
-        mapped_weights=weights,
+        sources=paths,
+        placements=_marks(destinations),
+        weights=weights,
     )
 
     assert len(plan.transforms) == FRAMES

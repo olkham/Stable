@@ -121,15 +121,15 @@ def test_moving_the_point_invalidates_its_cached_patches(client, tracked):
     assert after.content != before.content
 
 
-def test_a_new_keyframes_patch_is_rendered_before_anything_asks_for_it(client, tracked):
-    """Todo 3, sixth round: "when a patch/keyframe is made it should be cached".
+def test_a_new_anchors_patch_is_rendered_before_anything_asks_for_it(client, tracked):
+    """Todo 3, sixth round: "when a patch/anchor is made it should be cached".
 
     The cache was already there and already correct — what filled it was the
     first *request*, which on the panel that judges texture is a seek into the
-    full-resolution clip. So a card with eight keyframes cost eight of those on
+    full-resolution clip. So a card with eight anchors cost eight of those on
     every fresh server, which is the "slow to load" being reported.
 
-    Placing the keyframe is the moment its pixels are known and the moment
+    Placing the anchor is the moment its pixels are known and the moment
     nobody is waiting on a thumbnail, so that is when it is rendered. The
     assertion is that the *first* request for it is already a cache hit: it is
     answered with no proxy store and no video source available at all, which
@@ -158,8 +158,8 @@ def test_a_new_keyframes_patch_is_rendered_before_anything_asks_for_it(client, t
         assert served.content
 
 
-def test_listing_a_grid_warms_the_keyframes_it_lists(client, tracked):
-    """Which is what covers a restart, and every keyframe placed before this existed.
+def test_listing_a_grid_warms_the_anchors_it_lists(client, tracked):
+    """Which is what covers a restart, and every anchor placed before this existed.
 
     Warming on creation cannot help a cache that starts empty every time the
     server does. The panel asks for its grid before it asks for any image in it,
@@ -172,7 +172,7 @@ def test_listing_a_grid_warms_the_keyframes_it_lists(client, tracked):
     listed = client.get(f"/api/projects/{project_id}/points/p1/patches?frame=4")
     assert listed.status_code == 200, listed.text
     frames = [patch["frame"] for patch in listed.json()["patches"]]
-    assert frames, "the fixture point has no keyframes to warm"
+    assert frames, "the fixture point has no anchors to warm"
     assert drain_patch_warmup(), "the warmer never finished"
 
     with (

@@ -1,4 +1,4 @@
-"""Promotion of manual corrections to keyframes, and bounding a run.
+"""Promotion of manual corrections to anchors, and bounding a run.
 
 The pure halves of todos 11, 12 and 20:
 :func:`stable.core.corrections.ground_truth_anchors` decides *which* edits count
@@ -79,7 +79,7 @@ def test_promoted_anchors_come_back_in_frame_order() -> None:
 # -- a point's effective ground truth ---------------------------------------------
 
 
-def test_effective_anchors_unions_pins_and_promotions() -> None:
+def test_effective_anchors_unions_a_points_own_and_its_promotions() -> None:
     point = PointSpec(
         id="p1",
         queries=[Query(frame=0, x=1.0, y=1.0), Query(frame=40, x=2.0, y=2.0)],
@@ -88,7 +88,7 @@ def test_effective_anchors_unions_pins_and_promotions() -> None:
     assert [q.frame for q in effective_anchors(point)] == [0, 20, 40]
 
 
-def test_a_correction_outranks_a_pin_on_the_same_frame() -> None:
+def test_a_correction_outranks_an_anchor_on_the_same_frame() -> None:
     """The correction is the later statement about where the feature is."""
     point = PointSpec(
         id="p1",
@@ -107,21 +107,21 @@ def test_an_unbounded_run_covers_everything_in_its_direction() -> None:
     assert bounded_frame_range("bidir", 10, 100) == (0, 100)
 
 
-def test_a_run_can_stop_at_the_neighbouring_keyframe() -> None:
+def test_a_run_can_stop_at_the_neighbouring_anchor() -> None:
     anchors = [Query(frame=5, x=0.0, y=0.0), Query(frame=40, x=0.0, y=0.0)]
-    assert bounded_frame_range("fwd", 10, 100, anchors=anchors, stop_at_keyframe=True) == (10, 41)
-    assert bounded_frame_range("bwd", 10, 100, anchors=anchors, stop_at_keyframe=True) == (5, 11)
-    assert bounded_frame_range("bidir", 10, 100, anchors=anchors, stop_at_keyframe=True) == (5, 41)
+    assert bounded_frame_range("fwd", 10, 100, anchors=anchors, stop_at_anchor=True) == (10, 41)
+    assert bounded_frame_range("bwd", 10, 100, anchors=anchors, stop_at_anchor=True) == (5, 11)
+    assert bounded_frame_range("bidir", 10, 100, anchors=anchors, stop_at_anchor=True) == (5, 41)
 
 
-def test_stopping_at_a_keyframe_uses_the_nearest_one() -> None:
+def test_stopping_at_an_anchor_uses_the_nearest_one() -> None:
     anchors = [Query(frame=f, x=0.0, y=0.0) for f in (2, 6, 30, 60)]
-    assert bounded_frame_range("bidir", 10, 100, anchors=anchors, stop_at_keyframe=True) == (6, 31)
+    assert bounded_frame_range("bidir", 10, 100, anchors=anchors, stop_at_anchor=True) == (6, 31)
 
 
-def test_stopping_at_a_keyframe_with_none_that_way_is_a_no_op() -> None:
+def test_stopping_at_an_anchor_with_none_that_way_is_a_no_op() -> None:
     anchors = [Query(frame=10, x=0.0, y=0.0)]
-    assert bounded_frame_range("bidir", 10, 100, anchors=anchors, stop_at_keyframe=True) == (0, 100)
+    assert bounded_frame_range("bidir", 10, 100, anchors=anchors, stop_at_anchor=True) == (0, 100)
 
 
 def test_a_run_can_be_limited_to_a_frame_count() -> None:
@@ -133,10 +133,10 @@ def test_a_run_can_be_limited_to_a_frame_count() -> None:
 def test_the_tighter_of_the_two_bounds_wins() -> None:
     anchors = [Query(frame=13, x=0.0, y=0.0)]
     assert bounded_frame_range(
-        "fwd", 10, 100, anchors=anchors, max_frames=20, stop_at_keyframe=True
+        "fwd", 10, 100, anchors=anchors, max_frames=20, stop_at_anchor=True
     ) == (10, 14)
     assert bounded_frame_range(
-        "fwd", 10, 100, anchors=anchors, max_frames=1, stop_at_keyframe=True
+        "fwd", 10, 100, anchors=anchors, max_frames=1, stop_at_anchor=True
     ) == (10, 12)
 
 

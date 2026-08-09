@@ -2,9 +2,10 @@
 
 Three types matter here:
 
-* :class:`Query` — a user-placed anchor keyframe: "at frame ``f`` this point is
-  truly at ``(x, y)``". A point owns a *list* of these (see the multi-anchor
-  section of ``PLAN.md``).
+* :class:`Query` — a user-placed **anchor**: "at frame ``f`` this point is truly
+  at ``(x, y)``". A point owns a *list* of these (see the multi-anchor section
+  of ``PLAN.md``). ``Query`` is the storage name, fixed by schema v1's
+  ``points[].queries``; *anchor* is the only word the UI uses for it.
 * :class:`TrackResult` — the output of one tracker run for ``N`` points, the
   single type everything downstream sees. This is what makes trackers swappable.
 * :class:`PointTrack` — one point's slice of a :class:`TrackResult`. Per-point
@@ -49,7 +50,7 @@ def _freeze(array: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True)
 class Query:
-    """A user-placed anchor keyframe: a position known to be true.
+    """A user-placed anchor: a position known to be true.
 
     A point's ``queries`` list may hold several of these across the clip;
     tracking runs bidirectionally from each one and the runs are merged by

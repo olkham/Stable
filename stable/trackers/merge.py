@@ -1,7 +1,7 @@
 """Multi-anchor merging — tracker-agnostic, applied to every plugin.
 
 The robustness feature that separates Stable from a plain "track from one
-template" tool: a point owns **several user-placed anchor keyframes**
+template" tool: a point owns **several user-placed anchors**
 (:class:`~stable.core.types.Query`) spread across the clip. Tracking runs
 bidirectionally from every anchor, and the runs are merged here — never inside a
 plugin. Plugins only ever do single-run tracking (see
@@ -55,7 +55,7 @@ bounded by the anchors either side of it — so within a full multi-anchor track
 the blend above is the whole story. Runs started somewhere else (a "retrack from
 here", or a bounded run the operator asked for) do cross anchors, and for those
 :func:`enforce_anchor_agreement` is the guard: a run that arrives at a
-user-placed keyframe more than ``tolerance_px`` away from it is **stopped there**
+user-placed anchor more than ``tolerance_px`` away from it is **stopped there**
 rather than allowed to carry on from a position the user has already said is
 wrong. The disagreement is returned as an :class:`AnchorViolation` so the caller
 can report *where* and *by how much* instead of silently losing frames.
@@ -250,7 +250,7 @@ class AnchorViolation:
 
     Produced by :func:`enforce_anchor_agreement`. It is the "where, and by how
     much" the operator needs: the run was stopped at :attr:`frame`, having
-    wandered :attr:`distance` pixels away from the keyframe they placed there.
+    wandered :attr:`distance` pixels away from the anchor they placed there.
 
     Args:
         frame: The anchor frame the run was stopped at.
@@ -284,7 +284,7 @@ def plan_anchor_runs(anchors: list[Query], frame_range: tuple[int, int]) -> list
     """Turn a point's anchors into the minimal set of single-direction runs.
 
     Args:
-        anchors: The point's anchor keyframes, in any order. Duplicate frames
+        anchors: The point's anchors, in any order. Duplicate frames
             are rejected — two truths for one frame is a UI-level error.
         frame_range: Half-open ``(start, end)`` absolute range to cover.
 
@@ -335,7 +335,7 @@ def enforce_anchor_agreement(
 ) -> tuple[PointTrack, list[AnchorViolation]]:
     """Stop a run at the first anchor it disagrees with, in each direction.
 
-    A user-placed keyframe is ground truth. A run travelling away from
+    A user-placed anchor is ground truth. A run travelling away from
     ``origin`` that arrives at one more than ``tolerance_px`` away from it has
     lost the feature: it is not merely imprecise there, everything it produces
     *beyond* that frame is stepped off a position the operator has already said
@@ -344,13 +344,13 @@ def enforce_anchor_agreement(
     can tell the operator where it happened and by how much.
 
     Anchors are examined in travel order, so a run that agrees with the first
-    keyframe it meets carries on to the next one — several anchors in a row are
+    anchor it meets carries on to the next one — several anchors in a row are
     all honoured, which is what makes "track everything forwards and backwards"
-    across many keyframes safe.
+    across many anchors safe.
 
     Args:
         track: The run's output over the whole clip timeline.
-        anchors: The point's anchor keyframes. The one sitting on ``origin``
+        anchors: The point's anchors. The one sitting on ``origin``
             (the run's own query) is ignored — a run never disagrees with the
             position it started from.
         origin: Absolute frame the run started from.
@@ -509,7 +509,7 @@ def merge_anchor_runs(
     Args:
         runs: The executed runs for a single point, typically produced from
             :func:`plan_anchor_runs`. May be empty.
-        anchors: The point's anchor keyframes. The merged track passes through
+        anchors: The point's anchors. The merged track passes through
             each of these exactly.
         n_frames: Clip length ``T``; every run's track must be this long.
         config: Blending tuning; defaults to :class:`MergeConfig`.

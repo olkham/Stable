@@ -42,9 +42,11 @@ __all__ = [
     "RetrackCorrection",
     "CORRECTION_TYPES",
     "GROUND_TRUTH_KINDS",
+    "ANCHORING_KINDS",
     "correction_from_dict",
     "apply_corrections",
     "ground_truth_anchors",
+    "corrections_anchored_at",
     "RetrackResolver",
     "FALLOFF_SHAPES",
     "INTERPOLATION_METHODS",
@@ -52,7 +54,7 @@ __all__ = [
 ]
 
 FALLOFF_SHAPES: tuple[str, ...] = ("linear", "smooth")
-"""How an offset decays to zero away from its keyframe (``smooth`` = smoothstep)."""
+"""How an offset decays to zero away from its own frame (``smooth`` = smoothstep)."""
 
 INTERPOLATION_METHODS: tuple[str, ...] = ("linear", "spline")
 """Gap-fill interpolation methods."""
@@ -118,7 +120,7 @@ class OffsetCorrection(Correction):
     offset applies to that single frame only.
 
     Args:
-        frame: Absolute frame index of the keyframe.
+        frame: Absolute frame index the full offset is applied at.
         dx: Horizontal offset in pixels.
         dy: Vertical offset in pixels.
         falloff_before: Frames over which the offset ramps in.
@@ -140,7 +142,7 @@ class OffsetCorrection(Correction):
     shape: str = "smooth"
 
     def __post_init__(self) -> None:
-        """Validate the offset keyframe (dataclass hook)."""
+        """Validate the offset (dataclass hook)."""
         if self.frame < 0:
             raise ContractError(f"OffsetCorrection.frame must be >= 0, got {self.frame}")
         if self.falloff_before < 0 or self.falloff_after < 0:
@@ -178,7 +180,7 @@ class ReplaceCorrection(Correction):
     y: float
 
     def __post_init__(self) -> None:
-        """Validate the replacement keyframe (dataclass hook)."""
+        """Validate the replacement (dataclass hook)."""
         if self.frame < 0:
             raise ContractError(f"ReplaceCorrection.frame must be >= 0, got {self.frame}")
 
@@ -307,12 +309,24 @@ GROUND_TRUTH_KINDS: tuple[str, ...] = ("replace", "retrack")
 """Correction kinds that state an absolute position, i.e. *are* ground truth.
 
 These are the edits where the operator said "the feature is **here**", in
-pixels, so they promote to anchor keyframes (see :func:`ground_truth_anchors`).
+pixels, so they promote to anchors (see :func:`ground_truth_anchors`).
 ``offset`` is deliberately absent: it is a relative nudge, meaningful only
 against the track it was applied to. The server promotes a drag by recording the
 resulting absolute position as a companion ``replace`` at the same frame, which
 is what makes the promotion survive a re-track without doubling the nudge.
 ``gap_fill`` and ``delete_range`` state no position at all.
+"""
+
+ANCHORING_KINDS: tuple[str, ...] = ("replace", "retrack", "offset")
+"""Correction kinds that :func:`corrections_anchored_at` takes to *be* an anchor.
+
+:data:`GROUND_TRUTH_KINDS` plus ``offset``, and the extra entry is the whole
+reason this list exists separately. A drag on the frame is stored as an
+``offset`` and a companion ``replace`` at the same frame (see the server's
+``_promotion_for``); the ``replace`` is what shows up as an anchor, but the two
+are one gesture, and removing the anchor while leaving the nudge that placed it
+would move the point by a fraction of a pixel and look like the deletion did
+nothing at all.
 """
 
 
@@ -346,14 +360,14 @@ def correction_from_dict(data: dict[str, Any]) -> Correction:
 
 
 def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
-    """Return the anchor keyframes a point's manual corrections amount to.
+    """Return the anchors a point's manual corrections amount to.
 
     Every enabled correction that states an absolute position (see
     :data:`GROUND_TRUTH_KINDS`) is a place the operator has told the tool where
-    the feature actually is — which is precisely what an anchor keyframe is.
-    Promoting them means a later re-track plans its runs *through* those
-    positions and merges to pass exactly through them, instead of overwriting
-    the operator's work with a fresh guess.
+    the feature actually is — which is precisely what an anchor is. Promoting
+    them means a later re-track plans its runs *through* those positions and
+    merges to pass exactly through them, instead of overwriting the operator's
+    work with a fresh guess.
 
     Args:
         corrections: A point's correction layer, in order. Disabled entries are
@@ -375,6 +389,36 @@ def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
     return [by_frame[frame] for frame in sorted(by_frame)]
 
 
+def corrections_anchored_at(corrections: Sequence[Correction], frame: int) -> list[Correction]:
+    """Return the corrections that put an anchor on ``frame``.
+
+    The counterpart to :func:`ground_truth_anchors`: that one answers "which
+    anchors do these edits imply", this one answers "which edits does deleting
+    that anchor have to take with it". An anchor the operator can see and can
+    delete must be *one* thing, so removing it removes everything that asserted
+    it — otherwise a promoted anchor comes straight back the moment the list is
+    re-read, which is what "delete the correction on the Edit tab" used to mean.
+
+    Disabled corrections are skipped: a disabled edit states nothing, shows no
+    anchor, and is something the operator deliberately kept to compare against.
+
+    Args:
+        corrections: The point's correction layer, in order.
+        frame: Absolute frame index of the anchor being removed.
+
+    Returns:
+        The corrections to drop, in list order — see :data:`ANCHORING_KINDS` for
+        why a plain ``offset`` at that frame is one of them.
+    """
+    return [
+        correction
+        for correction in corrections
+        if correction.enabled
+        and correction.kind in ANCHORING_KINDS
+        and int(getattr(correction, "frame", -1)) == int(frame)
+    ]
+
+
 RetrackResolver = Callable[["RetrackCorrection"], PointTrack | None]
 """Looks up the cached run a :class:`RetrackCorrection` refers to.
 
@@ -392,7 +436,7 @@ def _smoothstep(values: np.ndarray) -> np.ndarray:
 
 
 def _falloff_weights(correction: OffsetCorrection, n_frames: int) -> np.ndarray:
-    """Return the ``[T]`` influence of an offset keyframe, ``1`` at its own frame.
+    """Return the ``[T]`` influence of an offset, ``1`` at its own frame.
 
     The weight ramps in over ``falloff_before`` frames and out over
     ``falloff_after``; a zero falloff on one side means the offset simply does
@@ -504,7 +548,7 @@ class _Editable:
 
 
 def _apply_offset(state: _Editable, correction: OffsetCorrection) -> None:
-    """Blend a nudge over the keyframe's falloff window."""
+    """Blend a nudge over the offset's falloff window."""
     weights = _falloff_weights(correction, state.n_frames)
     live = (weights > 0.0) & state.valid()
     if not live.any():
@@ -580,7 +624,7 @@ def apply_corrections(
     repair what a delete-range removed, and an offset can nudge a spliced
     retrack. The five semantics are:
 
-    * :class:`OffsetCorrection` — add ``(dx, dy)`` scaled by the keyframe's
+    * :class:`OffsetCorrection` — add ``(dx, dy)`` scaled by the offset's
       falloff weight, only where a position already exists (a nudge cannot
       invent a sample).
     * :class:`ReplaceCorrection` — hard-set one frame; confidence becomes

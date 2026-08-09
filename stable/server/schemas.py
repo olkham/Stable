@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from ..trackers.merge import DEFAULT_ANCHOR_TOLERANCE_PX
 
@@ -70,7 +70,7 @@ class PointCreate(BaseModel):
 
 
 class AnchorCreate(BaseModel):
-    """Body for ``POST /api/projects/{id}/points/{point_id}/anchors``: add an anchor pin."""
+    """Body for ``POST /api/projects/{id}/points/{point_id}/anchors``: add an anchor."""
 
     frame: int
     x: float
@@ -88,8 +88,8 @@ class TrackRequest(BaseModel):
     """Body for ``POST /api/projects/{id}/points/{point_id}/track``.
 
     ``anchor_tolerance_px`` is how far a run may land from one of the point's
-    keyframes before it is stopped there and the keyframe reported as
-    unreached; see :func:`stable.trackers.merge.enforce_anchor_agreement`.
+    anchors before it is stopped there and the anchor reported as unreached;
+    see :func:`stable.trackers.merge.enforce_anchor_agreement`.
     """
 
     tracker: str | None = None
@@ -192,10 +192,17 @@ class CorrectionUpdate(BaseModel):
 class RetrackRequest(BaseModel):
     """Body for ``POST /api/projects/{id}/points/{point_id}/retrack``.
 
-    A retrack is a *bounded* run, not a whole-clip one. ``x``/``y`` may be
+    A directional run from one frame, not a whole-clip one. ``x``/``y`` may be
     omitted to start from wherever the point already is at ``frame``, which is
-    what the panel's "track on to the next keyframe" buttons send.
+    what the panel's "track on to the next anchor" buttons send.
+
+    ``stop_at_keyframe`` is the previous name of ``stop_at_anchor`` and is still
+    accepted: the two words were the same thing (todo 6, seventh round), and a
+    browser tab left open across the rename must not start sending a bound the
+    server silently ignores.
     """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     frame: int
     x: float | None = None
@@ -204,7 +211,10 @@ class RetrackRequest(BaseModel):
     tracker: str | None = None
     device: str | None = None
     max_frames: int | None = Field(default=None, gt=0)
-    stop_at_keyframe: bool = False
+    stop_at_anchor: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("stop_at_anchor", "stop_at_keyframe"),
+    )
     anchor_tolerance_px: float = Field(default=DEFAULT_ANCHOR_TOLERANCE_PX, gt=0)
 
 

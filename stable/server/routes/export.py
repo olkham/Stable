@@ -40,7 +40,7 @@ from ...core.trackdata import AE_FORMAT, after_effects_keyframes
 from ...render.stabilize import render_stabilized
 from ...video.encode import AudioPlan, plan_audio
 from .. import motion as motion_glue
-from ..clip_range import effective_range
+from ..clip_range import effective_range, export_window
 from ..frames import frame_geometry
 from ..jobs import JobManager, get_job_manager
 from ..schemas import ExportVideoRequest
@@ -51,13 +51,17 @@ from . import solve as solve_routes
 __all__ = ["router", "TRACK_FORMATS"]
 
 NO_OP_DETAIL = (
-    "this render would not move the picture at all, so it would just re-encode the source: "
-    "the stabilisation warp is 'smoothed motion' minus 'solved motion', and nothing has "
-    "asked them to differ. Enable at least one smoothing filter in the Smoothing panel "
-    "(Butterworth at ~1 Hz is the usual starting point), or set a stabilisation target so a "
-    "tracked point is held still."
+    "this render would not move the picture at all, so it would just re-encode the source. "
+    "There are no target points, so the render falls back to undoing what the Smoothing panel "
+    "removed — and no filter is enabled there, so there is nothing to undo. Add a target point "
+    "(hold a track somewhere in the delivered frame), or enable a smoothing filter "
+    "(Butterworth at ~1 Hz is the usual starting point)."
 )
-"""Why an all-identity export is refused, and the two ways to fix it."""
+"""Why an all-identity export is refused, and the two ways to fix it.
+
+Only a project with no targets can reach it: a target pins a path to a mark on
+every frame, which moves the picture unless the shot was already perfectly still.
+"""
 
 router = APIRouter(prefix="/projects/{project_id}/export", tags=["export"])
 
@@ -92,9 +96,15 @@ def unique_render_name(directory: Path, requested: str | None) -> str:
     return candidate
 
 
-def _render_range(workspace: Workspace, project_id: str, total: int) -> tuple[int, int]:
-    """Return the frames an export should write: the In/Out range, or all of them."""
-    return effective_range(workspace.project_dir(project_id), total)
+def _render_range(
+    workspace: Workspace, project_id: str, total: int, options: Any
+) -> tuple[int, int]:
+    """Return the frames an export should write.
+
+    The export's own range where it states one, the In/Out markers otherwise —
+    see :func:`stable.server.clip_range.export_window`.
+    """
+    return export_window(workspace.project_dir(project_id), total, options.export_range)
 
 
 def _workspace() -> Workspace:
@@ -287,17 +297,22 @@ def export_video_route(
                 "alpha channel; switch the border policy to 'crop' or 'auto_zoom' to export video"
             ),
         )
-    options = solve_routes.load_options(workspace, project_id)
+    options = solve_routes.load_options(workspace, project_id, project)
+    clip = workspace.get_video_source(project_id)
+    total = min(motion.n_frames, clip.frame_count)
+    # Worked out before the plan, not after: a crop asked to fit the export
+    # range needs to know that range in order to be planned at all.
+    render_range = _render_range(workspace, project_id, total, options)
     try:
-        plan = motion_glue.build_plan(project, motion, options=options)
+        plan = motion_glue.build_plan(
+            project, motion, options=options, export_range=render_range
+        )
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if plan.is_no_op:
         raise HTTPException(status_code=400, detail=NO_OP_DETAIL)
     filename = unique_render_name(workspace.renders_dir(project_id), body.filename)
     codec, crf = body.codec, body.crf
-    clip = workspace.get_video_source(project_id)
-    render_range = _render_range(workspace, project_id, min(plan.n_frames, clip.frame_count))
 
     def _run(progress: Any) -> dict[str, Any]:
         proj = workspace.load_project(project_id)
@@ -317,10 +332,10 @@ def export_video_route(
             codec=codec,
             crf=crf,
             audio_source=source_clip,
-            # The In/Out markers as they were when this was queued, or the whole
-            # clip when none were set (todo 1). The plan still covers every
-            # frame — the warp for frame N is the warp for frame N whatever is
-            # written out — so this narrows the *render*, not the stabilisation.
+            # The export range as it was when this was queued — its own, or the
+            # In/Out markers (todo 1, todo 1, eighth round). The plan still covers every frame
+            # — the warp for frame N is the warp for frame N whatever is written
+            # out — so this narrows the *render*, not the stabilisation.
             frame_range=render_range,
             progress=progress,
         )
@@ -334,8 +349,11 @@ def export_video_route(
             "height": plan.geometry.height,
             "crop_scale": plan.geometry.crop_scale,
             "coverage": plan.geometry.coverage,
+            "crop_measured_frames": plan.geometry.measured_frames,
             "gaps": plan.geometry.gaps,
-            "target": plan_target(options),
+            "target": motion_glue.target_label(options.target),
+            "targets": [point.to_dict() for point in options.target.points],
+            "resolution": [plan.geometry.width, plan.geometry.height],
             "fill": None if plan.fill is None else plan.fill.mode,
             "max_displacement": plan.max_displacement,
             "audio": audio.mode,
@@ -347,14 +365,6 @@ def export_video_route(
     except RenderError as exc:  # pragma: no cover - planning happens inside the job
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"job_id": job.id, "filename": filename}
-
-
-def plan_target(options: Any) -> str:
-    """Return a short human label for what the render held still."""
-    target = options.target
-    if target.mode == "point":
-        return f"point {target.point_id}"
-    return {"frame": "smoothing only", "centroid": "all points"}.get(target.mode, target.mode)
 
 
 @router.get("/renders")
@@ -415,10 +425,13 @@ def export_preview(
     Returns:
         ``output``/``source`` sizes; ``rect``, the output rectangle mapped back
         into source pixels so the screen can draw it over the frame; the
-        measured ``coverage``, requested ``crop_scale`` and whether the fill
-        will be visible (``gaps``); ``max_displacement`` and ``is_no_op``, which
-        say whether this is a stabilisation at all; and ``targets``, one row per
-        mapped point saying where it lands and by how much it misses.
+        measured ``coverage``, requested ``crop_scale``, how many frames the
+        coverage was measured over (``crop_measured_frames``) and whether the
+        fill will be visible (``gaps``); ``export_window`` and ``clip_range``,
+        the frames that would be written and the In/Out markers they may differ
+        from; ``max_displacement`` and ``is_no_op``, which say whether this is a
+        stabilisation at all; and ``targets``, one row per mark saying where it
+        lands and by how much it misses.
 
     Raises:
         HTTPException: 409 if the project has not been solved and smoothed yet
@@ -431,17 +444,19 @@ def export_preview(
             status_code=409,
             detail="solve and smooth this project before previewing the export",
         )
-    options = solve_routes.load_options(workspace, project_id)
+    options = solve_routes.load_options(workspace, project_id, project)
     try:
         plan = solve_routes.preview_plan(workspace, project_id, project, motion)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     geometry = plan.geometry
+    window = _render_range(workspace, project_id, plan.n_frames, options)
     return {
-        **frame_geometry(project, plan, options, frame),
+        **frame_geometry(project, plan, options, frame, motion),
         "coverage": float(geometry.coverage),
         "crop_scale": float(geometry.crop_scale),
+        "crop_measured_frames": int(geometry.measured_frames),
         "zoom": float(geometry.zoom),
         "gaps": bool(geometry.gaps),
         "border": geometry.border,
@@ -449,6 +464,9 @@ def export_preview(
         "is_no_op": bool(plan.is_no_op),
         "no_op_detail": NO_OP_DETAIL if plan.is_no_op else None,
         "target": options.target.to_dict(),
+        "target_label": motion_glue.target_label(options.target),
+        "export_window": list(window),
+        "clip_range": list(effective_range(workspace.project_dir(project_id), plan.n_frames)),
     }
 
 

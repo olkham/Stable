@@ -124,7 +124,7 @@ def test_the_grid_previews_a_size_before_it_is_saved(client, template_point):
     assert client.get(f"/api/projects/{project_id}/points/p1/patches").json()["custom"] is False
 
 
-def test_a_keyframe_too_close_to_the_edge_is_reported_not_hidden(client, tiny_clip):
+def test_an_anchor_too_close_to_the_edge_is_reported_not_hidden(client, tiny_clip):
     """A patch the tracker would refuse must be flagged, with the reason."""
     path, source = tiny_clip
     detail = upload_clip(client, path)
@@ -144,7 +144,7 @@ def test_a_keyframe_too_close_to_the_edge_is_reported_not_hidden(client, tiny_cl
     assert "outside the frame" in patch.json()["detail"]
 
 
-def test_every_keyframe_gets_an_entry_in_the_grid(client, template_point):
+def test_every_anchor_gets_an_entry_in_the_grid(client, template_point):
     project_id, source = template_point
     for frame in (10, 20):
         x, y = source.true_position(frame)
@@ -219,7 +219,7 @@ def test_a_point_on_any_tracker_still_has_patches(client, lk_point):
     body = client.get(f"/api/projects/{project_id}/points/p1/patches").json()
 
     assert body["tracker"] == "lk"
-    assert body["patches"], "an LK point must still show its keyframe patch"
+    assert body["patches"], "an LK point must still show its anchor patch"
     assert (
         client.get(f"/api/projects/{project_id}/points/p1/patches/image?frame=0").status_code == 200
     )
@@ -247,7 +247,7 @@ def test_the_size_control_is_offered_only_where_it_would_do_something(client, te
 
 
 def test_the_current_frame_shows_where_the_tracker_put_the_point(client, lk_point):
-    """The "tracked region", not only the keyframes — what the report asked for."""
+    """The "tracked region", not only the anchors — what the report asked for."""
     project_id, source = lk_point
     frame = source.frame_count // 2
 
@@ -265,11 +265,11 @@ def test_the_current_frame_shows_where_the_tracker_put_the_point(client, lk_poin
     assert image.status_code == 200
 
 
-def test_a_keyframe_wins_over_the_track_on_the_same_frame(client, lk_point):
-    """On a pinned frame the patch shown is the one the operator stated."""
+def test_an_anchor_wins_over_the_track_on_the_same_frame(client, lk_point):
+    """On an anchored frame the patch shown is the one the operator stated."""
     project_id, _source = lk_point
     body = client.get(f"/api/projects/{project_id}/points/p1/patches?frame=0").json()
-    assert body["current"]["kind"] == "keyframe"
+    assert body["current"]["kind"] == "anchor"
 
 
 def test_an_untracked_frame_has_no_patch_rather_than_a_wrong_one(client, template_point):

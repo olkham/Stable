@@ -1,4 +1,4 @@
-"""``enforce_anchor_agreement``: a run stops at a keyframe it disagrees with.
+"""``enforce_anchor_agreement``: a run stops at an anchor it disagrees with.
 
 The tracker-agnostic half of todo 13. The merge has always *ended* on every
 anchor exactly; this is the rule that stops a run continuing past one it has
@@ -98,7 +98,7 @@ def test_the_run_stops_at_the_first_disagreement_not_the_worst() -> None:
     assert [v.frame for v in violations] == [10]
 
 
-def test_agreeing_keyframes_are_walked_through_to_reach_a_later_one() -> None:
+def test_agreeing_anchors_are_walked_through_to_reach_a_later_one() -> None:
     track = straight_track()
     anchors = [
         Query(frame=5, x=5.0, y=5.0),

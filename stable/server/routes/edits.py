@@ -13,7 +13,7 @@ Endpoints, all under ``/projects/{project_id}``:
 ============================================ ===================================
 ``GET/POST  /points/{id}/corrections``       list / append an edit
 ``PATCH/DELETE /points/{id}/corrections/{c}``  toggle / remove one
-``POST      /points/{id}/retrack``           re-track from a corrected position
+``POST      /points/{id}/retrack``           track one direction from one frame
 ``GET       /edits/history``                 undo/redo availability
 ``POST      /edits/undo`` / ``/edits/redo``  step the corrections stack
 ============================================ ===================================
@@ -127,8 +127,8 @@ def _promotion_for(
 ) -> ReplaceCorrection | None:
     """Return the ground-truth anchor a manual correction should be promoted to.
 
-    Todo 11: *every* manual correction that says where the feature is becomes a
-    keyframe, so a later re-track plans through it instead of overwriting it.
+    Todo 11: *every* manual correction that says where the feature is becomes an
+    anchor, so a later re-track plans through it instead of overwriting it.
 
     ``replace`` and ``retrack`` already carry an absolute position, so they are
     ground truth as they stand (see
@@ -174,9 +174,9 @@ def add_correction(
     ``{"kind": "offset", ...}`` or ``{"kind": "replace", ...}``; the curve
     editor's repair buttons become ``gap_fill`` and ``delete_range``.
 
-    A correction that states a position is also promoted to an anchor keyframe
-    (see :func:`_promotion_for`), which is what stops the next track or retrack
-    from overwriting the operator's work. Promotion happens inside the same
+    A correction that states a position is also promoted to an anchor (see
+    :func:`_promotion_for`), which is what stops the next track or directional
+    run from overwriting the operator's work. Promotion happens inside the same
     read-modify-write, so it is part of the *same* undo step — and because it
     lives entirely in the corrections layer, undo un-promotes it for free.
 
@@ -302,17 +302,18 @@ def retrack_point(
     workspace: Workspace = Depends(_workspace),
     jobs: JobManager = Depends(_jobs),
 ) -> dict[str, str]:
-    """Submit a job re-tracking a point from a corrected position.
+    """Submit a job tracking one direction from one frame.
 
-    Unlike adding an anchor — which re-runs the whole multi-anchor merge — this
-    repairs one direction from one frame and splices the result in as a
-    correction, leaving the merged baseline intact underneath.
+    This is what "track forwards / backwards from this anchor" runs. Unlike
+    ``POST .../track`` — which re-plans the whole multi-anchor merge over the
+    working range — it covers one direction from one frame and splices the
+    result in as a correction, leaving the merged baseline intact underneath.
 
-    The run is **bounded**: ``stop_at_keyframe`` takes it only as far as the
-    neighbouring keyframe (todo 12), ``max_frames`` only as far as the operator
-    asked (todo 20), and any keyframe it crosses and disagrees with stops it
-    dead (todo 13). Omitting ``x``/``y`` starts it from wherever the point
-    already is at that frame.
+    The run is **bounded**: ``stop_at_anchor`` takes it only as far as the
+    neighbouring anchor (todo 12), ``max_frames`` only as far as the operator
+    asked (todo 20), and any anchor it crosses and disagrees with stops it dead
+    (todo 13). Omitting ``x``/``y`` starts it from wherever the point already is
+    at that frame — the anchor there, if there is one.
 
     Raises:
         HTTPException: 404 if the point does not exist.
@@ -340,7 +341,7 @@ def retrack_point(
             device=body.device,
             progress=progress,
             max_frames=body.max_frames,
-            stop_at_keyframe=body.stop_at_keyframe,
+            stop_at_anchor=body.stop_at_anchor,
             anchor_tolerance_px=body.anchor_tolerance_px,
         )
 

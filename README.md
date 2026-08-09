@@ -41,8 +41,14 @@ stable sample          # writes ./stable-sample/{clip.mp4, tracks.json, curves.c
 no GPU, no model download, nothing to configure — so there is something
 concrete to look at within seconds of installing.
 
+Everything a track does hangs off its **anchors**. An anchor says "on this
+frame, this feature is *here*"; you can place one on any frame, track forwards
+or backwards from it with the `◀` / `▶` beside it on the track's card, and
+delete it again — which takes whatever was tracked from it with it. There is no
+second concept: an anchor is the only kind of mark a track carries.
+
 In the viewer: `←`/`→` step a frame, space plays, `↑`/`↓` jump between the
-selected track's keyframes, `A` pins it where it is on this frame (`⇧A` to
+selected track's anchors, `A` anchors it where it is on this frame (`⇧A` to
 click the position instead), `I`/`O` set the working range, `+`/`-`/`0` and the
 wheel zoom, middle-drag pans. Correcting a track needs no mode: select it and
 click or drag on the frame (`Ctrl+Z` undoes).
@@ -239,7 +245,7 @@ trackers' model code) — the frontend is already built into the package
 * **Raw output is immutable.** Track arrays are read-only. Manual edits are a
   typed correction layer applied on top, so undo is "drop a correction" and
   re-tracking never destroys the user's work.
-* **Multi-anchor by default.** A point holds several anchor keyframes; runs go
+* **Multi-anchor by default.** A point holds several anchors; runs go
   bidirectionally from each and are merged tracker-agnostically. The merged
   track passes through every anchor exactly, and disagreement between
   overlapping runs lowers confidence — that dip is the UI's "fix this" signal.

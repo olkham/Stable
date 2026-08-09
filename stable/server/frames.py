@@ -43,6 +43,7 @@ from ..render.warp import rescale_transform, warp_frame
 from ..smoothing.motion import SmoothedMotion
 from ..solver.motion import MotionSolve
 from . import motion as motion_glue
+from .clip_range import CLIP_RANGE_CACHE, export_window
 from .storage import Workspace
 
 __all__ = [
@@ -51,6 +52,7 @@ __all__ = [
     "solve_cache_path",
     "smoothing_cache_path",
     "load_options",
+    "export_range",
     "load_solve",
     "load_smoothed",
     "has_motion",
@@ -97,13 +99,39 @@ def _options_path(workspace: Workspace, project_id: str) -> Path:
     return motion_glue.options_path(workspace.project_dir(project_id))
 
 
-def load_options(workspace: Workspace, project_id: str) -> RenderOptions:
-    """Return a project's stabilisation options (target / crop / fill).
+def load_options(
+    workspace: Workspace, project_id: str, project: Project | None = None
+) -> RenderOptions:
+    """Return a project's stabilisation options (target / crop / fill / range).
 
     Shared by the preview, the frame stream and the export, so all three are
     planned from exactly the same choices.
+
+    Args:
+        workspace: The workspace holding the project.
+        project_id: Which project's options to read.
+        project: That project, when the caller already has it. Only needed to
+            read a sidecar written before todo 1, eighth round, whose ``map`` marks were
+            stored in pixels and need the clip size to become fractions.
     """
-    return motion_glue.load_render_options(workspace.project_dir(project_id))
+    size = (
+        (int(project.video.w), int(project.video.h))
+        if project is not None and project.video.w and project.video.h
+        else None
+    )
+    return motion_glue.load_render_options(workspace.project_dir(project_id), size)
+
+
+def export_range(
+    workspace: Workspace, project_id: str, options: RenderOptions, total: int
+) -> tuple[int, int]:
+    """Return the frames an export of this project would write.
+
+    The In/Out markers, or the export's own range where it states one — see
+    :func:`stable.server.clip_range.export_window`. Lives here because the crop
+    can be asked to fit exactly these frames, so planning needs it too.
+    """
+    return export_window(workspace.project_dir(project_id), total, options.export_range)
 
 
 def load_solve(workspace: Workspace, project_id: str) -> MotionSolve | None:
@@ -145,15 +173,22 @@ def has_motion(workspace: Workspace, project_id: str) -> bool:
 def _plan_key(workspace: Workspace, project_id: str, project: Project) -> tuple[Any, ...]:
     """Everything a built plan depends on, as a comparable tuple.
 
-    The mtimes cover the solve, the smoothing and the stabilisation options; the
-    border policy and clip size come off the project file, which the caches do
-    not carry.
+    The mtimes cover the solve, the smoothing, the stabilisation options and the
+    In/Out markers; the border policy and clip size come off the project file,
+    which the caches do not carry.
+
+    The markers are in here because a crop can be asked to fit the export range
+    (:attr:`~stable.render.options.CropSpec.limit_to_range`), and that range
+    falls back to them — so moving an In point changes the plan, and a key that
+    did not say so would keep serving the crop from where the marker used to be.
     """
     options_file = _options_path(workspace, project_id)
+    range_file = workspace.project_dir(project_id) / CLIP_RANGE_CACHE
     return (
         solve_cache_path(workspace, project_id).stat().st_mtime_ns,
         smoothing_cache_path(workspace, project_id).stat().st_mtime_ns,
         options_file.stat().st_mtime_ns if options_file.is_file() else 0,
+        range_file.stat().st_mtime_ns if range_file.is_file() else 0,
         project.render.border,
         project.video.w,
         project.video.h,
@@ -191,8 +226,12 @@ def preview_plan(
             raise FrameUnavailable(
                 "solve and smooth this project before previewing the export", status=409
             )
+        options = load_options(workspace, project_id, project)
         return motion_glue.build_plan(
-            project, smoothed, options=load_options(workspace, project_id)
+            project,
+            smoothed,
+            options=options,
+            export_range=export_range(workspace, project_id, options, smoothed.n_frames),
         )
 
     return motion_glue.cached_plan(project_id, key, build)
@@ -336,7 +375,11 @@ def _similarity(transform: Any) -> dict[str, float]:
 
 
 def frame_geometry(
-    project: Project, plan: StabilizationPlan, options: RenderOptions, index: int
+    project: Project,
+    plan: StabilizationPlan,
+    options: RenderOptions,
+    index: int,
+    motion: SmoothedMotion | None = None,
 ) -> dict[str, Any]:
     """Describe one frame's export geometry, without touching a pixel.
 
@@ -362,6 +405,14 @@ def frame_geometry(
     corners, so the two cannot disagree — which is precisely why it is sent
     rather than recovered from those corners by a second implementation of the
     same arithmetic.
+
+    Since todo 1, eighth round a target's *mark* is stated in output coordinates, so drawing
+    one needs ``output_warp`` rather than ``warp``: the mark is at ``place ×
+    output size`` on the output canvas, and at ``output_warp⁻¹`` of that on the
+    source canvas. ``warp`` is still sent because the viewer draws other things
+    in that space, and ``targets`` still reports the miss per mark — which for
+    is the least-squares miss when three or more marks disagree, and zero when
+    one or two of them do not.
     """
     total = len(plan.transforms)
     idx = max(0, min(int(index), total - 1)) if total else 0
@@ -387,8 +438,8 @@ def frame_geometry(
         "rect": rect,
         "warp": _similarity(warp),
         "output_warp": _similarity(output_transform),
-        # Two or more pairs is what turns a translation into a mapping that can
+        # Two or more marks is what turns a translation into a mapping that can
         # rotate and scale; the screen says which the operator has asked for.
         "uses_rotation_and_scale": bool(options.target.uses_rotation_and_scale),
-        "targets": motion_glue.target_residuals(project, plan, options.target, idx),
+        "targets": motion_glue.target_residuals(project, plan, options.target, idx, motion),
     }

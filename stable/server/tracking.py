@@ -18,21 +18,21 @@ disabling the correction) brings the original back.
 Anchors are ground truth, everywhere
 ------------------------------------
 Both kinds of run go through :func:`effective_anchors`, which is the single
-answer to "what has the operator told us about this point": its anchor
-keyframes *plus* every manual correction that states a position (see
+answer to "what has the operator told us about this point": its own anchors
+*plus* every manual correction that states a position (see
 :func:`stable.core.corrections.ground_truth_anchors`). That matters twice.
 
 #. **Planning.** A full track plans its runs through every one of them, so the
-   merge passes exactly through the operator's corrections as well as their
-   pins — a manual fix improves the next track instead of being overwritten by
-   it.
+   merge passes exactly through the operator's corrections as well as their own
+   anchors — a manual fix improves the next track instead of being overwritten
+   by it.
 #. **Guarding.** A run that crosses an anchor and disagrees with it is stopped
    there by :func:`stable.trackers.merge.enforce_anchor_agreement` instead of
    drifting past, and the disagreement is reported (frame + pixels) all the way
    out to the job result, the sidecar report and the timeline.
 
 Before this, a retrack simply spliced over whatever anchors lay in its
-direction: the user's keyframes were silently discarded by the very run that was
+direction: the user's anchors were silently discarded by the very run that was
 supposed to respect them.
 
 Watching a run happen
@@ -93,6 +93,7 @@ __all__ = [
     "run_point_tracking",
     "run_point_retrack",
     "effective_anchors",
+    "anchors_changed",
     "bounded_frame_range",
     "report_path_for",
     "retrack_path_for",
@@ -210,9 +211,9 @@ def load_violations(path: Path) -> list[dict[str, Any]]:
 def effective_anchors(point: PointSpec) -> list[Query]:
     """Return every position the operator has stated for a point, by frame.
 
-    The union of the point's anchor keyframes and the anchors its enabled
-    manual corrections promote to (todo 11). A correction wins over a pin on the
-    same frame: it is the later statement of where the feature is.
+    The union of the point's own anchors and the anchors its enabled manual
+    corrections promote to (todo 11). A correction wins over a stored anchor on
+    the same frame: it is the later statement of where the feature is.
 
     Args:
         point: The point whose ground truth is wanted.
@@ -234,15 +235,15 @@ def bounded_frame_range(
     *,
     anchors: list[Query] | None = None,
     max_frames: int | None = None,
-    stop_at_keyframe: bool = False,
+    stop_at_anchor: bool = False,
 ) -> tuple[int, int]:
     """Return the half-open frame range a directional run should cover.
 
     A run defaults to "everything in that direction". Two options bound it, and
     the tighter of the two wins:
 
-    * ``stop_at_keyframe`` — stop at the next keyframe forwards / previous
-      keyframe backwards (todo 12). With no keyframe that way it is a no-op.
+    * ``stop_at_anchor`` — stop at the next anchor forwards / previous anchor
+      backwards (todo 12). With no anchor that way it is a no-op.
     * ``max_frames`` — cover at most this many frames beyond ``frame``
       (todo 20), so a repair costs seconds rather than the whole clip.
 
@@ -250,9 +251,9 @@ def bounded_frame_range(
         direction: ``"fwd"``, ``"bwd"`` or ``"bidir"``.
         frame: Absolute frame the run starts from.
         n_frames: Clip length ``T``.
-        anchors: The point's ground-truth anchors, needed by ``stop_at_keyframe``.
+        anchors: The point's ground-truth anchors, needed by ``stop_at_anchor``.
         max_frames: Maximum number of frames to cover beyond ``frame``.
-        stop_at_keyframe: Stop at the neighbouring keyframe.
+        stop_at_anchor: Stop at the neighbouring anchor.
 
     Returns:
         A half-open ``(start, end)`` absolute range that always contains
@@ -267,7 +268,7 @@ def bounded_frame_range(
 
     reach_fwd = n_frames - 1 - frame
     reach_bwd = frame
-    if stop_at_keyframe:
+    if stop_at_anchor:
         after = [f for f in frames if f > frame]
         before = [f for f in frames if f < frame]
         if after:
@@ -284,15 +285,27 @@ def bounded_frame_range(
 
 
 def _save_report(
-    path: Path, result: MergeResult, violations: list[AnchorViolation] | None = None
+    path: Path,
+    result: MergeResult,
+    violations: list[AnchorViolation] | None = None,
+    anchors: list[Query] | None = None,
 ) -> None:
     """Write a :class:`~stable.trackers.merge.MergeReport` as JSON.
 
     ``anchor_violations`` (and the ``flagged_anchors`` frame list derived from
     it) ride along in the same sidecar so reopening a project keeps the "this
-    keyframe was never actually reached" signal the timeline draws red — it is a
+    anchor was never actually reached" signal the timeline draws red — it is a
     property of the run, not something recomputable from the merged track, whose
     anchor passthrough is exact by construction.
+
+    ``anchors`` records the point's *own* anchors (``points[].queries``) as they
+    stood when the run was planned, with their positions, which is what
+    :func:`anchors_changed` compares against. Positions, because moving an
+    anchor without moving it to another frame leaves ``anchor_frames``
+    identical while the merged track still runs through where it used to be;
+    the point's own anchors rather than the effective set, because the promoted
+    ones belong to corrections, and a correction applies itself to the displayed
+    track whether or not a run has been planned through it.
     """
     report = result.report
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,10 +315,50 @@ def _save_report(
         "contributions": [int(v) for v in report.contributions.tolist()],
         "disagreement": disagreement,
         "anchor_frames": list(report.anchor_frames),
+        "anchors": [q.to_dict() for q in (anchors or [])],
         "anchor_violations": [v.to_dict() for v in breaches],
         "flagged_anchors": sorted({v.frame for v in breaches}),
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def anchors_changed(point: PointSpec, report: dict[str, Any] | None) -> bool:
+    """Whether a point's anchors have moved on since the track was computed.
+
+    An anchor is an *input* to tracking, so changing one leaves the stored track
+    answering a question nobody is asking any more — it still passes exactly
+    through an anchor that has been deleted, and not at all through one just
+    placed. Re-running is the operator's call (a full track is minutes of GPU on
+    a real clip, and starting one behind their back would be worse than saying
+    nothing), so this is the flag the card raises next to the button.
+
+    Only the point's *own* anchors count. A correction-promoted anchor arrives
+    with the correction that applies it, so the displayed track already honours
+    it; it is the operator's own anchors that a run has to be re-planned through
+    before anything changes.
+
+    Args:
+        point: The point, with its current anchors.
+        report: The sidecar of the run that produced its track, or ``None`` when
+            there is no track to be stale.
+
+    Returns:
+        Whether the point's anchors differ from the ones the run recorded. False
+        when there is no track yet (an untracked point is not out of date) and
+        false for a report written before this was recorded — a sidecar that
+        cannot answer the question must not be read as a "yes".
+    """
+    if report is None:
+        return False
+    recorded = report.get("anchors")
+    if not isinstance(recorded, list):
+        return False
+    try:
+        was = [Query.from_dict(dict(entry)) for entry in recorded]
+    except StableError:  # pragma: no cover - corrupt sidecar
+        return False
+    now = point.sorted_queries()
+    return [(q.frame, q.x, q.y) for q in now] != [(q.frame, q.x, q.y) for q in was]
 
 
 def load_report(path: Path) -> dict[str, Any] | None:
@@ -328,11 +381,11 @@ def run_point_tracking(
 ) -> dict[str, Any]:
     """Track one point's anchors, merge the runs, and persist the result.
 
-    Every anchor the operator has stated — pins *and* promoted manual
-    corrections, see :func:`effective_anchors` — is planned through, so the
-    merged track passes exactly through all of them. Runs are guarded: one that
-    reaches a keyframe it disagrees with is stopped there rather than allowed to
-    drift on, and that keyframe comes back flagged.
+    Every anchor the operator has stated — the point's own *and* the ones its
+    manual corrections were promoted to, see :func:`effective_anchors` — is
+    planned through, so the merged track passes exactly through all of them.
+    Runs are guarded: one that reaches an anchor it disagrees with is stopped
+    there rather than allowed to drift on, and that anchor comes back flagged.
 
     Args:
         workspace: The server's project storage.
@@ -347,7 +400,7 @@ def run_point_tracking(
             from one frame is :func:`run_point_retrack`.
         device: Compute device override; ``None`` selects automatically.
         progress: A ``(fraction, message)`` progress callback.
-        anchor_tolerance_px: How far a run may land from a keyframe before it is
+        anchor_tolerance_px: How far a run may land from an anchor before it is
             stopped there.
 
     Returns:
@@ -372,7 +425,7 @@ def run_point_tracking(
     anchors = [q for q in effective_anchors(point) if frame_range[0] <= q.frame < frame_range[1]]
     if not anchors:
         raise ProjectError(
-            f"point {point_id!r} has no anchor keyframes inside frames "
+            f"point {point_id!r} has no anchors inside frames "
             f"[{frame_range[0]}, {frame_range[1]}) to track from"
         )
 
@@ -417,7 +470,12 @@ def run_point_tracking(
     tracks_dir.mkdir(parents=True, exist_ok=True)
     npz_path = tracks_dir / f"{point_id}.npz"
     merge_result.track.save_npz(npz_path)
-    _save_report(report_path_for(npz_path), merge_result, violations)
+    # The point's *own* anchors, not the effective set this run planned through:
+    # see `anchors_changed`, which reads this back to answer "have the operator's
+    # anchors moved on since?". Recording the effective set would answer "yes"
+    # the moment the point has any correction at all, which is not a change and
+    # not something re-tracking would settle.
+    _save_report(report_path_for(npz_path), merge_result, violations, point.sorted_queries())
 
     def _mutate(p: Project) -> None:
         spec = p.point(point_id)
@@ -453,42 +511,53 @@ def run_point_retrack(
     device: str | None,
     progress: Any,
     max_frames: int | None = None,
-    stop_at_keyframe: bool = False,
+    stop_at_anchor: bool = False,
     anchor_tolerance_px: float = DEFAULT_ANCHOR_TOLERANCE_PX,
 ) -> dict[str, Any]:
-    """Re-track a point from a corrected position and append the correction.
+    """Track one direction from one frame, and splice the run in as a correction.
 
-    The run is executed once, cached on disk, and referenced by a new
+    This is "track forwards / backwards from this anchor" (and its
+    from-the-playhead sibling, "carry on from here"). The run is executed once,
+    cached on disk, and referenced by a new
     :class:`~stable.core.corrections.RetrackCorrection` appended to the point —
-    so it is undoable like every other edit and costs nothing to re-apply when
-    the project is reopened.
+    so it is undoable like every other edit, costs nothing to re-apply when the
+    project is reopened, and goes away again with the anchor it started from
+    (see :func:`stable.core.corrections.corrections_anchored_at`).
 
     The run is bounded and guarded rather than open-ended:
 
-    * ``stop_at_keyframe`` / ``max_frames`` cap how far it goes (todos 12, 20);
-    * any keyframe it *does* reach and disagree with stops it there (todo 13),
-      so a retrack can never silently overwrite the operator's own anchors.
+    * ``stop_at_anchor`` / ``max_frames`` cap how far it goes (todos 12, 20);
+    * any anchor it *does* reach and disagree with stops it there (todo 13),
+      so a run can never silently overwrite the operator's own anchors.
 
     Because a correction only ever splices the frames its cached run actually
     covered, bounding the run bounds the edit — no extra range bookkeeping is
     needed in :func:`~stable.core.corrections.apply_corrections`.
 
+    A point that has never been tracked gets an all-``NaN`` baseline written for
+    it here (todo 6, seventh round). Corrections splice *onto* a raw track, and
+    without one this whole operation computed a run that
+    :func:`load_display_track` would then refuse to show — which is why the UI
+    could only offer it once a full track already existed, and why "place an
+    anchor, then track forwards from it" was not a thing the tool could do.
+
     Args:
         workspace: The server's project storage.
         project_id: The owning project.
-        point_id: The point to repair.
-        frame: Frame the retrack starts from.
+        point_id: The point to track.
+        frame: Frame the run starts from.
         x: Corrected horizontal position, used as the run's query. ``None``
-            reuses the point's current position at ``frame`` — which is what
-            "track on from here to the next keyframe" means.
+            reuses the point's current position at ``frame`` — an anchor there
+            if it has one, otherwise its tracked position, which is what
+            "track on from here to the next anchor" means.
         y: Corrected vertical position; see ``x``.
         direction: ``"fwd"``, ``"bwd"`` or ``"bidir"``.
         tracker: Tracker plugin override; ``None`` uses the point's own.
         device: Compute device override; ``None`` selects automatically.
         progress: A ``(fraction, message)`` progress callback.
         max_frames: Cover at most this many frames beyond ``frame``.
-        stop_at_keyframe: Stop at the next/previous keyframe.
-        anchor_tolerance_px: How far the run may land from a keyframe it crosses
+        stop_at_anchor: Stop at the next/previous anchor.
+        anchor_tolerance_px: How far the run may land from an anchor it crosses
             before it is stopped there.
 
     Returns:
@@ -520,7 +589,7 @@ def run_point_retrack(
         n_frames,
         anchors=anchors,
         max_frames=max_frames,
-        stop_at_keyframe=stop_at_keyframe,
+        stop_at_anchor=stop_at_anchor,
     )
 
     plugin_name = tracker or point.tracker
@@ -571,9 +640,12 @@ def run_point_retrack(
     violations_path_for(npz_path).write_text(
         json.dumps([v.to_dict() for v in violations]), encoding="utf-8"
     )
+    baseline_path = _ensure_baseline(project, point, tracks_dir, n_frames)
 
     def _mutate(proj: Project) -> None:
         spec = proj.point(point_id)
+        if baseline_path is not None:
+            spec.raw = proj.relative_path(str(baseline_path))
         spec.corrections = [
             *spec.corrections,
             RetrackCorrection(
@@ -610,6 +682,41 @@ def run_point_retrack(
         "flagged_anchors": sorted({v.frame for v in violations}),
         "stopped_at": violations[0].frame if violations else None,
     }
+
+
+def _ensure_baseline(
+    project: Project, point: PointSpec, tracks_dir: Path, n_frames: int
+) -> Path | None:
+    """Give a never-tracked point an empty track for corrections to splice onto.
+
+    The correction layer is defined as ``apply_corrections(raw, corrections)``,
+    so with no ``raw`` there is nothing for a directional run to land on and
+    :func:`load_display_track` returns ``None`` — the run happens, is cached,
+    and is invisible. An all-``NaN`` baseline is the honest starting state
+    ("this point has a track; no frame of it is known yet"), and one run over
+    frames 100–160 then reads as exactly the frames it covered.
+
+    Args:
+        project: The project, for resolving the point's existing ``raw`` path.
+        point: The point as loaded before the run.
+        tracks_dir: The project's ``tracks/`` directory (already created).
+        n_frames: Clip length ``T``.
+
+    Returns:
+        The baseline's path when one was written, or ``None`` when the point
+        already had a usable track and nothing needed doing.
+    """
+    if point.raw:
+        existing = project.resolve_path(point.raw)
+        if existing and Path(existing).is_file():
+            return None
+    path = tracks_dir / f"{point.id}.npz"
+    if path.is_file():
+        # On disk but not referenced (a project edited by hand, an interrupted
+        # write): adopt it rather than throwing a real track away.
+        return path
+    PointTrack.empty(n_frames).save_npz(path)
+    return path
 
 
 def _resolve_start_position(
@@ -709,13 +816,13 @@ def load_display_track(project: Project, point: PointSpec) -> PointTrack | None:
 
 
 def load_anchor_violations(project: Project, point: PointSpec) -> list[dict[str, Any]]:
-    """Return every keyframe disagreement recorded for a point, in frame order.
+    """Return every anchor disagreement recorded for a point, in frame order.
 
-    A track can fail to reach an operator's keyframe in two places: the
-    multi-anchor run behind the raw track, and any enabled retrack correction
+    A track can fail to reach an operator's anchor in two places: the
+    multi-anchor run behind the raw track, and any enabled directional run
     layered on top. Both are collected here so the timeline paints exactly the
-    keyframes that are still unreached in what the user is looking at — a
-    retrack whose correction is toggled off stops flagging anything.
+    anchors that are still unreached in what the user is looking at — a run
+    whose correction is toggled off stops flagging anything.
     """
     found: list[dict[str, Any]] = []
     if point.raw:

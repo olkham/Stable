@@ -10,11 +10,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..core.errors import StableError
 from ..core.project import PointSpec, Project
-from ..core.types import PointTrack
 from .storage import Workspace
 from .tracker_options import load_tracker_options, tracker_search, tracker_window
-from .tracking import load_report, report_path_for
+from .tracking import anchors_changed, load_display_track, load_report, report_path_for
 
 __all__ = ["point_summary", "project_detail"]
 
@@ -23,23 +23,35 @@ _EMPTY_STATS: dict[str, Any] = {
     "tracked_frames": 0,
     "mean_confidence": 0.0,
     "worst_frames": [],
+    "anchors_changed": False,
 }
 
 
 def _load_track_stats(project: Project, point: PointSpec) -> dict[str, Any]:
-    """Return the lightweight (non-array) stats used in list/detail responses."""
+    """Return the lightweight (non-array) stats used in list/detail responses.
+
+    Measured on the **displayed** track — raw plus the correction layer — which
+    is what the canvas draws, the solver consumes and the export writes. Reading
+    the raw ``.npz`` alone under-reported every point whose coverage comes from
+    corrections: a point tracked only by a directional run from one anchor has
+    an empty baseline (see :func:`stable.server.tracking.run_point_retrack`) and
+    used to report "0 frames · 0% confidence" over a track plainly drawn on the
+    frame. ``worst_frames`` stays a property of the *run*, so it still comes
+    from the merge report.
+    """
     if not point.raw:
         return dict(_EMPTY_STATS)
     path = project.resolve_path(point.raw)
     try:
-        track = PointTrack.load_npz(path) if path else None
-    except (OSError, ValueError):  # pragma: no cover - corrupt/missing npz
+        track = load_display_track(project, point) if path else None
+    except (OSError, ValueError, StableError):  # pragma: no cover - corrupt/missing npz
         track = None
     if track is None:
         return dict(_EMPTY_STATS)
     valid = track.valid
     conf = track.confidence
     worst: list[int] = []
+    report = None
     if path:
         report = load_report(report_path_for(Path(path)))
         if report:
@@ -55,6 +67,9 @@ def _load_track_stats(project: Project, point: PointSpec) -> dict[str, Any]:
         "tracked_frames": int(valid.sum()),
         "mean_confidence": float(conf[valid].mean()) if valid.any() else 0.0,
         "worst_frames": worst,
+        # Whether the anchors have moved on since this track was computed, so
+        # the card can offer a re-track instead of quietly showing a stale one.
+        "anchors_changed": anchors_changed(point, report),
     }
 
 

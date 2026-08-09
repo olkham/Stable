@@ -50,17 +50,22 @@ export interface FrameGeometry {
   output: { width: number; height: number };
   /** The output rectangle's four corners, in **source** pixels. */
   rect: [number, number][];
-  /** The stabilisation warp; mapped target destinations are stated after it. */
+  /** The stabilisation warp alone, before the crop/zoom fit. */
   warp: StreamWarp;
   /**
    * Source pixels → **output** pixels: the same warp with the crop/zoom fit
    * composed in, i.e. what actually produced the picture on the output canvas.
    * `rect` is its inverse applied to the output corners.
+   *
+   * This is the one marks are drawn with: a mark is a fraction of the output
+   * frame, so it is at `u × output.width` here and at this transform's inverse
+   * of that on the source canvas.
    */
   output_warp: StreamWarp;
   uses_rotation_and_scale: boolean;
+  /** One row per mark: where it was asked for, where it landed, the miss. */
   targets: {
-    point_id: string;
+    point_id: string | null;
     target: [number, number];
     landed: [number, number] | null;
     residual: number | null;

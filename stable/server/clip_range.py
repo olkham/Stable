@@ -10,7 +10,10 @@ An In/Out pair is one piece of state that answers both. It bounds:
 
 * **tracking** — runs cover the range and leave the rest untouched (``NaN``), so
   the operator's time goes where the shot is;
-* **export** — the render writes exactly the frames between the markers.
+* **export** — the render writes exactly the frames between the markers, unless
+  the export has been given a range of its own (see :func:`export_window` and
+  :class:`~stable.render.options.ExportRange`). Tracking wants a margin either
+  side of the shot; delivery does not.
 
 Where it is kept
 ----------------
@@ -36,8 +39,16 @@ from pathlib import Path
 from typing import Any
 
 from ..core.errors import ProjectError
+from ..render.options import ExportRange
 
-__all__ = ["CLIP_RANGE_CACHE", "ClipRange", "load_clip_range", "save_clip_range"]
+__all__ = [
+    "CLIP_RANGE_CACHE",
+    "ClipRange",
+    "load_clip_range",
+    "save_clip_range",
+    "effective_range",
+    "export_window",
+]
 
 CLIP_RANGE_CACHE = "clip_range.json"
 """File name of a project's In/Out sidecar."""
@@ -170,3 +181,26 @@ def effective_range(project_dir: Path, frame_count: int) -> tuple[int, int]:
     """Return the ``(start, end)`` frames to work on — the range, or the clip."""
     stored = load_clip_range(project_dir, frame_count)
     return stored.as_tuple() if stored else (0, int(frame_count))
+
+
+def export_window(
+    project_dir: Path, frame_count: int, override: ExportRange | None = None
+) -> tuple[int, int]:
+    """Return the ``(start, end)`` frames an export should write.
+
+    The In/Out markers by default — they are the working range, and delivering
+    what you tracked is the common case. An
+    :class:`~stable.render.options.ExportRange` overrides either end of that for
+    the render alone (todo 1, eighth round): tracking wants a margin either side of the shot
+    and delivery does not, so the two ranges have to be able to differ without
+    one of them being retyped every time the other changes.
+
+    Args:
+        project_dir: The project's directory, holding the In/Out sidecar.
+        frame_count: The clip's length; the answer is clamped into it.
+        override: The export's own range, or ``None`` to follow In/Out.
+    """
+    markers = effective_range(project_dir, frame_count)
+    if override is None or not override.is_custom:
+        return markers
+    return override.resolve(frame_count, markers)

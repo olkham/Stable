@@ -24,11 +24,32 @@ Finding the minimal zoom
 ------------------------
 For each frame the warped source rectangle is a convex quad (a similarity
 cannot bend it). :func:`coverage_scale` asks, for every frame, how far a
-centred rectangle of the source aspect ratio can grow before it pokes out of
-that quad — a linear-programming question with four constraints per edge that
-has a closed form — and takes the tightest answer over the whole clip. The
-zoom is the reciprocal. Because it is exact rather than iterative, "minimal
-zoom covering all frames" is a guarantee, not a search that might stop early.
+rectangle of the source aspect ratio can grow before it pokes out of that quad —
+a linear-programming question with four constraints per edge that has a closed
+form — and takes the tightest answer over the frames it is given. The zoom is
+the reciprocal. Because it is exact rather than iterative, "minimal zoom
+covering all frames" is a guarantee, not a search that might stop early.
+
+Which frames get a say is a choice (todo 1, eighth round): pass ``coverage_range`` and the
+answer covers only the frames the export will actually write, so one violent
+second at the end of a take stops dictating the crop of the thirty seconds being
+delivered.
+
+Where that rectangle sits
+-------------------------
+Not necessarily centred. :func:`plan_output` takes an ``origin`` — a position in
+warped coordinates, normally the stabilisation target's — and a ``placement``,
+the fraction of the output frame that origin has to land on. The default
+``(0.5, 0.5)`` is "centre it", which is what every caller wanted before targets
+could be placed. Anything else composes the shot: ``(1/3, 0.5)`` puts the held
+feature on the left thirds line, and the crop grows as far as it can *around
+that*, which is a different (and generally smaller) rectangle than the centred
+one.
+
+This is the whole reason a target's placement can be stated in output
+coordinates at all. The fit transform is built to satisfy ``fit(origin) =
+placement × output size`` exactly, so "the point lands where I put it" is an
+identity of the geometry rather than something the renderer approximates.
 
 Choosing the crop yourself
 --------------------------
@@ -54,7 +75,7 @@ from ..core.errors import RenderError
 from ..core.geometry import SimilarityTransform
 from ..core.project import BORDER_POLICIES
 from .fill import BorderFill, composite_fill
-from .options import CropSpec
+from .options import CropSpec, OutputResolution
 
 __all__ = [
     "INTERPOLATIONS",
@@ -63,6 +84,7 @@ __all__ = [
     "plan_output",
     "warp_frame",
     "rescale_transform",
+    "window_size",
     "cuda_available",
     "load_cv2",
 ]
@@ -145,10 +167,19 @@ class OutputGeometry:
         crop_scale: The fraction of the frame actually kept. Equals ``coverage``
             for an automatic crop; an explicit
             :class:`~stable.render.options.CropSpec` overrides it.
-        centre: Where the output rectangle is centred, in warped coordinates.
+        centre: The origin the output rectangle was grown around, in warped
+            coordinates — the stabilisation target's position, or the frame
+            centre when there is nothing to hold.
+        placement: Where that origin lands in the output, as a ``(u, v)``
+            fraction of the output frame. ``fit(centre)`` is exactly
+            ``placement × (width, height)``, which is what lets a target's
+            position be stated in output coordinates.
         gaps: True when the output includes area no frame covers, so the border
             fill will be visible. Honest rather than implied: an explicit crop
             or a capped zoom can both leave uncovered edges on purpose.
+        measured_frames: How many frames the coverage was measured over — the
+            whole clip, or just the export range when the crop was asked to fit
+            that (:attr:`~stable.render.options.CropSpec.limit_to_range`).
     """
 
     width: int
@@ -160,12 +191,19 @@ class OutputGeometry:
     clamped: bool = False
     crop_scale: float = 1.0
     centre: tuple[float, float] = (0.0, 0.0)
+    placement: tuple[float, float] = (0.5, 0.5)
     gaps: bool = False
+    measured_frames: int = 0
 
     @property
     def size(self) -> tuple[int, int]:
         """Output size as ``(width, height)``."""
         return (self.width, self.height)
+
+    @property
+    def placement_pixels(self) -> tuple[float, float]:
+        """Where :attr:`centre` lands, in output pixels."""
+        return (self.placement[0] * self.width, self.placement[1] * self.height)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe summary of the output geometry."""
@@ -178,7 +216,9 @@ class OutputGeometry:
             "clamped": self.clamped,
             "crop_scale": self.crop_scale,
             "centre": list(self.centre),
+            "placement": list(self.placement),
             "gaps": self.gaps,
+            "measured_frames": self.measured_frames,
             "fit": self.fit.to_dict(),
         }
 
@@ -226,40 +266,55 @@ def coverage_scale(
     width: int,
     height: int,
     *,
-    centre: tuple[float, float] | None = None,
+    origin: tuple[float, float] | None = None,
+    placement: tuple[float, float] = (0.5, 0.5),
+    window: tuple[float, float] | None = None,
 ) -> float:
-    """Return the largest centred rectangle every warped frame fully covers.
+    """Return the largest rectangle, positioned as asked, every warped frame covers.
 
     Args:
-        transforms: One stabilisation warp per frame.
+        transforms: One stabilisation warp per frame — only the frames that
+            matter, so a caller that renders a sub-range passes that sub-range.
         width: Source frame width in pixels.
         height: Source frame height in pixels.
-        centre: Centre of the rectangle in output coordinates; defaults to the
-            frame centre. A centred crop is what keeps the framing where the
-            operator put it — an off-centre one would silently re-frame the shot.
+        origin: The point in warped coordinates the rectangle is pinned to;
+            defaults to the frame centre.
+        placement: Where ``origin`` sits inside the rectangle, as a ``(u, v)``
+            fraction of it. ``(0.5, 0.5)`` grows a centred rectangle, which is
+            what keeps the framing where it was; ``(1/3, 0.5)`` grows one whose
+            left thirds line is on ``origin``, which is how a placed target
+            composes the shot.
+        window: The rectangle's shape as a ``(width, height)`` ratio, or
+            ``None`` for the source frame's. A delivery resolution with a
+            different aspect crops a rectangle of *that* shape — a square
+            delivery takes the largest square, rather than squeezing 16:9 into
+            it — so the shape has to be known before the size is solved for.
 
     Returns:
-        A factor in ``[0, 1]``: the rectangle is ``coverage * width`` by
-        ``coverage * height``. ``1.0`` means no crop is needed at all; ``0.0``
-        means the frames share no common area.
+        A factor in ``[0, 1]``: the rectangle is that fraction of the largest
+        window of the requested shape that fits the source frame. ``1.0`` means
+        no crop is needed at all; ``0.0`` means the frames share no common area
+        at that placement.
     """
     if width <= 0 or height <= 0:
         raise RenderError(f"frame size must be positive, got {width}x{height}")
     if not transforms:
         return 1.0
-    origin = (
+    pinned = (
         np.array([width / 2.0, height / 2.0], dtype=np.float64)
-        if centre is None
-        else np.asarray(centre, dtype=np.float64)
+        if origin is None
+        else np.asarray(origin, dtype=np.float64)
     )
-    # Corner directions of a centred rectangle with the source aspect ratio.
+    # Corner offsets of a rectangle of the requested shape holding the origin at
+    # `placement`. With the source shape and (0.5, 0.5) these are the centred
+    # corners the whole module used before a target could be placed off-centre
+    # or a delivery aspect asked for.
+    box_w, box_h = window_size(width, height, window)
+    u, v = float(placement[0]), float(placement[1])
+    left, right = -u * box_w, (1.0 - u) * box_w
+    top, bottom = -v * box_h, (1.0 - v) * box_h
     directions = np.array(
-        [
-            [-width / 2.0, -height / 2.0],
-            [width / 2.0, -height / 2.0],
-            [width / 2.0, height / 2.0],
-            [-width / 2.0, height / 2.0],
-        ],
+        [[left, top], [right, top], [right, bottom], [left, bottom]],
         dtype=np.float64,
     )
 
@@ -277,7 +332,7 @@ def coverage_scale(
             normal /= length
             if float(normal @ (quad_centre - start)) > 0.0:
                 normal = -normal  # make it point out of the quad
-            slack = float(normal @ (start - origin))
+            slack = float(normal @ (start - pinned))
             if slack <= 0.0:
                 return 0.0  # the crop centre itself is outside this frame
             for direction in directions:
@@ -296,6 +351,33 @@ def _even(value: int) -> int:
     return max(int(value) - (int(value) % 2), 2)
 
 
+def window_size(
+    width: int, height: int, window: tuple[float, float] | None
+) -> tuple[float, float]:
+    """Return the largest rectangle of ``window``'s shape that fits the frame.
+
+    This is what a crop scale of ``1.0`` means once delivery can ask for a
+    different aspect than the source: all of the frame when the shapes agree,
+    and the biggest rectangle of the delivered shape inside it when they do not.
+    ``None`` keeps the source's own shape, which is the whole frame.
+
+    Args:
+        width: Source frame width in pixels.
+        height: Source frame height in pixels.
+        window: The delivered ``(width, height)`` ratio, or ``None``.
+
+    Returns:
+        The window's ``(width, height)`` in source pixels at scale ``1.0``.
+    """
+    if window is None:
+        return (float(width), float(height))
+    ratio_w, ratio_h = float(window[0]), float(window[1])
+    if ratio_w <= 0.0 or ratio_h <= 0.0:
+        raise RenderError(f"the output aspect must be positive, got {window!r}")
+    scale = min(width / ratio_w, height / ratio_h)
+    return (ratio_w * scale, ratio_h * scale)
+
+
 def plan_output(
     transforms: Sequence[SimilarityTransform],
     width: int,
@@ -303,13 +385,17 @@ def plan_output(
     border: str = "auto_zoom",
     *,
     max_zoom: float | None = None,
-    centre: tuple[float, float] | None = None,
+    origin: tuple[float, float] | None = None,
+    placement: tuple[float, float] = (0.5, 0.5),
     crop: CropSpec | None = None,
+    coverage_range: tuple[int, int] | None = None,
+    allow_zoom: bool = True,
+    resolution: OutputResolution | None = None,
 ) -> OutputGeometry:
     """Work out the output size and fit transform for a border policy.
 
     Args:
-        transforms: One stabilisation warp per frame.
+        transforms: One stabilisation warp per frame, for the whole clip.
         width: Source frame width in pixels.
         height: Source frame height in pixels.
         border: One of :data:`~stable.core.project.BORDER_POLICIES`.
@@ -317,30 +403,54 @@ def plan_output(
             than this, the zoom stops there and the result is marked
             :attr:`OutputGeometry.clamped` — visible gaps, but the user keeps
             the framing they asked for rather than losing half the frame.
-        centre: Where the output rectangle sits in warped coordinates; defaults
-            to the frame centre. Pass the stabilisation target's held position
-            to crop around it instead.
+        origin: The position in warped coordinates the output rectangle is
+            pinned to — the stabilisation target's held position. Defaults to
+            the frame centre, which is what "nothing in particular is held"
+            means.
+        placement: Where ``origin`` lands in the output, as a ``(u, v)``
+            fraction of it. The fit is built so that ``fit(origin)`` is exactly
+            ``placement × output size``, which is how a target's position can be
+            stated in output coordinates and be *right* rather than close.
         crop: How much of the frame to keep. ``None`` (or an ``auto``
             :class:`~stable.render.options.CropSpec`) reproduces the exact
             minimal gapless crop; an explicit ``scale`` overrides it and may
             leave uncovered edges for the border fill to handle.
+        coverage_range: Half-open ``(start, end)`` frames the automatic crop is
+            measured over. ``None`` measures the whole clip. Narrowing it is how
+            "the biggest crop with no gaps *between the export markers*" is
+            computed — the frames outside are not being written, so letting them
+            veto the crop is answering a question nobody asked.
+        allow_zoom: Whether the ``auto_zoom`` policy may actually zoom. False
+            for a fit of two or more marks: those state the framing completely,
+            so any zoom on top would slide every point off the mark it was
+            placed on. The geometry still reports the coverage, so the gaps such
+            a fit leaves are visible rather than silent.
+        resolution: The pixel size to deliver the crop window at. ``None`` (or
+            an unset :class:`~stable.render.options.OutputResolution`) delivers
+            it at whatever size it came out, which is what every policy did
+            before delivery size was a choice.
 
     Returns:
         The :class:`OutputGeometry`.
 
     Raises:
-        RenderError: If the policy is unknown, the size is not positive, or an
-            automatic crop finds the frames share no common area.
+        RenderError: If the policy is unknown, the size is not positive, the
+            coverage range is empty, or an automatic crop finds the frames share
+            no common area.
     """
     if border not in BORDER_POLICIES:
         raise RenderError(f"unknown border policy {border!r}; expected {list(BORDER_POLICIES)}")
     if width <= 0 or height <= 0:
         raise RenderError(f"frame size must be positive, got {width}x{height}")
     spec = crop or CropSpec()
-    origin = (width / 2.0, height / 2.0) if centre is None else (
-        float(centre[0]),
-        float(centre[1]),
+    delivery = resolution or OutputResolution()
+    window = delivery.aspect
+    box_w, box_h = window_size(width, height, window)
+    pinned = (width / 2.0, height / 2.0) if origin is None else (
+        float(origin[0]),
+        float(origin[1]),
     )
+    place = (float(placement[0]), float(placement[1]))
 
     if border == "transparent":
         # Nothing is hidden, so nothing needs measuring: the gaps become alpha.
@@ -353,15 +463,21 @@ def plan_output(
             border=border,
             crop_scale=1.0,
             centre=(width / 2.0, height / 2.0),
+            placement=(0.5, 0.5),
+            measured_frames=len(transforms),
         )
 
-    coverage = coverage_scale(transforms, width, height, centre=origin)
+    measured = _coverage_frames(transforms, coverage_range)
+    coverage = coverage_scale(
+        measured, width, height, origin=pinned, placement=place, window=window
+    )
     if spec.is_auto:
         if coverage <= 0.0:
             raise RenderError(
                 "the stabilised frames share no common area, so there is nothing to crop to; "
-                "reduce the smoothing strength, disable a channel, set an explicit crop scale "
-                "with a border fill, or use the 'transparent' border"
+                "reduce the smoothing strength, disable a channel, move the stabilisation "
+                "target back towards the middle of the frame, set an explicit crop scale with a "
+                "border fill, or use the 'transparent' border"
             )
         requested = coverage
     else:
@@ -369,46 +485,83 @@ def plan_output(
     gaps = requested > coverage + 1e-9
 
     if border == "crop":
-        crop_w = _even(int(requested * width))
-        crop_h = _even(int(requested * height))
-        # Put the requested centre at the middle of the output rectangle; with
-        # the default centre this is exactly Phase 3's symmetric offset.
+        crop_w = _even(int(requested * box_w))
+        crop_h = _even(int(requested * box_h))
+        out_w, out_h = delivery.resolve((crop_w, crop_h))
+        # Put the origin where the placement asks for inside the crop window,
+        # then scale that window up to the delivered size. Both steps are one
+        # similarity, so the frame is still resampled exactly once.
         offset = SimilarityTransform(
-            tx=crop_w / 2.0 - origin[0],
-            ty=crop_h / 2.0 - origin[1],
+            tx=place[0] * crop_w - pinned[0],
+            ty=place[1] * crop_h - pinned[1],
         )
+        deliver = SimilarityTransform(scale=out_w / crop_w) if out_w != crop_w else None
         return OutputGeometry(
-            width=crop_w,
-            height=crop_h,
-            fit=offset,
+            width=out_w,
+            height=out_h,
+            fit=offset if deliver is None else deliver.compose(offset),
             coverage=coverage,
-            zoom=1.0,
+            zoom=1.0 if deliver is None else out_w / crop_w,
             border=border,
             crop_scale=requested,
-            centre=origin,
+            centre=pinned,
+            placement=place,
             gaps=gaps,
+            measured_frames=len(measured),
         )
 
-    zoom = 1.0 / requested
+    zoom = 1.0 / requested if allow_zoom else 1.0
     clamped = False
-    if max_zoom is not None and zoom > float(max_zoom):
+    if not allow_zoom:
+        gaps = gaps or coverage < 1.0 - 1e-9
+    elif max_zoom is not None and zoom > float(max_zoom):
         if float(max_zoom) < 1.0:
             raise RenderError(f"max_zoom must be >= 1, got {max_zoom}")
         zoom, clamped = float(max_zoom), True
         gaps = gaps or zoom * coverage < 1.0 - 1e-9
-    recentre = SimilarityTransform(tx=width / 2.0 - origin[0], ty=height / 2.0 - origin[1])
+    # `auto_zoom` delivers the window at its own size unless asked otherwise;
+    # the window is the frame when the shapes agree, which is the usual case.
+    out_w, out_h = delivery.resolve((_even(int(box_w)), _even(int(box_h))))
+    scale = zoom * out_w / box_w
+    recentre = SimilarityTransform(
+        tx=place[0] * out_w - pinned[0], ty=place[1] * out_h - pinned[1]
+    )
     return OutputGeometry(
-        width=int(width),
-        height=int(height),
-        fit=recentre.compose(SimilarityTransform.about_pivot(origin, scale=zoom)),
+        width=out_w,
+        height=out_h,
+        fit=recentre.compose(SimilarityTransform.about_pivot(pinned, scale=scale)),
         coverage=coverage,
         zoom=zoom,
         border=border,
         clamped=clamped,
-        crop_scale=requested,
-        centre=origin,
+        crop_scale=requested if allow_zoom else 1.0,
+        centre=pinned,
+        placement=place,
         gaps=gaps,
+        measured_frames=len(measured),
     )
+
+
+def _coverage_frames(
+    transforms: Sequence[SimilarityTransform], coverage_range: tuple[int, int] | None
+) -> Sequence[SimilarityTransform]:
+    """Return the warps an automatic crop should be measured over.
+
+    Raises:
+        RenderError: If the range is empty or falls outside the planned frames.
+    """
+    if coverage_range is None:
+        return transforms
+    start, end = int(coverage_range[0]), int(coverage_range[1])
+    if end <= start:
+        raise RenderError(f"the crop's frame range must be non-empty, got [{start}, {end})")
+    window = transforms[max(start, 0) : min(end, len(transforms))]
+    if not window:
+        raise RenderError(
+            f"the crop's frame range [{start}, {end}) does not overlap the "
+            f"{len(transforms)} planned frames"
+        )
+    return window
 
 
 def _warp_cuda(cv2: Any, source: np.ndarray, matrix: np.ndarray, size: tuple[int, int],

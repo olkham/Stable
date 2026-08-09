@@ -24,8 +24,9 @@ translation composed on top of the sanctioned warp, never into channel values.
 Render options live beside the project file
 -------------------------------------------
 The v1 project schema is locked, and its ``render`` block is ``border`` /
-``codec`` / ``crf``. The operator's stabilisation target, crop scale and border
-fill are therefore stored in :data:`RENDER_OPTIONS_CACHE`, a sidecar in the
+``codec`` / ``crf``. The operator's stabilisation target, its position in the
+delivered frame, the crop scale, the border fill and the export's own frame
+range are therefore stored in :data:`RENDER_OPTIONS_CACHE`, a sidecar in the
 project directory alongside ``solve.json`` and ``smoothing.json`` — derived
 render state, in the same place as the rest of it, with no invented schema keys
 and nothing for a project-file migration to carry.
@@ -63,8 +64,10 @@ __all__ = [
     "smoothed_payload",
     "load_render_options",
     "save_render_options",
-    "resolve_target_positions",
-    "resolve_mapped_targets",
+    "named_track",
+    "smoothed_paths",
+    "resolve_targets",
+    "target_label",
     "target_residuals",
     "target_choices",
     "build_plan",
@@ -235,17 +238,27 @@ def options_path(project_dir: Path) -> Path:
     return Path(project_dir) / RENDER_OPTIONS_CACHE
 
 
-def load_render_options(project_dir: Path) -> RenderOptions:
+def load_render_options(
+    project_dir: Path, frame_size: tuple[int, int] | None = None
+) -> RenderOptions:
     """Return a project's stabilisation options, or the defaults if never set.
 
-    A missing or unreadable sidecar is not an error: the defaults are exactly
-    Phase 3's behaviour, so an older project renders as it always did.
+    A missing or unreadable sidecar is not an error: the default target is the
+    average of every tracked point held at the centre of the frame, which is
+    what a project that has never opened the export screen should render as.
+
+    Args:
+        project_dir: The project's directory.
+        frame_size: The clip's ``(width, height)``. Only used to read a sidecar
+            written before todo 1, eighth round, whose ``map`` marks were stored as pixels;
+            without it those fall back to the output centre rather than being
+            misread as fractions.
     """
     try:
         payload = read_json(options_path(project_dir))
     except (OSError, ValueError):  # pragma: no cover - corrupt sidecar only
         return RenderOptions()
-    return RenderOptions.from_dict(payload)
+    return RenderOptions.from_dict(payload, frame_size)
 
 
 def save_render_options(project_dir: Path, options: RenderOptions) -> dict[str, Any]:
@@ -279,159 +292,183 @@ def target_choices(project: Project) -> list[dict[str, Any]]:
     return out
 
 
-def resolve_target_positions(project: Project, target: StabilizationTarget) -> np.ndarray | None:
-    """Turn a :class:`StabilizationTarget` into a ``[T, 2]`` path, or ``None``.
-
-    ``frame`` mode returns ``None`` (nothing extra to hold). ``centroid``
-    averages every solve-enabled point's corrected track, which is what "the
-    average position of all the keypoints" means once manual repairs are taken
-    into account. ``point`` returns that one point's corrected track.
-
-    Args:
-        project: The project holding the tracks.
-        target: The operator's choice.
-
-    Returns:
-        The ``[T, 2]`` path in source pixels, or ``None`` for ``frame`` mode.
+def named_track(project: Project, point_id: str) -> Any:
+    """Return one point's corrected track, by id.
 
     Raises:
-        ProjectError: If the chosen point does not exist or has no track, or no
-            solve-enabled point is tracked for a centroid.
+        ProjectError: If the project has no such point, or it has no track —
+            a target is only as real as the track underneath it, and finding
+            that out here beats finding it out inside an export job.
     """
     from .tracking import load_display_track  # noqa: PLC0415 - avoids an import cycle
 
-    if not target.is_active:
-        return None
-    if target.mode == "point":
-        point = next((p for p in project.points if p.id == target.point_id), None)
-        if point is None:
-            raise ProjectError(
-                f"stabilisation target names point {target.point_id!r}, which this project "
-                "does not have; pick another target"
-            )
+    point = next((p for p in project.points if p.id == point_id), None)
+    if point is None:
+        raise ProjectError(
+            f"a target point holds track {point_id!r}, which this project does not have; "
+            "remove that target or point it at a track that exists"
+        )
+    track = load_display_track(project, point)
+    if track is None:
+        raise ProjectError(f"the target's track {point_id!r} has not been tracked yet")
+    return track
+
+
+def smoothed_paths(project: Project, motion: SmoothedMotion) -> dict[str, np.ndarray]:
+    """Return every tracked point's path **after** the smoothing's own warp.
+
+    The dashed trail the viewer draws, and what ``GET /smoothing/tracks``
+    serves — one implementation, so a target that says "hold the smoothed
+    estimate" holds exactly the curve the operator is looking at rather than one
+    that merely resembles it.
+    """
+    from .tracking import load_display_track  # noqa: PLC0415 - avoids an import cycle
+
+    warps = motion.stabilization_transforms()
+    out: dict[str, np.ndarray] = {}
+    for point in project.points:
         track = load_display_track(project, point)
         if track is None:
-            raise ProjectError(
-                f"stabilisation target point {target.point_id!r} has not been tracked yet"
-            )
-        return np.asarray(track.points, dtype=np.float64)
-
-    paths = [
-        np.asarray(track.points, dtype=np.float64)
-        for track in (load_display_track(project, p) for p in project.points if p.enabled_for_solve)
-        if track is not None
-    ]
-    if not paths:
-        raise ProjectError(
-            "a centroid stabilisation target needs at least one tracked, solve-enabled point"
-        )
-    return average_positions(paths)
+            continue
+        positions = np.asarray(track.points, dtype=np.float64)
+        moved = np.full_like(positions, np.nan)
+        for frame in range(min(len(warps), positions.shape[0])):
+            source = positions[frame]
+            if np.isfinite(source).all():
+                moved[frame] = warps[frame].apply(source)
+        out[point.id] = moved
+    return out
 
 
-def resolve_mapped_targets(
-    project: Project, target: StabilizationTarget
+def resolve_targets(
+    project: Project, target: StabilizationTarget, motion: SmoothedMotion
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Turn a ``map`` target's pairs into the arrays the plan needs.
+    """Turn the operator's marks into the arrays the plan fits.
 
     Args:
         project: The project holding the tracks.
-        target: The operator's choice.
+        target: The marks, in order.
+        motion: The smoothed motion, needed only by ``smoothed`` marks — that is
+            what turns a track into the dashed trail.
 
     Returns:
-        ``(sources[K, T, 2], destinations[K, 2], weights[K, T])``, or ``None``
-        when this is not a ``map`` target.
+        ``(sources[K, T, 2], placements[K, 2], weights[K, T])``, or ``None``
+        when there are no marks at all (the render then falls back to the
+        smoothing's own warp).
 
     Raises:
-        ProjectError: If a pair names a point the project does not have or that
-            has not been tracked — a mapping is only as real as its tracks.
+        ProjectError: If a mark names a track the project does not have or that
+            has not been tracked, or asks for the mean of nothing.
     """
-    from .tracking import load_display_track  # noqa: PLC0415 - avoids an import cycle
-
-    if target.mode != "map" or not target.pairs:
+    if not target.points:
         return None
+    smoothed: dict[str, np.ndarray] | None = None
     sources: list[np.ndarray] = []
     weights: list[np.ndarray] = []
-    destinations: list[tuple[float, float]] = []
-    for pair in target.pairs:
-        point = next((p for p in project.points if p.id == pair.point_id), None)
-        if point is None:
-            raise ProjectError(
-                f"the stabilisation mapping names point {pair.point_id!r}, which this project "
-                "does not have; remove that target or pick another point"
-            )
-        track = load_display_track(project, point)
-        if track is None:
-            raise ProjectError(
-                f"the stabilisation mapping needs point {pair.point_id!r} tracked first"
-            )
-        sources.append(np.asarray(track.points, dtype=np.float64))
-        weights.append(np.asarray(track.confidence, dtype=np.float64))
-        destinations.append(pair.position)
+    placements: list[tuple[float, float]] = []
+    for mark in target.points:
+        ids = list(mark.point_ids)
+        if not ids:
+            ids = [p.id for p in project.points if p.enabled_for_solve and p.raw]
+            if not ids:
+                raise ProjectError(
+                    f"target {mark.id} holds every track, and this project has no tracked, "
+                    "solve-enabled point; track one, or point the target at a specific track"
+                )
+        tracks = [named_track(project, point_id) for point_id in ids]
+        if mark.is_smoothed:
+            if smoothed is None:
+                smoothed = smoothed_paths(project, motion)
+            paths = [smoothed[point_id] for point_id in ids]
+        else:
+            paths = [np.asarray(t.points, dtype=np.float64) for t in tracks]
+        sources.append(paths[0] if len(paths) == 1 else average_positions(paths))
+        confidences = np.stack([np.asarray(t.confidence, dtype=np.float64) for t in tracks])
+        weights.append(confidences.mean(axis=0) * mark.weight)
+        placements.append(mark.place.fraction)
     return (
         np.stack(sources),
-        np.asarray(destinations, dtype=np.float64),
+        np.asarray(placements, dtype=np.float64),
         np.stack(weights),
     )
 
 
-def target_residuals(
-    project: Project, plan: Any, target: StabilizationTarget, frame: int
-) -> list[dict[str, Any]]:
-    """Report where each mapped point actually lands, and how far that misses by.
+def target_label(target: StabilizationTarget) -> str:
+    """Return the short phrase the export screen and the job record use."""
+    if not target.points:
+        return "smoothing only"
+    if len(target.points) == 1:
+        return target.points[0].label()
+    return f"{len(target.points)} targets"
 
-    Three or more pairs generally *cannot* all be satisfied by a similarity —
-    the fit is least-squares — so the export screen shows the miss per pair
-    rather than presenting an average as if it were the answer. One or two pairs
-    normally read ~0 px, which is itself worth seeing: it says the mapping is
-    exact rather than merely close.
+
+def target_residuals(
+    project: Project,
+    plan: Any,
+    target: StabilizationTarget,
+    frame: int,
+    motion: SmoothedMotion | None = None,
+) -> list[dict[str, Any]]:
+    """Report where each held path actually lands, and how far that misses by.
+
+    One mark is satisfied exactly and reads ~0 px, which is itself worth seeing:
+    it says the render is doing what the panel claims. Two are satisfied exactly
+    too. Three or more generally *cannot* all be — a similarity has four degrees
+    of freedom and they ask for six — so the fit is least-squares and the miss is
+    shown per mark rather than an average being presented as if it were the
+    answer.
 
     Args:
         project: The project holding the tracks.
         plan: The built :class:`~stable.render.stabilize.StabilizationPlan`.
-        target: The operator's choice.
+        target: The marks, in order.
         frame: Which frame to report for.
+        motion: The smoothed motion, needed only when a mark holds a smoothed
+            path. Without it those rows report no landing rather than guessing.
 
     Returns:
-        One row per pair with the requested destination, where the plan puts the
-        point, and the distance between them — **all three in output pixels**,
-        so they can be read against each other. (``target`` as *stored* is in
-        the space before the crop/zoom fit, because the fit cannot be known
-        until every transform exists; reporting it unconverted next to a
-        post-fit ``landed`` would look like a miss that is not there. The raw
-        stored value is still on ``options.target``.) Empty for any target that
-        is not a mapping.
+        One row per mark: its id, the tracks it holds, what it was asked for,
+        where the plan puts it, and the distance between them — all in **output
+        pixels**, so they read against each other and against the output canvas.
     """
-    resolved = resolve_mapped_targets(project, target)
-    if resolved is None:
-        return []
-    sources, destinations, _weights = resolved
-    index = max(0, min(int(frame), sources.shape[1] - 1))
-    transform = plan.transforms[max(0, min(index, len(plan.transforms) - 1))]
-    fit = plan.geometry.fit
+    size = (float(plan.geometry.width), float(plan.geometry.height))
+    index = max(0, min(int(frame), len(plan.transforms) - 1)) if plan.transforms else 0
+    output_transform = plan.geometry.fit.compose(
+        plan.transforms[index] if plan.transforms else plan.geometry.fit
+    )
+    resolved = (
+        resolve_targets(project, target, motion)
+        if motion is not None and target.points
+        else None
+    )
+
     rows: list[dict[str, Any]] = []
-    for k, pair in enumerate(target.pairs):
-        source_point = sources[k, index]
-        if not np.isfinite(source_point).all():
-            wanted = fit.apply(np.asarray(pair.position, dtype=np.float64))
-            rows.append(
-                {
-                    "point_id": pair.point_id,
-                    "target": [float(wanted[0]), float(wanted[1])],
-                    "landed": None,
-                    "residual": None,
-                }
-            )
-            continue
-        landed = fit.compose(transform).apply(source_point)
-        wanted = fit.apply(np.asarray(pair.position, dtype=np.float64))
-        rows.append(
-            {
-                "point_id": pair.point_id,
-                "target": [float(wanted[0]), float(wanted[1])],
-                "landed": [float(landed[0]), float(landed[1])],
-                "residual": float(np.hypot(*(landed - wanted))),
-            }
+    for k, mark in enumerate(target.points):
+        wanted = mark.place.pixels(size)
+        row: dict[str, Any] = {
+            "id": mark.id,
+            # `point_id` is what the viewer colours a crosshair from; a mark
+            # over several tracks belongs to none of them and gets none.
+            "point_id": mark.point_ids[0] if len(mark.point_ids) == 1 else None,
+            "point_ids": list(mark.point_ids),
+            "source": mark.source,
+            "label": mark.label(),
+            "target": [float(wanted[0]), float(wanted[1])],
+            "landed": None,
+            "residual": None,
+        }
+        source_point = (
+            resolved[0][k][index]
+            if resolved is not None and index < resolved[0].shape[1]
+            else None
         )
+        if source_point is not None and np.isfinite(source_point).all():
+            landed = output_transform.apply(source_point)
+            row["landed"] = [float(landed[0]), float(landed[1])]
+            row["residual"] = float(
+                np.hypot(landed[0] - wanted[0], landed[1] - wanted[1])
+            )
+        rows.append(row)
     return rows
 
 
@@ -444,6 +481,7 @@ def build_plan(
     *,
     border: str | None = None,
     options: RenderOptions | None = None,
+    export_range: tuple[int, int] | None = None,
 ) -> StabilizationPlan:
     """Plan the stabilised render for a project's smoothed motion.
 
@@ -451,8 +489,13 @@ def build_plan(
         project: The project, for its clip size, border policy and tracks.
         motion: The smoothed solve.
         border: Override for the project's border policy.
-        options: The operator's stabilisation target / crop / fill choices;
-            ``None`` means the defaults, which reproduce Phase 3 exactly.
+        options: The operator's target / crop / fill / resolution choices;
+            ``None`` means the defaults.
+        export_range: The frames the export will write. Only consulted when the
+            crop was asked to fit that range
+            (:attr:`~stable.render.options.CropSpec.limit_to_range`) — the plan
+            always covers the whole clip, because the warp for frame N is the
+            warp for frame N whatever ends up being written.
 
     Returns:
         The :class:`~stable.render.stabilize.StabilizationPlan`.
@@ -460,22 +503,22 @@ def build_plan(
     Raises:
         stable.core.errors.RenderError: If the border policy is unknown or an
             automatic crop finds the warped frames share no common area.
-        ProjectError: If the stabilisation target cannot be resolved.
+        ProjectError: If a target names a track this project cannot supply.
     """
     size = (int(project.video.w), int(project.video.h))
     chosen = options or RenderOptions()
-    mapped = resolve_mapped_targets(project, chosen.target)
+    resolved = resolve_targets(project, chosen.target, motion)
     return StabilizationPlan.build(
         motion,
         source_size=size,
         border=border or project.render.border,
-        target_positions=None if mapped else resolve_target_positions(project, chosen.target),
-        anchor_frame=chosen.target.anchor_frame,
-        mapped_sources=None if mapped is None else mapped[0],
-        mapped_destinations=None if mapped is None else mapped[1],
-        mapped_weights=None if mapped is None else mapped[2],
+        sources=None if resolved is None else resolved[0],
+        placements=None if resolved is None else resolved[1],
+        weights=None if resolved is None else resolved[2],
         crop=chosen.crop,
         fill=chosen.fill,
+        coverage_range=export_range if chosen.crop.limit_to_range else None,
+        resolution=chosen.resolution,
     )
 
 

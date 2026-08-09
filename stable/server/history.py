@@ -1,10 +1,13 @@
-"""Undo/redo over the corrections layer.
+"""Undo/redo over the corrections layer and the anchors it hangs off.
 
 ``PLAN.md`` makes the promise that pays off here: *raw tracker output is
 immutable, user edits are a correction layer*. So the entire undoable state of
-an editing session is the corrections attached to each point — a few hundred
-bytes of JSON, not arrays of frames. Undo is therefore a snapshot stack rather
-than a command pattern with an inverse per operation, which means:
+an editing session is each point's corrections — and, since todo 6 of the
+seventh round, its anchors, because deleting one now takes the corrections
+rooted on it with it and half of that coming back would be worse than none of
+it. Both together are a few hundred bytes of JSON, not arrays of frames. Undo is
+therefore a snapshot stack rather than a command pattern with an inverse per
+operation, which means:
 
 * "undo restores the exact prior state" is true by construction, not by every
   operation implementing its own inverse correctly;
@@ -27,11 +30,18 @@ from typing import Any
 from ..core.corrections import correction_from_dict
 from ..core.errors import ProjectError
 from ..core.project import Project
+from ..core.types import Query
 
 __all__ = ["Snapshot", "EditHistory", "snapshot_corrections", "restore_corrections"]
 
-Snapshot = dict[str, list[dict[str, Any]]]
-"""Every point's corrections, keyed by point id — one undoable state."""
+Snapshot = dict[str, dict[str, list[dict[str, Any]]]]
+"""Every point's anchors and corrections, keyed by point id — one undoable state.
+
+Each entry is ``{"queries": [...], "corrections": [...]}``. Stacks written
+before anchors were versioned hold a bare correction list per point instead;
+:func:`restore_corrections` reads both, so an in-progress session survives the
+upgrade with its undo depth intact.
+"""
 
 HISTORY_FILENAME = "history.json"
 """File the stack is persisted to, inside the project directory."""
@@ -41,26 +51,53 @@ DEFAULT_LIMIT = 200
 
 
 def snapshot_corrections(project: Project) -> Snapshot:
-    """Return a deep, JSON-safe copy of every point's correction list."""
-    return {point.id: [c.to_dict() for c in point.corrections] for point in project.points}
+    """Return a deep, JSON-safe copy of every point's anchors and corrections."""
+    return {
+        point.id: {
+            "queries": [q.to_dict() for q in point.queries],
+            "corrections": [c.to_dict() for c in point.corrections],
+        }
+        for point in project.points
+    }
+
+
+def _entry(state: Any) -> tuple[list[Any] | None, list[Any]]:
+    """Split one point's snapshot entry into ``(queries, corrections)``.
+
+    ``queries`` is ``None`` for a stack written before anchors were versioned:
+    "this snapshot says nothing about anchors", which is not the same as "this
+    snapshot says the point had none".
+    """
+    if isinstance(state, dict):
+        queries = state.get("queries")
+        return (list(queries) if isinstance(queries, list) else None), list(
+            state.get("corrections", [])
+        )
+    return None, list(state or [])
 
 
 def restore_corrections(project: Project, snapshot: Snapshot) -> None:
-    """Set every point's corrections from ``snapshot``, in place.
+    """Set every point's anchors and corrections from ``snapshot``, in place.
 
-    Points the snapshot does not mention are cleared rather than left alone: a
-    point that exists now but did not when the snapshot was taken must come back
-    with no corrections, or undo would leave edits the user never made.
+    Points the snapshot does not mention have their corrections cleared: a point
+    that exists now but did not when the snapshot was taken must come back with
+    no edits, or undo would leave edits the user never made. Their **anchors**
+    are left alone, because undoing a point into an anchorless one would leave
+    it untrackable, and creating a point is not an undoable operation in the
+    first place.
 
     Raises:
-        ProjectError: If the snapshot holds a correction this build cannot read.
+        ProjectError: If the snapshot holds a correction or anchor this build
+            cannot read.
     """
     for point in project.points:
-        entries = snapshot.get(point.id, [])
+        queries, corrections = _entry(snapshot.get(point.id))
         try:
-            point.corrections = [correction_from_dict(dict(entry)) for entry in entries]
+            point.corrections = [correction_from_dict(dict(entry)) for entry in corrections]
+            if queries is not None:
+                point.queries = [Query.from_dict(dict(entry)) for entry in queries]
         except Exception as exc:  # noqa: BLE001 - re-raised as a project-level error
-            raise ProjectError(f"cannot restore corrections for point {point.id!r}: {exc}") from exc
+            raise ProjectError(f"cannot restore edits for point {point.id!r}: {exc}") from exc
 
 
 class EditHistory:
@@ -127,7 +164,7 @@ class EditHistory:
         return self._redo[-1][0] if self._redo else None
 
     def record(self, project: Project, label: str) -> None:
-        """Push ``project``'s *current* corrections as an undo point.
+        """Push ``project``'s *current* anchors and corrections as an undo point.
 
         Call this immediately before mutating, from inside the same
         read-modify-write the mutation happens in, so the snapshot is exactly
@@ -143,7 +180,7 @@ class EditHistory:
         self._redo.clear()
 
     def undo(self, project: Project) -> str | None:
-        """Restore the previous corrections state onto ``project``.
+        """Restore the previous anchor/correction state onto ``project``.
 
         Args:
             project: The project to mutate in place.

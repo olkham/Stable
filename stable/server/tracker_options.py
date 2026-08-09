@@ -2,7 +2,7 @@
 
 Todo 14 asks for two things about template matching: let the operator choose the
 template size, and let them *see* the patch that size produces at each of their
-keyframes. Both live here.
+anchors. Both live here.
 
 Every tracker's window, not only the template's
 -----------------------------------------------

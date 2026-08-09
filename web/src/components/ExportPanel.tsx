@@ -16,21 +16,34 @@ const BORDER_HELP: Record<string, string> = {
     "No crop at all; uncovered area becomes alpha. Renders a PNG sequence, since no video codec here carries an alpha channel.",
 };
 
-const TARGET_HELP: Record<string, string> = {
-  frame:
-    "Undo only what the smoothing removed. With no smoothing filter enabled that is the identity — the export would just re-encode the source, so it is refused rather than run.",
-  centroid:
-    "Hold the average position of every solve-enabled tracked point still. Stabilises on its own, with or without smoothing.",
-  point: "Hold one chosen point still, pinned to where it sat on the anchor frame.",
-  map: "Hold chosen points at places you pick on the frame. Drag a crosshair on the video to compose the shot; add a second to correct rotation and scale as well as position.",
+const SOURCE_HELP: Record<string, string> = {
+  raw: "The tracked positions themselves — the solid trail on the video. This nails the feature: it does not move in the delivered frame, and every wobble the tracker saw comes out of the picture.",
+  smoothed:
+    "The smoothed estimate for the same tracks — the dashed trail on the video. This nails *that* curve, so the fit is driven by a de-noised estimate rather than by every sample, and the feature keeps whatever the smoothing treated as camera motion.",
 };
 
-const TARGET_LABEL: Record<string, string> = {
-  frame: "smoothing only",
-  centroid: "average of all points",
-  point: "a single point",
-  map: "points placed on the frame",
+const SOURCE_LABEL: Record<string, string> = {
+  raw: "tracked positions (solid trail)",
+  smoothed: "smoothed estimate (dashed trail)",
 };
+
+/** Delivery sizes worth one click. Anything else goes in the boxes. */
+const DELIVERY_SIZES: [string, number, number][] = [
+  ["1920x1080", 1920, 1080],
+  ["1280x720", 1280, 720],
+  ["3840x2160", 3840, 2160],
+  ["1080x1080", 1080, 1080],
+  ["1080x1920", 1080, 1920],
+];
+
+/** The named positions the mark can be dropped on, as output fractions. */
+const SNAP_SPOTS: [string, number, number][] = [
+  ["centre", 0.5, 0.5],
+  ["top left third", 1 / 3, 1 / 3],
+  ["top right third", 2 / 3, 1 / 3],
+  ["bottom left third", 1 / 3, 2 / 3],
+  ["bottom right third", 2 / 3, 2 / 3],
+];
 
 const FILL_HELP: Record<string, string> = {
   solid: "A flat colour in the exposed edge.",
@@ -127,6 +140,55 @@ function useLiveCommit(send: (value: number | null) => Promise<void>, delay: num
   return useMemo(() => ({ push, flush }), [push, flush]);
 }
 
+/** Keep a fraction of the output frame inside the output frame. */
+function clamp01(value: number): number {
+  return Math.min(Math.max(value, 0), 1);
+}
+
+/**
+ * One coordinate of the target's position, in output pixels.
+ *
+ * Typed freely and committed once, on blur or Enter. Storing per keystroke
+ * would re-plan the whole clip for every digit — moving the mark changes the
+ * crop, because the crop is grown around it — and "192" would go through 1 and
+ * 19 on the way, each one a plan and each one visibly re-framing the preview.
+ */
+function PixelField({
+  value,
+  max,
+  title,
+  onCommit,
+}: {
+  value: number;
+  max: number;
+  title: string;
+  onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) return;
+    const parsed = Number(draft);
+    setDraft(null);
+    if (Number.isFinite(parsed)) onCommit(Math.min(Math.max(parsed, 0), max));
+  };
+  return (
+    <input
+      type="number"
+      min={0}
+      max={max}
+      step={1}
+      title={title}
+      value={draft ?? Math.round(value)}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") setDraft(null);
+      }}
+    />
+  );
+}
+
 function humanBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} kB`;
@@ -164,10 +226,11 @@ function fromHex(hex: string): number[] {
  * least-squares and pretending otherwise would be a lie about the result.
  */
 export function ExportPanel() {
-  const { project, refresh, clipRange, jobs, cancelJob, tracks, loadTrack } = useProjectContext();
+  const { project, refresh, clipRange, currentFrame, jobs, cancelJob, tracks, loadTrack } =
+    useProjectContext();
   const {
     opts,
-    pairs,
+    marks,
     preview,
     frameGeometry,
     error,
@@ -177,8 +240,15 @@ export function ExportPanel() {
     setShowGuides,
     sideBySide,
     setSideBySide,
+    snap,
+    setSnap,
+    selected,
+    setSelected,
+    commitMark,
+    addTarget,
+    patchTarget,
+    deleteTarget,
     patchOptions,
-    putPairs,
     reloadPreview,
     renders,
     deleteRender,
@@ -258,15 +328,28 @@ export function ExportPanel() {
   const ranged = clipRange && !clipRange.whole_clip ? clipRange : null;
   const hasSolve = project.points.some((p) => p.has_track);
 
-  const target = opts?.options.target;
   const crop = opts?.options.crop;
   const fill = opts?.options.fill;
-  const mode = target?.mode ?? "frame";
-  const paired = new Set(pairs.map((p) => p.point_id));
-  // Residuals are per frame, so they come off the frame on the canvas rather
-  // than off the whole-clip preview (todo 2, fifth round).
-  const residuals = new Map(frameGeometry?.targets.map((row) => [row.point_id, row.residual]) ?? []);
+  const stored = opts?.options.export_range;
+  const resolution = opts?.options.resolution;
+  const points = opts?.options.target.points ?? [];
   const cropScale = cropDraft !== undefined ? cropDraft : (crop?.scale ?? null);
+  // A mark's position is a fraction of the output, so it is shown in the pixels
+  // of *this* output. Change the crop and the number moves; the shot does not,
+  // which is the point of storing the fraction.
+  const outSize = frameGeometry?.output ?? preview?.output ?? null;
+  // What the crop would deliver at if nothing scaled it, for the placeholders.
+  const cropSize = opts?.source_size && preview
+    ? ([
+        Math.round(opts.source_size[0] * preview.crop_scale),
+        Math.round(opts.source_size[1] * preview.crop_scale),
+      ] as [number, number])
+    : null;
+  const clipFrames = opts?.clip_frames ?? project.video.frames;
+  const markers: [number, number] = opts?.clip_range ?? [0, clipFrames];
+  const exportWindow: [number, number] = preview?.export_window ??
+    opts?.export_window ?? [0, clipFrames];
+  const customRange = stored != null && (stored.start != null || stored.end != null);
 
   /** Store the crop scale and hand the control back to the stored value. */
   async function commitCrop(scale: number | null) {
@@ -305,28 +388,61 @@ export function ExportPanel() {
   }
 
   /**
-   * Add a target for a point, starting where that point is right now.
+   * Add a target point for one track, where that track is right now.
    *
-   * A destination is stated in the space the stabilisation warp lands in, so
-   * the point's source position has to be pushed through that warp — which is
-   * exactly why the preview sends it. "Hold it here" is the common case; the
-   * operator drags the crosshair on the video if they want it somewhere else.
+   * A mark is a fraction of the *output* frame, so the track's position goes
+   * through `output_warp` — the whole transform that produced the picture — and
+   * is divided by the output size. "Leave it where it is" is the common opening
+   * move; the operator drags the crosshair if they want it somewhere else.
    */
-  function addTarget(pointId: string) {
-    if (!frameGeometry) return;
-    const track = tracks[pointId];
-    const px = track?.x[frameGeometry.frame];
-    const py = track?.y[frameGeometry.frame];
-    const source =
-      px != null && py != null
-        ? { x: px, y: py }
-        : { x: frameGeometry.source.width / 2, y: frameGeometry.source.height / 2 };
-    const at = applyWarp(frameGeometry.warp, source.x, source.y);
-    void putPairs([...pairs, { point_id: pointId, x: at.x, y: at.y }]);
+  function addMarkFor(pointIds: string[], source: string) {
+    const first = pointIds[0];
+    const track = first ? tracks[first] : undefined;
+    const px = frameGeometry && track ? track.x[frameGeometry.frame] : null;
+    const py = frameGeometry && track ? track.y[frameGeometry.frame] : null;
+    let place = { u: 0.5, v: 0.5 };
+    if (frameGeometry && px != null && py != null) {
+      const at = applyWarp(frameGeometry.output_warp, px, py);
+      place = {
+        u: clamp01(at.x / frameGeometry.output.width),
+        v: clamp01(at.y / frameGeometry.output.height),
+      };
+    }
+    void addTarget({ place, point_ids: pointIds, source });
   }
 
-  function removeTarget(pointId: string) {
-    void putPairs(pairs.filter((pair) => pair.point_id !== pointId));
+  /** Add or drop one track from a mark's set; the mark holds their mean. */
+  function toggleTrack(mark: { id: string; pointIds: string[] }, pointId: string) {
+    const next = new Set(mark.pointIds);
+    if (next.has(pointId)) next.delete(pointId);
+    else next.add(pointId);
+    void patchTarget(mark.id, { point_ids: [...next] });
+  }
+
+  /** Store one side of the delivery size; empty means "follow the crop". */
+  function setResolution(side: "width" | "height", raw: string) {
+    const value = raw.trim() === "" ? null : Math.max(2, Math.round(Number(raw)));
+    if (value !== null && !Number.isFinite(value)) return;
+    void patchOptions({ resolution: { [side]: value } });
+  }
+
+  /**
+   * Store the export range, or clear it back to following the In/Out markers.
+   *
+   * Kept non-empty here rather than letting the server refuse it: typing a new
+   * out point one digit at a time passes through values below the in point, and
+   * a red error flashing under the operator's hands while they are still typing
+   * is not information — it is noise.
+   */
+  function setRange(patch: { start?: number | null; end?: number | null }) {
+    const next = { ...patch };
+    if (typeof next.start === "number") {
+      next.start = Math.min(Math.max(0, next.start), Math.max(exportWindow[1] - 1, 0));
+    }
+    if (typeof next.end === "number") {
+      next.end = Math.min(Math.max(next.end, exportWindow[0] + 1), clipFrames);
+    }
+    void patchOptions({ export_range: next });
   }
 
   return (
@@ -354,9 +470,10 @@ export function ExportPanel() {
               (todo 1, first round), and a clip length that is not the one you
               expected is a slow thing to discover from the finished file. */}
           <div>
-            {ranged
-              ? `writes frames ${ranged.in}–${ranged.out - 1} (${ranged.frames} of ${ranged.clip_frames})`
+            {exportWindow[1] - exportWindow[0] < preview.frames
+              ? `writes frames ${exportWindow[0]}–${exportWindow[1] - 1} (${exportWindow[1] - exportWindow[0]} of ${preview.frames})`
               : `writes the whole clip (${preview.frames} frames)`}
+            {customRange ? " — the export's own range" : ranged ? " — the In/Out markers" : ""}
           </div>
           {preview.is_no_op && <div className="export-screen__warning">{preview.no_op_detail}</div>}
         </div>
@@ -396,94 +513,189 @@ export function ExportPanel() {
         </p>
       )}
 
-      <h4>Stabilise on</h4>
-      <div className="field-row">
-        <select
-          value={mode}
-          onChange={(e) =>
-            void patchOptions({
-              target: {
-                mode: e.target.value,
-                point_id:
-                  e.target.value === "point" ? (target?.point_id ?? tracked[0]?.id ?? null) : null,
-              },
-            })
-          }
-          disabled={!opts}
-        >
-          {(opts?.target_modes ?? ["frame"]).map((name) => (
-            <option key={name} value={name}>
-              {TARGET_LABEL[name] ?? name}
-            </option>
-          ))}
-        </select>
-        {mode === "point" && (
-          <select
-            value={target?.point_id ?? ""}
-            onChange={(e) => void patchOptions({ target: { mode: "point", point_id: e.target.value } })}
-          >
-            {(opts?.points ?? []).map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.id} ({p.frames} frames)
-              </option>
-            ))}
-          </select>
-        )}
+      {/* The targets. One row per mark: where it goes in the delivered frame,
+          which tracks it holds, and whether it holds their raw or smoothed
+          positions. The fit satisfies as many of them as a similarity can —
+          one or two exactly, three or more in the least-squares sense — so the
+          miss is shown per mark rather than averaged into a single number. */}
+      <div className="panel__header panel__header--inline">
+        <h4>Targets</h4>
+        <span className="export-screen__count">
+          {points.length === 0
+            ? "none"
+            : `${points.length} · ${
+                preview?.uses_rotation_and_scale ? "position, rotation & scale" : "position only"
+              }`}
+        </span>
       </div>
-      {(mode === "point" || mode === "centroid") && (
-        <div className="field-row">
-          <label>Anchor frame</label>
-          <input
-            type="number"
-            min={0}
-            max={Math.max(project.video.frames - 1, 0)}
-            value={target?.anchor_frame ?? project.solve.reference_frame}
-            onChange={(e) => void patchOptions({ target: { anchor_frame: Number(e.target.value) } })}
-          />
-          <span className="modal__hint">the framing that gets held</span>
-        </div>
-      )}
-      <p className="export-screen__hint">{TARGET_HELP[mode] ?? ""}</p>
 
-      {/* Placed targets. The list is shown for every mode so "+ target" is
-          reachable — pressing it *is* the choice of `map`, the same way dragging
-          a crosshair is — but the residuals only mean anything once the fit is
-          actually using them. */}
       {tracked.length === 0 ? (
-        <p className="panel__empty">Track a point to use it as a stabilisation target.</p>
+        <p className="panel__empty">Track a point before mapping it to a target.</p>
       ) : (
-        <ul className="export-screen__targets">
-          {tracked.map((point) => {
-            const residual = residuals.get(point.id);
-            return (
-              <li key={point.id}>
-                <span className="points-list__swatch" style={{ background: pointColor(point.id) }} />
-                <span className="export-screen__target-id">{point.id}</span>
-                {paired.has(point.id) ? (
-                  <>
-                    <span className="export-screen__residual">
-                      {residual == null ? "no position on this frame" : `${residual.toFixed(2)} px off`}
+        <>
+          <ul className="target-list">
+            {marks.map((mark) => {
+              const isSelected = selected === mark.id;
+              const held = mark.pointIds.length
+                ? mark.pointIds.join(" + ")
+                : "every solve-enabled track";
+              return (
+                <li
+                  key={mark.id}
+                  className={`target-list__item${isSelected ? " is-selected" : ""}`}
+                  onClick={() => setSelected(isSelected ? null : mark.id)}
+                >
+                  <div className="target-list__head">
+                    <span
+                      className="points-list__swatch"
+                      style={{ background: mark.pointId ? pointColor(mark.pointId) : "#e8e8e8" }}
+                    />
+                    <span className="target-list__id">{mark.id}</span>
+                    <span className="target-list__where">
+                      {outSize
+                        ? `${Math.round(mark.u * outSize.width)}, ${Math.round(mark.v * outSize.height)}`
+                        : `${(mark.u * 100).toFixed(0)}%, ${(mark.v * 100).toFixed(0)}%`}
                     </span>
-                    <button onClick={() => removeTarget(point.id)}>remove</button>
-                  </>
-                ) : (
-                  <button disabled={!frameGeometry} onClick={() => addTarget(point.id)}>
-                    + target
-                  </button>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+                    <span className="export-screen__residual">
+                      {mark.residual == null ? "—" : `${mark.residual.toFixed(2)} px off`}
+                    </span>
+                    <button
+                      className="target-list__remove"
+                      title="Delete this target"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void deleteTarget(mark.id);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="target-list__holds" title={`Holds ${held}`}>
+                    holds {mark.source === "smoothed" ? "smoothed " : ""}
+                    {held}
+                  </div>
+                  {isSelected && (
+                    <div className="target-list__editor" onClick={(e) => e.stopPropagation()}>
+                      <div className="field-row">
+                        <label>Source</label>
+                        <select
+                          value={mark.source}
+                          onChange={(e) => void patchTarget(mark.id, { source: e.target.value })}
+                        >
+                          {(opts?.target_sources ?? ["raw"]).map((name) => (
+                            <option key={name} value={name}>
+                              {SOURCE_LABEL[name] ?? name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <p className="export-screen__hint">{SOURCE_HELP[mark.source] ?? ""}</p>
+                      <div className="field-row">
+                        <label>Position</label>
+                        {outSize ? (
+                          <>
+                            <PixelField
+                              value={mark.u * outSize.width}
+                              max={outSize.width}
+                              title="Horizontal position in the exported frame, in pixels"
+                              onCommit={(x) =>
+                                void commitMark(mark.id, clamp01(x / outSize.width), mark.v)
+                              }
+                            />
+                            <PixelField
+                              value={mark.v * outSize.height}
+                              max={outSize.height}
+                              title="Vertical position in the exported frame, in pixels"
+                              onCommit={(y) =>
+                                void commitMark(mark.id, mark.u, clamp01(y / outSize.height))
+                              }
+                            />
+                            <span className="modal__hint">
+                              of {outSize.width}×{outSize.height}
+                            </span>
+                          </>
+                        ) : (
+                          <span className="modal__hint">solve and smooth to see the output size</span>
+                        )}
+                      </div>
+                      <div className="export-screen__spots">
+                        {SNAP_SPOTS.map(([label, u, v]) => (
+                          <button
+                            key={label}
+                            className={
+                              Math.abs(mark.u - u) < 1e-6 && Math.abs(mark.v - v) < 1e-6
+                                ? "is-active"
+                                : undefined
+                            }
+                            onClick={() => void commitMark(mark.id, u, v)}
+                            title={`Put this target on the ${label}`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="target-list__tracks">
+                        <span className="modal__hint">
+                          Tracks (several are held at their mean; none means every solve-enabled
+                          track)
+                        </span>
+                        {tracked.map((point) => (
+                          <label key={point.id} className="channel-check">
+                            <input
+                              type="checkbox"
+                              checked={mark.pointIds.includes(point.id)}
+                              onChange={() => toggleTrack(mark, point.id)}
+                            />
+                            <span
+                              className="points-list__swatch"
+                              style={{ background: pointColor(point.id) }}
+                            />
+                            {point.id}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+
+          <div className="export-screen__spots">
+            {tracked.map((point) => (
+              <button
+                key={point.id}
+                onClick={() => addMarkFor([point.id], "raw")}
+                title={`Add a target holding ${point.id} where it is on this frame`}
+              >
+                + {point.id}
+              </button>
+            ))}
+            <button
+              onClick={() => addMarkFor([], "raw")}
+              title="Add a target holding the mean of every solve-enabled track"
+            >
+              + all tracks
+            </button>
+          </div>
+          <p className="export-screen__hint">
+            {points.length === 0
+              ? "With no targets the render only undoes what the Smoothing panel removed. Add one to hold a track somewhere in the delivered frame."
+              : points.length === 1
+                ? "One target: the render shifts the picture to hold that path there. Add a second and it will correct rotation and scale too."
+                : "Two or more targets fix rotation and scale as well as position, which states the framing completely — so the crop cannot zoom, and any gaps are reported rather than zoomed away. With three or more the fit is least-squares and the miss per target is shown above."}{" "}
+            Drag a crosshair on either canvas to move one.
+          </p>
+        </>
       )}
-      {mode === "map" && preview && (
-        <p className="export-screen__hint">
-          {preview.uses_rotation_and_scale
-            ? "Two or more targets: the render rotates and scales the picture to put every point on its mark. With three or more it is a least-squares fit, and the miss per point is shown above."
-            : "One target: the render shifts the picture to hold this point still. Add a second to correct rotation and scale too."}{" "}
-          Drag a crosshair on the video to move it.
-        </p>
-      )}
+
+      <label
+        className="channel-check"
+        title="While dragging a crosshair, snap it to the centre, the thirds, and the horizontal or vertical line through any other point on screen"
+      >
+        <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} />
+        Snap targets to the centre, thirds and other points
+      </label>
 
       <h4>Crop</h4>
       <div className="field-row">
@@ -525,24 +737,139 @@ export function ExportPanel() {
           </>
         )}
       </div>
-      <div className="field-row">
-        <label>Centred on</label>
-        <select
-          value={crop?.centre ?? "frame"}
-          onChange={(e) => void patchOptions({ crop: { centre: e.target.value } })}
-          disabled={!opts || mode === "frame"}
-        >
-          {(opts?.crop_centres ?? ["frame"]).map((c) => (
-            <option key={c} value={c}>
-              {c === "frame" ? "the frame centre" : "the stabilisation target"}
-            </option>
-          ))}
-        </select>
-      </div>
+      <label
+        className="channel-check"
+        title="Measure the automatic crop over the exported frames only"
+      >
+        <input
+          type="checkbox"
+          checked={crop?.limit_to_range ?? false}
+          onChange={(e) => void patchOptions({ crop: { limit_to_range: e.target.checked } })}
+          disabled={!opts}
+        />
+        Fit the crop to the export range
+      </label>
       <p className="export-screen__hint">
         Automatic keeps exactly as much as every frame covers, so there is nothing to fill. Keeping
         more than that exposes the edges — which is what the border fill is for. Changing it never
-        touches the targets you have placed.
+        moves the target you have placed: the crop grows around it.
+      </p>
+      <p className="export-screen__hint">
+        {crop?.limit_to_range
+          ? `The crop is the largest one with no gaps between the export markers${
+              preview ? ` — measured over ${preview.crop_measured_frames} frames` : ""
+            }. Frames outside them are not being written, so they get no vote.`
+          : "The crop is measured over the whole clip, so one violent second anywhere in it limits the whole render. Tick the box above to measure only what you are actually delivering."}
+      </p>
+
+      {/* The export's own range (todo 1, eighth round). Separate from the In/Out markers on
+          purpose: tracking wants a margin either side of the shot and delivery
+          does not, so making the two the same control means retyping one every
+          time the other changes. */}
+      {/* Delivery size, which is a different decision from field of view: crop
+          hard into a shot and still hand over 1920x1080. Setting both sides
+          also sets the crop window's shape, so a square delivery crops a square
+          out of a 16:9 source rather than squeezing one into it. */}
+      <h4>Output resolution</h4>
+      <div className="field-row">
+        <label>Deliver at</label>
+        <input
+          type="number"
+          min={2}
+          step={2}
+          placeholder={cropSize ? String(cropSize[0]) : "auto"}
+          value={resolution?.width ?? ""}
+          onChange={(e) => setResolution("width", e.target.value)}
+          title="Output width in pixels; empty follows the crop"
+        />
+        <span className="modal__hint">x</span>
+        <input
+          type="number"
+          min={2}
+          step={2}
+          placeholder={cropSize ? String(cropSize[1]) : "auto"}
+          value={resolution?.height ?? ""}
+          onChange={(e) => setResolution("height", e.target.value)}
+          title="Output height in pixels; empty follows the crop"
+        />
+        <button
+          onClick={() => void patchOptions({ resolution: { width: null, height: null } })}
+          disabled={!resolution || (resolution.width == null && resolution.height == null)}
+          title="Deliver the crop at whatever size it came out"
+        >
+          auto
+        </button>
+      </div>
+      <div className="export-screen__spots">
+        {DELIVERY_SIZES.map(([label, width, height]) => (
+          <button
+            key={label}
+            className={
+              resolution?.width === width && resolution?.height === height ? "is-active" : undefined
+            }
+            onClick={() => void patchOptions({ resolution: { width, height } })}
+            title={`Deliver at ${width}x${height}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <p className="export-screen__hint">
+        {resolution?.width == null && resolution?.height == null
+          ? `Delivering the crop at its own size${outSize ? ` — ${outSize.width}x${outSize.height}` : ""}.`
+          : `Scaling the crop to ${outSize ? `${outSize.width}x${outSize.height}` : "the size above"}. Leave a side empty and it follows the crop; set both and the crop takes that shape.`}
+      </p>
+
+      <h4>Export range</h4>
+      {/* Marked from the playhead, the way an In/Out pair is actually set:
+          scrub to the frame you mean and press the button. Typing the number is
+          still there for when you know it, but nobody knows it by looking. */}
+      <div className="export-screen__markers">
+        <button
+          onClick={() => setRange({ start: currentFrame })}
+          title={`Start the export at the current frame (${currentFrame})`}
+        >
+          ⇥ Set in
+        </button>
+        <button
+          onClick={() => setRange({ end: currentFrame + 1 })}
+          title={`End the export after the current frame (${currentFrame})`}
+        >
+          Set out ⇤
+        </button>
+        <button
+          onClick={() => setRange({ start: null, end: null })}
+          disabled={!customRange}
+          title="Go back to writing exactly what the In/Out markers bound"
+        >
+          follow In/Out
+        </button>
+      </div>
+      <div className="field-row">
+        <label>Frames</label>
+        <input
+          type="number"
+          min={0}
+          max={Math.max(clipFrames - 1, 0)}
+          value={exportWindow[0]}
+          onChange={(e) => setRange({ start: Number(e.target.value) })}
+          title="First frame written, inclusive"
+        />
+        <span className="modal__hint">to</span>
+        <input
+          type="number"
+          min={1}
+          max={clipFrames}
+          value={exportWindow[1]}
+          onChange={(e) => setRange({ end: Number(e.target.value) })}
+          title="One past the last frame written"
+        />
+        <span className="modal__hint">of {clipFrames}</span>
+      </div>
+      <p className="export-screen__hint">
+        {customRange
+          ? `Writing ${exportWindow[1] - exportWindow[0]} frames — the export's own range. The In/Out markers (${markers[0]}–${markers[1] - 1}) still bound tracking.`
+          : `Following the In/Out markers, so this render writes frames ${exportWindow[0]}–${exportWindow[1] - 1}. Setting either end above makes it the export's own range and leaves the markers alone.`}
       </p>
 
       <h4>Border</h4>

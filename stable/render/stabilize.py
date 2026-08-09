@@ -12,31 +12,40 @@ Frames are then produced lazily and handed straight to
 through untouched. Nothing holds more than one frame at a time, so clip length
 is bounded by disk, not memory.
 
-The stabilisation target
-------------------------
-The base warp is ``smoothed(t) . raw(t)^-1``, so a clip with *no* smoothing
-configured produces the identity on every frame — a render that is a re-encode
-of the source and looks, correctly, like nothing happened. That is the whole
-failure mode behind "the stabilised output doesn't work": nothing errors,
-:attr:`OutputGeometry.zoom` comes back as ``1.0``, and the file is just the
-input again.
+Targets, and the fit
+--------------------
+A :class:`~stable.render.options.StabilizationTarget` is a list of marks on the
+output frame, each naming the tracked path that goes on it. The plan is the
+similarity that best satisfies all of them at once::
 
-A :class:`~stable.render.options.StabilizationTarget` is the direct way to ask
-for stabilisation instead of asking for it sideways through the smoothing
-panel. Given the target's tracked position ``p(t)``, the plan holds it still::
+    S(t)   = argmin_S sum_k w_k |S . p_k(t) - g_k|^2
+    out(t) = fit . S(t)
 
-    q(t) = W(t) . p(t)                     # where the base warp puts it
-    plan(t) = T(q(anchor) - q(t)) . W(t)   # nail it to its anchor-frame place
+and that fit **is** the whole stabilisation — there is nothing composed
+underneath it. That matters for more than tidiness: ``p_k`` is whichever path
+the operator picked, raw or smoothed, and a base warp in series would move the
+smoothed path somewhere else before the fit ever saw it. With nothing composed
+under it, a ``smoothed`` mark lands the dashed trail on its mark exactly, every
+frame, which is what picking it says it will do.
 
-``W(t)`` comes from
-:meth:`~stable.smoothing.motion.SmoothedMotion.stabilization_transform`, never
-from raw channel values — the curves are pivot-relative, and rebuilding a
-transform from them is wrong by a rotation about the frame corner. The extra
-term is a pure translation *composed on top*, so that stays true. With no
-smoothing ``W(t)`` is the identity and the target lock is the entire
-stabilisation; with smoothing it removes whatever drift the filters left behind.
-:attr:`StabilizationPlan.max_displacement` reports how much the plan actually
-moves the picture, which is how a caller tells a real render from a no-op.
+With no marks at all the plan falls back to
+:meth:`~stable.smoothing.motion.SmoothedMotion.stabilization_transforms` —
+``smoothed(t) . raw(t)^-1``, never rebuilt from raw channel values, because the
+curves are pivot-relative and reconstructing a transform from them is wrong by a
+rotation about the frame corner. That is what a project renders as before
+anybody opens the export screen, and what produces the smoothed source paths
+themselves. :attr:`StabilizationPlan.max_displacement` reports how much the plan
+actually moves the picture, which is how a caller tells a real render from a
+no-op.
+
+Where a mark lands
+------------------
+A mark is a fraction of the *delivered* frame, and the plan honours it exactly:
+:func:`~stable.render.warp.plan_output` builds the crop/zoom fit so that
+``fit(origin) == placement × output size``, where ``origin`` is the marks'
+centroid in the fitted space. That identity is why an operator can state "hold
+this feature on the left thirds line" and have it be true of the file rather
+than nearly true: the framing is solved for, not measured afterwards.
 """
 
 from __future__ import annotations
@@ -56,8 +65,8 @@ from ..smoothing.motion import SmoothedMotion
 from ..trackers.base import ProgressCallback, noop_progress
 from ..video.encode import export_video
 from .fill import BorderFill
-from .options import CropSpec, RenderOptions, hold_gaps
-from .warp import OutputGeometry, load_cv2, plan_output, warp_frame
+from .options import CropSpec, OutputResolution, RenderOptions, hold_gaps
+from .warp import OutputGeometry, load_cv2, plan_output, warp_frame, window_size
 
 __all__ = [
     "IDENTITY_TOLERANCE_PX",
@@ -78,43 +87,17 @@ the source. Callers use it to refuse rather than to spend minutes encoding one.
 """
 
 
-def _target_transforms(
-    warps: Sequence[SimilarityTransform],
-    positions: np.ndarray,
-    anchor_frame: int,
-) -> list[SimilarityTransform]:
-    """Compose a translation onto each warp that pins ``positions`` to their anchor.
+def _identity_warps(count: int) -> list[SimilarityTransform]:
+    """Return ``count`` identity transforms.
 
-    Args:
-        warps: The base stabilisation warp per frame.
-        positions: ``[T, 2]`` target positions in source pixels, gaps already
-            held (see :func:`~stable.render.options.hold_gaps`).
-        anchor_frame: The frame whose stabilised target position is held.
-
-    Returns:
-        One transform per frame.
-
-    Raises:
-        RenderError: If the positions do not cover the planned frames, or the
-            anchor frame is outside them.
+    The base a target fit is composed onto. It is the identity *on purpose*: the
+    fit is the entire stabilisation, so the paths the operator chose are the
+    paths that get put on the marks — nothing is applied underneath that would
+    move them somewhere else first. The smoothing's own warp is still what a
+    render with no marks uses, and it is still what produces the ``smoothed``
+    source paths; it is just not silently in series with them.
     """
-    path = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
-    if path.shape[0] < len(warps):
-        raise RenderError(
-            f"the stabilisation target covers {path.shape[0]} frames but the render plans "
-            f"{len(warps)}; the target track was made from a different clip"
-        )
-    if not 0 <= anchor_frame < len(warps):
-        raise RenderError(
-            f"stabilisation anchor frame {anchor_frame} is outside the clip [0, {len(warps)})"
-        )
-    held = warps[anchor_frame].apply(path[anchor_frame])
-    out: list[SimilarityTransform] = []
-    for frame, warp in enumerate(warps):
-        moved = warp.apply(path[frame])
-        offset = held - moved
-        out.append(SimilarityTransform(tx=float(offset[0]), ty=float(offset[1])).compose(warp))
-    return out
+    return [SimilarityTransform.identity() for _ in range(count)]
 
 
 def _mapped_transforms(
@@ -125,21 +108,16 @@ def _mapped_transforms(
 ) -> list[SimilarityTransform]:
     """Compose the similarity that puts each tracked point on its chosen target.
 
-    The generalisation of :func:`_target_transforms`, and the reason it is worth
-    having: pinning *one* point can only translate the picture, so a shot that
-    rotates or zooms still rotates and zooms around it. Given two or more
-    point-to-target pairs, the transform that satisfies them **is** the
-    rotation and scale the shot needs::
+    This is the whole stabilisation. Pinning *one* point can only translate the
+    picture, so a shot that rotates or zooms still rotates and zooms around it.
+    Given two or more point-to-target pairs, the transform that satisfies them
+    **is** the rotation and scale the shot needs::
 
-        q_k(t) = W(t) . p_k(t)                 # where the base warp puts point k
-        S(t)   = argmin_S sum_k w_k |S q_k(t) - g_k|^2
-        plan(t) = S(t) . W(t)
+        S(t) = argmin_S sum_k w_k |S . p_k(t) - g_k|^2
 
     ``S`` is the weighted Umeyama fit — the same
     :func:`~stable.solver.similarity.solve_similarity` the camera solve uses,
-    not a second implementation of it — and it is composed **on top of** the
-    sanctioned warp exactly as the single-target lock is, so nothing here
-    reconstructs a transform from channel values.
+    not a second implementation of it.
 
     With one pair the fit degrades to a pure translation (rotation and scale are
     unobservable from a single correspondence), which is precisely the
@@ -148,8 +126,16 @@ def _mapped_transforms(
     reported rather than hidden — see
     :func:`stable.server.motion.target_residuals`.
 
+    Two or more pairs also spend the framing budget completely. The similarity
+    that satisfies them is unique, so any crop/zoom fit applied afterwards would
+    slide every point off the mark it was placed on; :meth:`StabilizationPlan.build`
+    therefore plans those with ``allow_zoom=False``. Gaps are then real and
+    reported rather than zoomed away — the way to close them is to move the
+    marks closer together.
+
     Args:
-        warps: The base stabilisation warp per frame.
+        warps: The base each fit is composed onto; the identity, from
+            :func:`_identity_warps`.
         sources: ``[K, T, 2]`` tracked paths in source pixels, gaps already held.
         destinations: ``[K, 2]`` chosen positions in output pixels.
         weights: Optional ``[K, T]`` per-frame confidences.
@@ -229,13 +215,13 @@ class StabilizationPlan:
         max_zoom: float | None = None,
         interpolation: str = "linear",
         background: tuple[int, int, int] = (0, 0, 0),
-        target_positions: np.ndarray | None = None,
-        anchor_frame: int | None = None,
-        mapped_sources: np.ndarray | None = None,
-        mapped_destinations: np.ndarray | None = None,
-        mapped_weights: np.ndarray | None = None,
+        sources: np.ndarray | None = None,
+        placements: np.ndarray | None = None,
+        weights: np.ndarray | None = None,
         crop: CropSpec | None = None,
         fill: BorderFill | None = None,
+        coverage_range: tuple[int, int] | None = None,
+        resolution: OutputResolution | None = None,
     ) -> StabilizationPlan:
         """Plan a render from smoothed motion.
 
@@ -248,56 +234,82 @@ class StabilizationPlan:
             max_zoom: Optional cap on the auto-zoom factor.
             interpolation: Resampling kernel.
             background: RGB fill for uncovered area.
-            target_positions: ``[T, 2]`` source-pixel path of the stabilisation
-                target, or ``None`` for the plain smoothing-only warp. Gaps are
-                held (:func:`~stable.render.options.hold_gaps`) rather than left
-                to make the correction lurch.
-            anchor_frame: Frame whose target position is held; defaults to the
-                solve's reference frame, so the framing does not move.
-            mapped_sources: ``[K, T, 2]`` tracked paths for a ``map`` target,
-                mutually exclusive with ``target_positions``.
-            mapped_destinations: ``[K, 2]`` chosen output positions for those
-                paths. Two or more pairs is what lets the plan use rotation and
-                scale rather than only translation — see
-                :func:`_mapped_transforms`.
-            mapped_weights: Optional ``[K, T]`` confidences for the fit.
+            sources: ``[K, T, 2]`` source-pixel paths, one per target mark, in
+                the order the marks were given. Gaps are held
+                (:func:`~stable.render.options.hold_gaps`) rather than left to
+                make the correction lurch. ``None`` (or no marks at all) plans
+                the plain smoothing warp, which is what a project renders as
+                before anybody places a target.
+            placements: ``[K, 2]`` marks as ``(u, v)`` fractions of the output.
+            weights: Optional ``[K, T]`` per-frame confidences for the fit.
             crop: How much of the frame the output keeps; ``None`` is the exact
                 minimal gapless crop.
             fill: What goes in the uncovered area.
+            coverage_range: Half-open ``(start, end)`` the automatic crop is
+                measured over; ``None`` measures every planned frame. The plan
+                itself always covers the whole clip — this narrows what "no
+                gaps" is a promise about, not what gets rendered.
+            resolution: The size to deliver the crop window at.
 
         Returns:
             The :class:`StabilizationPlan`.
 
         Raises:
             RenderError: If the border policy is unknown, an automatic crop
-                finds the warped frames share no common area, or the target
-                path does not cover the clip.
+                finds the warped frames share no common area, or a source path
+                does not cover the clip.
         """
         width, height = int(source_size[0]), int(source_size[1])
         warps: Sequence[SimilarityTransform] = motion.stabilization_transforms()
-        target_centre: tuple[float, float] | None = None
-        if mapped_sources is not None and mapped_destinations is not None:
-            held_paths = np.stack([hold_gaps(path) for path in np.asarray(mapped_sources)])
-            warps = _mapped_transforms(
-                warps, held_paths, mapped_destinations, weights=mapped_weights
+        origin: tuple[float, float] | None = None
+        place = (0.5, 0.5)
+        allow_zoom = True
+        marks = (
+            np.zeros((0, 2))
+            if placements is None
+            else np.asarray(placements, dtype=np.float64).reshape(-1, 2)
+        )
+        if sources is not None and marks.shape[0]:
+            held = np.stack([hold_gaps(path) for path in np.asarray(sources)])
+            # The marks are fractions of the delivered frame, and the fit is the
+            # *whole* stabilisation — nothing is composed underneath it. That is
+            # what lets a `smoothed` source land its own trail on its mark: the
+            # path the operator picked is the path that gets fitted, rather than
+            # a path pushed through a warp they did not ask for.
+            #
+            # They resolve against the *crop window*, not the source frame. The
+            # window carries the delivered aspect ratio, so the fit's own scale
+            # is the only thing between these and the output pixels — which is
+            # what keeps two marks exactly on their fractions when the delivery
+            # is a different shape than the source.
+            box = np.asarray(
+                window_size(width, height, (resolution or OutputResolution()).aspect),
+                dtype=np.float64,
             )
-            # The destinations are already where the operator wants the picture
-            # framed, so a "crop around the target" centres on them.
-            centroid = np.asarray(mapped_destinations, dtype=np.float64).reshape(-1, 2).mean(axis=0)
-            target_centre = (float(centroid[0]), float(centroid[1]))
-        elif target_positions is not None:
-            held_path = hold_gaps(target_positions)
-            frame = motion.reference_frame if anchor_frame is None else int(anchor_frame)
-            warps = _target_transforms(warps, held_path, frame)
-            anchor_point = warps[frame].apply(held_path[frame])
-            target_centre = (float(anchor_point[0]), float(anchor_point[1]))
-        # "Crop around the target" only means anything once the target is pinned:
-        # without a lock its stabilised position moves, and a moving crop centre
-        # would re-frame the shot every frame instead of cropping it.
-        centre = target_centre if (crop is not None and crop.centre == "target") else None
+            destinations = marks * box
+            warps = _mapped_transforms(
+                _identity_warps(len(warps)), held, destinations, weights=weights
+            )
+            centroid = destinations.mean(axis=0)
+            origin = (float(centroid[0]), float(centroid[1]))
+            place = (float(marks[:, 0].mean()), float(marks[:, 1].mean()))
+            # Two or more marks pin rotation and scale as well as position, so
+            # the similarity is already determined and there is no zoom left to
+            # apply. One mark is a translation, which leaves the zoom free.
+            allow_zoom = marks.shape[0] < 2
         transforms = tuple(warps)
         geometry = plan_output(
-            transforms, width, height, border, max_zoom=max_zoom, centre=centre, crop=crop
+            transforms,
+            width,
+            height,
+            border,
+            max_zoom=max_zoom,
+            origin=origin,
+            placement=place,
+            crop=crop,
+            coverage_range=coverage_range,
+            allow_zoom=allow_zoom,
+            resolution=resolution,
         )
         return cls(
             transforms=transforms,
@@ -316,7 +328,8 @@ class StabilizationPlan:
         *,
         source_size: tuple[int, int],
         options: RenderOptions | None = None,
-        target_positions: np.ndarray | None = None,
+        sources: np.ndarray | None = None,
+        weights: np.ndarray | None = None,
         **overrides: Any,
     ) -> StabilizationPlan:
         """Plan a render from a project file's ``render`` block.
@@ -327,11 +340,12 @@ class StabilizationPlan:
                 — only its border policy is a planning decision; codec and CRF
                 belong to the encode step.
             source_size: ``(width, height)`` of the clip.
-            options: The operator's stabilisation target / crop / fill choices.
-                The *target* is supplied resolved, as ``target_positions``,
-                because turning "the point called p2" into a path needs the
-                tracks and this module deliberately knows nothing about them.
-            target_positions: ``[T, 2]`` path for ``options.target``.
+            options: The operator's target / crop / fill / resolution choices.
+                The marks' *paths* are supplied resolved, as ``sources``,
+                because turning "the smoothed estimate of p2" into a path needs
+                the tracks and this module deliberately knows nothing about them.
+            sources: ``[K, T, 2]`` paths, one per mark, in ``options`` order.
+            weights: Optional ``[K, T]`` confidences for the fit.
             **overrides: Any other :meth:`build` argument.
 
         Returns:
@@ -342,10 +356,14 @@ class StabilizationPlan:
             motion,
             source_size=source_size,
             border=settings.border,
-            target_positions=target_positions,
-            anchor_frame=chosen.target.anchor_frame,
+            sources=sources,
+            placements=np.asarray(
+                [point.place.fraction for point in chosen.target.points], dtype=np.float64
+            ).reshape(-1, 2),
+            weights=weights,
             crop=chosen.crop,
             fill=chosen.fill,
+            resolution=chosen.resolution,
             **overrides,
         )
 
@@ -650,10 +668,13 @@ def stabilize(
     border: str = "auto_zoom",
     max_zoom: float | None = None,
     interpolation: str = "linear",
-    target_positions: np.ndarray | None = None,
-    anchor_frame: int | None = None,
+    sources: np.ndarray | None = None,
+    placements: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
     crop: CropSpec | None = None,
     fill: BorderFill | None = None,
+    coverage_range: tuple[int, int] | None = None,
+    resolution: OutputResolution | None = None,
     **kwargs: Any,
 ) -> tuple[str, StabilizationPlan]:
     """Plan and render in one call — the convenience wrapper the CLI uses.
@@ -665,10 +686,13 @@ def stabilize(
         border: One of :data:`~stable.core.project.BORDER_POLICIES`.
         max_zoom: Optional cap on the auto-zoom factor.
         interpolation: Resampling kernel.
-        target_positions: ``[T, 2]`` path of the stabilisation target, if any.
-        anchor_frame: Frame whose target position is held.
+        sources: ``[K, T, 2]`` paths to put on the marks, if any.
+        placements: ``[K, 2]`` marks, as ``(u, v)`` fractions of the output.
+        weights: Optional ``[K, T]`` confidences for the fit.
         crop: How much of the frame to keep.
         fill: What goes in the uncovered area.
+        coverage_range: Frames the automatic crop is measured over.
+        resolution: The size to deliver the crop window at.
         **kwargs: Any other :func:`render_stabilized` argument.
 
     Returns:
@@ -686,10 +710,13 @@ def stabilize(
         border=border,
         max_zoom=max_zoom,
         interpolation=interpolation,
-        target_positions=target_positions,
-        anchor_frame=anchor_frame,
+        sources=sources,
+        placements=placements,
+        weights=weights,
         crop=crop,
         fill=fill,
+        coverage_range=coverage_range,
+        resolution=resolution,
     )
     return render_stabilized(video, plan, out_path, **kwargs), plan
 

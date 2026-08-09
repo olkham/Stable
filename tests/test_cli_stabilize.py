@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import numpy as np
 import pytest
@@ -325,11 +326,12 @@ def test_a_target_stabilises_with_no_smoothing_at_all(tmp_path, stabilize_inputs
     assert main(
         [
             "stabilize", video, "--tracks", tracks, "--out", pinned,
-            "--channels", "none", "--target", "point:4",
+            "--channels", "none", "--target", "track:4",
         ]
     ) == 0
     printed = capsys.readouterr()
     assert "holding point 4" in printed.out
+    assert "(50%, 50%) of the output" in printed.out
     assert "re-encode of the input" not in printed.err
 
     # Point 4 of GRID is the frame centre, so pinning it must steady the middle.
@@ -345,13 +347,13 @@ def test_a_target_stabilises_with_no_smoothing_at_all(tmp_path, stabilize_inputs
     assert frame_count(pinned) == clip.frame_count
 
 
-def test_centroid_target_needs_no_point_index(tmp_path, stabilize_inputs, capsys):
+def test_average_target_needs_no_point_index(tmp_path, stabilize_inputs, capsys):
     video, tracks, _ = stabilize_inputs
-    out = str(tmp_path / "centroid.mp4")
+    out = str(tmp_path / "average.mp4")
     assert main(
         [
             "stabilize", video, "--tracks", tracks, "--out", out,
-            "--channels", "none", "--target", "centroid",
+            "--channels", "none", "--target", "average",
         ]
     ) == 0
     assert "holding every point" in capsys.readouterr().out
@@ -362,10 +364,93 @@ def test_a_target_index_outside_the_tracks_is_reported(tmp_path, stabilize_input
     assert main(
         [
             "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "x.mp4"),
-            "--target", "point:99",
+            "--target", "track:99",
         ]
     ) == 1
     assert "out of range" in capsys.readouterr().err
+
+
+def test_the_target_can_be_placed_anywhere_in_the_output_frame(tmp_path, stabilize_inputs, capsys):
+    """Todo 1, eighth round: ``--target-at`` states where in the delivered frame it sits."""
+    video, tracks, _ = stabilize_inputs
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "thirds.mp4"),
+            "--channels", "none", "--target", "track:4", "--target-at", "top-left",
+        ]
+    ) == 0
+    assert "(33%, 33%) of the output" in capsys.readouterr().out
+
+
+def test_a_placement_outside_the_output_frame_is_refused(tmp_path, stabilize_inputs, capsys):
+    video, tracks, _ = stabilize_inputs
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "x.mp4"),
+                "--target", "track:0", "--target-at", "1.4,0.5",
+            ]
+        )
+    assert "fractions of the output frame" in capsys.readouterr().err
+
+
+def test_a_smoothed_target_holds_the_smoothed_estimate(tmp_path, stabilize_inputs, capsys):
+    """'smoothed' holds the smoothed estimate of that track, not the raw one."""
+    video, tracks, _ = stabilize_inputs
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "soft.mp4"),
+            "--target", "smoothed:4", "--smooth", "butterworth:cutoff_hz=1.0",
+        ]
+    ) == 0
+    assert "holding the smoothed estimate of point 4" in capsys.readouterr().out
+
+
+def test_the_delivery_resolution_scales_the_crop(tmp_path, stabilize_inputs):
+    """``--width``/``--height`` are delivery size, not field of view."""
+    from stable.video.source import PyAVVideoSource
+
+    video, tracks, _ = stabilize_inputs
+    out = str(tmp_path / "delivered.mp4")
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", out,
+            "--border", "crop", "--crop", "0.5", "--width", "640", "--height", "480", "--quiet",
+        ]
+    ) == 0
+    with PyAVVideoSource(out) as decoded:
+        assert (decoded.width, decoded.height) == (640, 480)
+
+
+def test_the_crop_can_be_measured_over_the_rendered_range_only(tmp_path, stabilize_inputs, capsys):
+    """Frames outside ``--frame-range`` stop dictating the crop of the ones inside."""
+    video, tracks, clip = stabilize_inputs
+    window = f"0:{max(clip.frame_count // 3, 2)}"
+
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "whole.mp4"),
+            "--target", "track:4", "--frame-range", window,
+        ]
+    ) == 0
+    whole = _zoom_of(capsys.readouterr().out)
+
+    assert main(
+        [
+            "stabilize", video, "--tracks", tracks, "--out", str(tmp_path / "fitted.mp4"),
+            "--target", "track:4", "--frame-range", window, "--crop-to-range",
+        ]
+    ) == 0
+    printed = capsys.readouterr().out
+    assert "measured over" in printed
+    assert _zoom_of(printed) < whole
+
+
+def _zoom_of(printed: str) -> float:
+    """Pull the ``zoom N.NNNN`` the border line reports out of the CLI's output."""
+    match = re.search(r"zoom ([0-9.]+)", printed)
+    assert match, printed
+    return float(match.group(1))
 
 
 def test_crop_scale_sets_the_output_size(tmp_path, stabilize_inputs):

@@ -159,7 +159,7 @@ class PointSpec:
 
     Args:
         id: Project-unique identifier (e.g. ``"p1"``).
-        queries: Anchor keyframes. Several anchors across the clip is the normal
+        queries: The point's anchors. Several across the clip is the normal
             case — see the multi-anchor section of ``PLAN.md``.
         tracker: Registered tracker plugin name.
         enabled_for_solve: Whether the solver may use this point.

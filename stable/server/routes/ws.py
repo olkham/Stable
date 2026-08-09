@@ -54,6 +54,7 @@ from ..frames import (
     frame_geometry,
     has_motion,
     load_options,
+    load_smoothed,
     output_frame_jpeg,
     plan_revision,
     preview_plan,
@@ -220,9 +221,13 @@ def _geometry_payload(
         project = workspace.load_project(project_id)
         plan = preview_plan(workspace, project_id, project)
         revision = plan_revision(workspace, project_id, project)
+        # The smoothed motion is what turns a track into the dashed trail, so a
+        # target holding one cannot be reported on without it.
+        motion = load_smoothed(workspace, project_id, project)
+        options = load_options(workspace, project_id, project)
     except Exception:  # noqa: BLE001 - an unplannable project still gets its pixels
         return None, ""
-    return frame_geometry(project, plan, load_options(workspace, project_id), frame), revision
+    return frame_geometry(project, plan, options, frame, motion), revision
 
 
 def _pack(header: dict[str, Any], payload: bytes) -> bytes:

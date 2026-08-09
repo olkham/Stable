@@ -17,7 +17,7 @@ const SETTLE_MS = 150;
  * Todo 14 is phrased in terms of template matching — "see the template patch",
  * "a grid of thumbnails" — but the need is not specific to that tracker: for
  * *any* point, the useful question is "what does the tracker see here, and does
- * it still look like what it saw at the keyframe?". A template that is a crisp
+ * it still look like what it saw at the anchor?". A template that is a crisp
  * corner at frame 0 and motion-blurred sky at frame 200 explains a failed track
  * instantly, and no other view in this app shows it.
  *
@@ -37,9 +37,9 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   const { project, currentFrame, setCurrentFrame, editRevision, refresh, afterEdit } =
     useProjectContext();
   const [info, setInfo] = useState<PointPatches | null>(null);
-  // The keyframe image the operator has clicked, so `Delete` has something to
+  // The anchor image the operator has clicked, so `Delete` has something to
   // act on (todo 9, fourth round). Null once it is gone or the point changes.
-  const [selectedKeyframe, setSelectedKeyframe] = useState<number | null>(null);
+  const [selectedAnchor, setSelectedAnchor] = useState<number | null>(null);
   // Pending edits to the settings, keyed by the plugin's own argument name.
   // Only what has been touched lives here, so a reload never fights the user.
   const [draft, setDraft] = useState<Record<string, number>>({});
@@ -73,21 +73,21 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   // A different point (or a tracker change) invalidates every pending edit:
   // the settings are per point and named per plugin.
   useEffect(() => setDraft({}), [pointId, info?.tracker]);
-  useEffect(() => setSelectedKeyframe(null), [pointId]);
+  useEffect(() => setSelectedAnchor(null), [pointId]);
 
   /**
-   * Remove one of this point's own keyframe pins.
+   * Remove one anchor, from its own picture.
    *
-   * Goes through `afterEdit`, not a bare refresh: the keyframe list the panel
+   * Goes through `afterEdit`, not a bare refresh: the anchor list this panel
    * and the timeline draw comes with the *track*, which is cached separately
-   * from the project, so refreshing only the project would leave a deleted pin
-   * on screen until the next tracking run replaced that cache.
+   * from the project, so refreshing only the project would leave a deleted
+   * anchor on screen until the next tracking run replaced that cache.
    */
-  const deleteKeyframe = useCallback(
+  const deleteAnchor = useCallback(
     async (frame: number) => {
       try {
         await api.deleteAnchor(project.id, pointId, frame);
-        setSelectedKeyframe(null);
+        setSelectedAnchor(null);
         await afterEdit(pointId);
         await reload();
       } catch (err) {
@@ -97,20 +97,20 @@ export function PatchPanel({ pointId }: { pointId: string }) {
     [project.id, pointId, afterEdit, reload],
   );
 
-  // Delete/Backspace removes the selected keyframe image. Ignored while typing
+  // Delete/Backspace removes the selected anchor's image. Ignored while typing
   // in a field, the same guard the rest of the app's shortcuts use.
   useEffect(() => {
-    if (selectedKeyframe === null) return;
+    if (selectedAnchor === null) return;
     function onKey(event: KeyboardEvent) {
       if (event.key !== "Delete" && event.key !== "Backspace") return;
       const target = event.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
       event.preventDefault();
-      void deleteKeyframe(selectedKeyframe as number);
+      void deleteAnchor(selectedAnchor as number);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedKeyframe, deleteKeyframe]);
+  }, [selectedAnchor, deleteAnchor]);
 
   if (error) return <div className="error-text">{error}</div>;
   if (!info) return <div className="patch-panel">Loading patches…</div>;
@@ -123,14 +123,14 @@ export function PatchPanel({ pointId }: { pointId: string }) {
    * server sends null for the trackers that have none — the deep ones, which see
    * whole frames. For those there is no patch: the radius below is a preview
    * size this panel invented, and a grid of thumbnails of it is a picture of
-   * something the algorithm never looks at. The keyframes themselves still
-   * matter (they are where the point is pinned, and deleting one has to keep
-   * working), so they are listed — as frames, which is what they are here.
+   * something the algorithm never looks at. The panel then says so and shows
+   * nothing else — the anchors are listed on the card above, and listing them
+   * again here was the second of the two lists this round exists to remove.
    */
   const hasWindow = info.radius_source !== null;
-  // Pins only: the last one cannot be deleted, and a promoted correction is not
-  // one of them, so counting the whole grid would get that limit wrong.
-  const keyframeCount = info.patches.filter((p) => p.pinned).length;
+  // A point must keep one anchor to track from, so the last one's × is refused
+  // here rather than left to fail on the server.
+  const anchorCount = info.patches.filter((p) => p.kind === "anchor").length;
   const windowSetting = settings.find((s) => s.role === "window");
   const value = (setting: TrackerSetting) => draft[setting.attribute] ?? setting.value;
   const dirty = settings.some((s) => value(s) !== s.value);
@@ -167,22 +167,19 @@ export function PatchPanel({ pointId }: { pointId: string }) {
   /** Clear every override this point has, restoring the plugin's own defaults. */
   const reset = () => commit(Object.fromEntries(settings.map((s) => [s.attribute, null])));
 
-  /** Why a keyframe's × is unavailable, or null when it can be deleted. */
+  /** Why an anchor's × is unavailable, or null when it can be deleted. */
   function undeletableReason(patch: PointPatches["patches"][number]): string | null {
-    if (patch.kind !== "keyframe") return "Only keyframes can be deleted";
-    if (!patch.pinned) {
-      return "This keyframe comes from a manual correction — delete the correction on the Edit tab";
-    }
-    if (keyframeCount <= 1) {
-      return "A point needs at least one keyframe to track from — this is its last one";
+    if (patch.kind !== "anchor") return "Only anchors can be deleted";
+    if (anchorCount <= 1) {
+      return "A track needs at least one anchor to track from — this is its last one";
     }
     return null;
   }
 
   function thumb(patch: PointPatches["patches"][number], key: string) {
     const isCurrent = patch.frame === currentFrame;
-    const isKeyframe = patch.kind === "keyframe";
-    const isSelected = isKeyframe && patch.frame === selectedKeyframe;
+    const isAnchor = patch.kind === "anchor";
+    const isSelected = isAnchor && patch.frame === selectedAnchor;
     const blocked = undeletableReason(patch);
     return (
       <figure
@@ -192,24 +189,24 @@ export function PatchPanel({ pointId }: { pointId: string }) {
         } patch-thumb--${patch.kind}`}
         onClick={() => {
           setCurrentFrame(patch.frame);
-          // Clicking a keyframe image also *selects* it, which is what gives
+          // Clicking an anchor's image also *selects* it, which is what gives
           // `Delete` something to remove (todo 9).
-          if (isKeyframe) setSelectedKeyframe(patch.frame);
+          if (isAnchor) setSelectedAnchor(patch.frame);
         }}
         title={
-          isKeyframe
-            ? `Keyframe ${patch.frame} — the position you set. Click to jump there and select it; Delete removes it.`
+          isAnchor
+            ? `Anchor at frame ${patch.frame} — the position you set. Click to jump there and select it; Delete removes it.`
             : `Frame ${patch.frame} — where the tracker put it. Click to jump there.`
         }
       >
-        {isKeyframe && (
+        {isAnchor && (
           <button
             className="patch-thumb__delete"
             disabled={blocked !== null}
-            title={blocked ?? `Delete keyframe ${patch.frame}`}
+            title={blocked ?? `Delete the anchor at frame ${patch.frame}`}
             onClick={(e) => {
               e.stopPropagation();
-              if (!blocked) void deleteKeyframe(patch.frame);
+              if (!blocked) void deleteAnchor(patch.frame);
             }}
           >
             ×
@@ -227,8 +224,8 @@ export function PatchPanel({ pointId }: { pointId: string }) {
               // counter, which every correction bumped, so correcting one point
               // on one frame re-fetched the *whole* grid; at `original` that is
               // a full-resolution seek per thumbnail, twenty deep-clip seeks for
-              // one drag, and it is what made editing feel laggy. A pin does not
-              // move when a correction is made elsewhere, so now it does not
+              // one drag, and it is what made editing feel laggy. An anchor does
+              // not move when a correction is made elsewhere, so now it does not
               // reload either.
               `${patch.x.toFixed(1)}x${patch.y.toFixed(1)}`,
               // 1:1 source pixels here: this panel is where the operator judges
@@ -252,7 +249,7 @@ export function PatchPanel({ pointId }: { pointId: string }) {
           </div>
         )}
         <figcaption>
-          {patch.kind === "keyframe" ? "◆" : ""}f{patch.frame}
+          {patch.kind === "anchor" ? "◆" : ""}f{patch.frame}
         </figcaption>
       </figure>
     );
@@ -335,57 +332,31 @@ export function PatchPanel({ pointId }: { pointId: string }) {
         </div>
       )}
 
-      {info.patches.length === 0 ? (
+      {/* One list of anchors per card, and it is the one on the card itself
+          (todo 6, seventh round). What this panel adds is the *pixels* at each
+          of them, so it draws them when there are pixels to draw and says why
+          not when there are not — it no longer repeats the row above as chips. */}
+      {!hasWindow ? (
+        <p className="patch-panel__note">{patchSizeExplanation(info)}</p>
+      ) : info.patches.length === 0 ? (
         <p className="patch-panel__empty">
-          No keyframes yet — place one to see {hasWindow ? "the patch it would track from" : "it listed here"}.
+          No anchors yet — place one to see the patch it would track from.
         </p>
-      ) : hasWindow ? (
+      ) : (
         <>
           <span className="patch-panel__label">
-            Keyframes — click one, then Delete, or use its ×
+            Anchors — click one, then Delete, or use its ×
           </span>
           <div className="patch-panel__grid">
             {info.patches.map((patch) => thumb(patch, `k${patch.frame}`))}
           </div>
         </>
-      ) : (
-        <>
-          {/* No thumbnails, because there is no patch (todo 5, sixth round) —
-              but the keyframes are still the point's ground truth, and removing
-              one has to be possible from here whatever the tracker is. */}
-          <span className="patch-panel__label">Keyframes</span>
-          <div className="patch-panel__keyframes">
-            {info.patches.map((patch) => {
-              const blocked = undeletableReason(patch);
-              return (
-                <span key={`k${patch.frame}`} className="anchor-chip">
-                  <button className="link-button" onClick={() => setCurrentFrame(patch.frame)}>
-                    {patch.pinned ? "◆" : "✎"}f{patch.frame}
-                  </button>
-                  {patch.kind === "keyframe" && (
-                    <button
-                      className="anchor-chip__delete"
-                      disabled={blocked !== null}
-                      title={blocked ?? `Delete keyframe ${patch.frame}`}
-                      onClick={() => {
-                        if (!blocked) void deleteKeyframe(patch.frame);
-                      }}
-                    >
-                      ×
-                    </button>
-                  )}
-                </span>
-              );
-            })}
-          </div>
-          <p className="patch-panel__note">{patchSizeExplanation(info)}</p>
-        </>
       )}
 
       {hasWindow && info.patches.some((p) => !p.available) && (
         <p className="patch-panel__warning">
-          ✕ marks a keyframe too close to the frame edge for this size — the tracker would refuse
-          it too. Reduce the size or move the keyframe inward.
+          ✕ marks an anchor too close to the frame edge for this size — the tracker would refuse
+          it too. Reduce the size or move the anchor inward.
         </p>
       )}
     </div>

@@ -76,7 +76,7 @@ def test_disabled_corrections_change_nothing():
 # -- offset --------------------------------------------------------------------
 
 
-def test_offset_is_full_at_its_keyframe_and_zero_beyond_the_falloff():
+def test_offset_is_full_at_its_own_frame_and_zero_beyond_the_falloff():
     raw = straight_track()
     out = apply_corrections(
         raw, [OffsetCorrection(frame=20, dx=5.0, dy=-3.0, falloff_before=6, falloff_after=6)]

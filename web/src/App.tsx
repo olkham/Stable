@@ -3,11 +3,13 @@ import { CurveEditor } from "./components/CurveEditor";
 import { ExportPanel } from "./components/ExportPanel";
 import { ModelManager } from "./components/ModelManager";
 import { TracksPanel } from "./components/TracksPanel";
+import { TrackTimelinePanel } from "./components/TrackTimelinePanel";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { SmoothingPanel } from "./components/SmoothingPanel";
 import { SolvePanel } from "./components/SolvePanel";
 import { Timeline } from "./components/Timeline";
 import { Viewer } from "./components/Viewer";
+import { useTracksPanelFlag } from "./flags";
 import { ExportProvider } from "./state/ExportContext";
 import { FrameStreamProvider } from "./state/FrameStreamContext";
 import { ProjectProvider, useProjectContext } from "./state/ProjectContext";
@@ -63,6 +65,10 @@ function Workspace({ onClose }: { onClose: () => void }) {
   const [tab, setTab] = useState<Tab>("points");
   const [curvesOpen, setCurvesOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
+  // Two Tracks panels exist while the redesign is being judged; see `flags.ts`.
+  // The switch between them is in whichever panel is up, so there is no way to
+  // end up in one with no way back.
+  const [tracksPanel, setTracksPanel] = useTracksPanelFlag();
 
   return (
     <div className="workspace">
@@ -124,7 +130,12 @@ function Workspace({ onClose }: { onClose: () => void }) {
               </button>
             ))}
           </nav>
-          {tab === "points" && <TracksPanel />}
+          {tab === "points" &&
+            (tracksPanel === "timeline" ? (
+              <TrackTimelinePanel variant={tracksPanel} onVariantChange={setTracksPanel} />
+            ) : (
+              <TracksPanel variant={tracksPanel} onVariantChange={setTracksPanel} />
+            ))}
           {tab === "solve" && <SolvePanel />}
           {tab === "smoothing" && <SmoothingPanel />}
           {/* The export is a tab, not a modal (todo 1, fourth round): its

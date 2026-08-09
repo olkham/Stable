@@ -18,14 +18,18 @@ from stable.core.geometry import SimilarityTransform
 from stable.render import (
     BorderFill,
     CropSpec,
+    ExportRange,
+    OutputResolution,
+    Placement,
     RenderOptions,
     StabilizationPlan,
     StabilizationTarget,
+    TargetPoint,
     average_positions,
     coverage_scale,
     hold_gaps,
     plan_output,
-    warp_frame,
+    window_size,
 )
 from stable.smoothing import SmoothingSettings, smooth_motion
 from stable.solver import solve_motion
@@ -61,27 +65,118 @@ def truth_path(source: WarpedClipSource, point: tuple[float, float]) -> np.ndarr
 
 def test_options_round_trip_through_json():
     options = RenderOptions(
-        target=StabilizationTarget(mode="point", point_id="p3", anchor_frame=7),
-        crop=CropSpec(scale=0.75, centre="target"),
+        target=StabilizationTarget(
+            points=(
+                TargetPoint(id="t1", place=Placement(1 / 3, 0.25), point_ids=("p3",)),
+                TargetPoint(id="t2", place=Placement(0.7, 0.6), source="smoothed"),
+            )
+        ),
+        crop=CropSpec(scale=0.75, limit_to_range=True),
         fill=BorderFill(mode="blur", color=(10, 20, 30), blur=4.0, tint=0.5, feather=2.0),
+        export_range=ExportRange(start=12, end=200),
+        resolution=OutputResolution(1920, 1080),
     )
     assert RenderOptions.from_dict(options.to_dict()) == options
-    # Anything absent takes its default, so an older project renders as before.
+    # Anything absent takes its default: no marks, which is the smoothing warp.
     assert RenderOptions.from_dict({}) == RenderOptions()
-    assert RenderOptions.from_dict(None).target.mode == "frame"
+    assert RenderOptions.from_dict(None).target.points == ()
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        # `frame` held nothing, so it becomes no marks at all.
+        ({"mode": "frame"}, []),
+        ({"mode": "point", "point_id": "p2"}, [(("p2",), "raw")]),
+        ({"mode": "track", "point_id": "p2"}, [(("p2",), "raw")]),
+        ({"mode": "smoothed_track", "point_id": "p2"}, [(("p2",), "smoothed")]),
+        # `centroid` / `average` named no point and meant "all of them", which
+        # is exactly what an empty track list means now.
+        ({"mode": "centroid"}, [((), "raw")]),
+        ({"mode": "selected", "point_ids": ["p1", "p3"]}, [(("p1", "p3"), "raw")]),
+        (
+            {"mode": "map", "pairs": [{"point_id": "p1", "u": 0.2, "v": 0.3}]},
+            [(("p1",), "raw")],
+        ),
+    ],
+)
+def test_sidecars_from_before_the_target_list_still_load(stored, expected):
+    """Three generations of stored target must not become junk on read."""
+    target = StabilizationTarget.from_dict(stored)
+    assert [(p.point_ids, p.source) for p in target.points] == expected
+    # Whatever they migrate to, the ids have to be usable and distinct.
+    assert len({p.id for p in target.points}) == len(target.points)
+
+
+def test_a_legacy_map_mark_is_read_as_a_fraction_of_the_frame():
+    """Marks used to be pixels before the crop fit; they are output fractions now.
+
+    The clip size is what converts them, and it is only available when the
+    caller has the project — so the conversion is offered rather than assumed,
+    and a mark read without it goes to the centre rather than being taken for a
+    fraction it plainly is not.
+    """
+    stored = {"mode": "map", "pairs": [{"point_id": "p1", "x": 480.0, "y": 270.0}]}
+    converted = StabilizationTarget.from_dict(stored, (1920, 1080))
+    assert converted.points[0].place.fraction == pytest.approx((0.25, 0.25))
+    blind = StabilizationTarget.from_dict(stored)
+    assert blind.points[0].place.fraction == (0.5, 0.5)
 
 
 @pytest.mark.parametrize(
     ("kwargs", "fragment"),
     [
-        ({"mode": "middle"}, "unknown stabilisation target"),
-        ({"mode": "point"}, "needs a point_id"),
-        ({"mode": "centroid", "anchor_frame": -2}, "anchor_frame"),
+        ({"source": "guessed"}, "unknown target source"),
+        ({"point_ids": ("p1", "p1")}, "only be mapped once"),
+        ({"weight": 0.0}, "weight must be positive"),
+        ({"id": ""}, "needs an id"),
     ],
 )
-def test_bad_targets_are_rejected_with_a_reason(kwargs, fragment):
+def test_bad_target_points_are_rejected_with_a_reason(kwargs, fragment):
     with pytest.raises(RenderError, match=fragment):
-        StabilizationTarget(**kwargs)
+        TargetPoint(**kwargs)
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
+def test_a_placement_outside_the_output_frame_is_rejected(value):
+    with pytest.raises(RenderError, match="placement"):
+        Placement(u=value)
+
+
+def test_the_output_resolution_scales_the_crop_or_follows_it():
+    assert OutputResolution().is_source
+    assert OutputResolution().resolve((640, 360)) == (640, 360)
+    assert OutputResolution(1920, 1080).resolve((640, 360)) == (1920, 1080)
+    # One side alone keeps the shape and changes the size.
+    assert OutputResolution(width=1280).resolve((640, 360)) == (1280, 720)
+    assert OutputResolution(height=720).resolve((640, 360)) == (1280, 720)
+    # Both sides set is also a statement about the crop window's shape.
+    assert OutputResolution(1080, 1080).aspect == (1080.0, 1080.0)
+    assert OutputResolution(width=1080).aspect is None
+    with pytest.raises(RenderError, match="at least 2 pixels"):
+        OutputResolution(width=1)
+
+
+def test_the_crop_window_takes_the_delivered_aspect_ratio():
+    """A square delivery crops the biggest square, rather than squeezing 16:9."""
+    assert window_size(1920, 1080, None) == (1920.0, 1080.0)
+    assert window_size(1920, 1080, (1.0, 1.0)) == (1080.0, 1080.0)
+    assert window_size(1920, 1080, (16.0, 9.0)) == (1920.0, 1080.0)
+    assert window_size(1080, 1920, (16.0, 9.0)) == (1080.0, 607.5)
+
+
+def test_an_export_range_must_be_non_empty_and_may_follow_the_markers():
+    assert not ExportRange().is_custom
+    assert ExportRange().resolve(500, (10, 40)) == (10, 40)
+    # Either end alone overrides that end and leaves the other following.
+    assert ExportRange(start=25).resolve(500, (10, 40)) == (25, 40)
+    assert ExportRange(end=60).resolve(500, (10, 40)) == (10, 60)
+    # A range from a longer clip is clamped rather than rejected.
+    assert ExportRange(start=900, end=950).resolve(100, (0, 100)) == (99, 100)
+    with pytest.raises(RenderError, match="end after it starts"):
+        ExportRange(start=40, end=40)
+    with pytest.raises(RenderError, match="frame 0 or later"):
+        ExportRange(start=-3)
 
 
 @pytest.mark.parametrize("scale", [0.0, -0.5, 1.5, float("nan")])
@@ -142,21 +237,38 @@ def test_a_target_that_was_never_tracked_says_so():
         hold_gaps(np.full((6, 2), np.nan))
 
 
-# -- the target lock ------------------------------------------------------------
+# -- the target fit --------------------------------------------------------------
+
+
+def smoothed_path(motion, source, point):
+    """The dashed trail: a point's path after the smoothing's own warp."""
+    warps = motion.stabilization_transforms()
+    return np.asarray(
+        [warps[f].apply(np.asarray(source.transform_at(f).apply(point)))
+         for f in range(source.frame_count)],
+        dtype=np.float64,
+    )
+
+
+def held(motion, clip, paths, marks, **kwargs):
+    """Plan a render holding ``paths`` on ``marks``."""
+    return StabilizationPlan.build(
+        motion,
+        source_size=(clip.width, clip.height),
+        sources=np.stack(paths),
+        placements=np.asarray(marks, dtype=np.float64),
+        **kwargs,
+    )
 
 
 def test_a_target_pins_its_point_with_no_smoothing_at_all(clip):
-    """The heart of todo 17: stabilisation without configuring a filter."""
-    motion = motion_for(clip)  # no filters => the base warp is the identity
+    """Stabilisation without configuring a filter: the fit *is* the warp."""
+    motion = motion_for(clip)  # no filters => the smoothing warp is the identity
     plain = StabilizationPlan.build(motion, source_size=(clip.width, clip.height))
     assert plain.is_no_op
 
     feature = GRID[4]
-    plan = StabilizationPlan.build(
-        motion,
-        source_size=(clip.width, clip.height),
-        target_positions=truth_path(clip, feature),
-    )
+    plan = held(motion, clip, [truth_path(clip, feature)], [(0.5, 0.5)])
     assert not plan.is_no_op
     landed = np.asarray(
         [plan.output_transform(f).apply(np.asarray(clip.transform_at(f).apply(feature)))
@@ -165,57 +277,68 @@ def test_a_target_pins_its_point_with_no_smoothing_at_all(clip):
     assert np.ptp(landed, axis=0).max() < 1e-6
 
 
-def test_the_target_lock_composes_onto_the_sanctioned_warp(clip):
-    """Pivot safety: the extra term is a pure translation, nothing is rebuilt.
+@pytest.mark.parametrize("place", [(0.5, 0.5), (1 / 3, 0.25)])
+def test_a_smoothed_target_sticks_to_the_dashed_trail(clip, place):
+    """The whole reason a target names a source.
 
-    Rebuilding a transform from the solve's channel values (the mistake Phase 3
-    recorded) would change the rotation and scale too. Asserting they survive
-    untouched is what makes that impossible to reintroduce here.
+    A ``raw`` mark holds the solid trail on the mark; a ``smoothed`` one holds
+    the dashed trail there. Both must be *exact*, on every frame — which they
+    can only be because the fit is the entire stabilisation, with no smoothing
+    warp composed underneath moving the chosen path somewhere else first.
     """
-    motion = motion_for(clip, SmoothingSettings.uniform("gaussian", {"sigma": 6.0}))
-    base = motion.stabilization_transforms()
-    plan = StabilizationPlan.build(
-        motion,
-        source_size=(clip.width, clip.height),
-        target_positions=truth_path(clip, GRID[0]),
-        border="transparent",
-    )
-    moved = 0.0
-    for frame, warp in enumerate(plan.transforms):
-        assert warp.rotation == pytest.approx(base[frame].rotation, abs=1e-12)
-        assert warp.scale == pytest.approx(base[frame].scale, abs=1e-12)
-        moved = max(moved, abs(warp.tx - base[frame].tx) + abs(warp.ty - base[frame].ty))
-    assert moved > 1.0, "the target should have had something left to correct"
+    motion = motion_for(clip, SmoothingSettings.uniform("butterworth", {"cutoff_hz": 1.0}))
+    raw = truth_path(clip, GRID[4])
+    dashed = smoothed_path(motion, clip, GRID[4])
+    # The two trails have to actually differ, or this proves nothing.
+    assert np.abs(raw - dashed).max() > 1.0
 
-
-def test_the_anchor_frame_chooses_which_framing_is_held(clip):
-    motion = motion_for(clip)
-    positions = truth_path(clip, GRID[4])
-    for anchor in (0, 15, 29):
-        plan = StabilizationPlan.build(
-            motion,
-            source_size=(clip.width, clip.height),
-            target_positions=positions,
-            anchor_frame=anchor,
-            border="transparent",
+    for name, path in (("raw", raw), ("smoothed", dashed)):
+        plan = held(motion, clip, [path], [place])
+        mark = np.array([place[0] * plan.geometry.width, place[1] * plan.geometry.height])
+        landed = np.asarray(
+            [plan.output_transform(f).apply(path[f]) for f in range(plan.n_frames)]
         )
-        # At its own anchor frame the render must not move the picture at all.
-        assert plan.transforms[anchor].is_identity(atol=1e-9)
+        assert np.abs(landed - mark).max() < 1e-6, f"the {name} trail left its mark"
+
+
+def test_the_fit_is_the_whole_warp_so_a_smoothed_target_is_gentler(clip):
+    """Holding the dashed trail leaves the shot moving; holding the solid one does not.
+
+    Both are legitimate asks, and the difference is the reason the control
+    exists: a raw mark takes out everything the tracker saw, a smoothed one
+    takes out what the smoothed estimate saw and leaves the rest.
+    """
+    motion = motion_for(clip, SmoothingSettings.uniform("butterworth", {"cutoff_hz": 1.0}))
+    feature = GRID[4]
+    raw = truth_path(clip, feature)
+    dashed = smoothed_path(motion, clip, feature)
+
+    def feature_spread(path):
+        plan = held(motion, clip, [path], [(0.5, 0.5)], border="transparent")
+        landed = np.asarray(
+            [plan.output_transform(f).apply(raw[f]) for f in range(plan.n_frames)]
+        )
+        return float(np.ptp(landed, axis=0).max())
+
+    assert feature_spread(raw) < 1e-6
+    assert feature_spread(dashed) > 1.0
 
 
 def test_a_target_from_a_different_clip_is_refused(clip):
     motion = motion_for(clip)
     with pytest.raises(RenderError, match="different clip"):
-        StabilizationPlan.build(
-            motion, source_size=(clip.width, clip.height), target_positions=np.zeros((4, 2))
-        )
-    with pytest.raises(RenderError, match="anchor frame"):
-        StabilizationPlan.build(
-            motion,
-            source_size=(clip.width, clip.height),
-            target_positions=truth_path(clip, GRID[0]),
-            anchor_frame=999,
-        )
+        held(motion, clip, [np.zeros((4, 2))], [(0.5, 0.5)])
+
+
+def test_with_no_marks_the_plan_is_the_smoothing_warp(clip):
+    """The fallback, and what a project renders as before a target is placed."""
+    motion = motion_for(clip, SmoothingSettings.uniform("gaussian", {"sigma": 6.0}))
+    base = motion.stabilization_transforms()
+    plan = StabilizationPlan.build(
+        motion, source_size=(clip.width, clip.height), border="transparent"
+    )
+    for frame, warp in enumerate(plan.transforms):
+        assert warp.allclose(base[frame])
 
 
 def test_max_displacement_measures_stabilisation_not_zoom(clip):
@@ -265,121 +388,93 @@ def test_an_explicit_crop_can_render_a_shot_with_no_common_area():
     assert (rescued.width, rescued.height) == (WIDTH, HEIGHT)
 
 
-def test_the_crop_can_be_centred_somewhere_other_than_the_frame_centre():
+def test_the_crop_is_pinned_to_the_origin_it_is_given():
     still = [SimilarityTransform.identity()]
-    off = plan_output(still, WIDTH, HEIGHT, "crop", centre=(60.0, 30.0), crop=CropSpec(scale=0.5))
+    off = plan_output(still, WIDTH, HEIGHT, "crop", origin=(60.0, 30.0), crop=CropSpec(scale=0.5))
     assert off.centre == (60.0, 30.0)
-    # The requested centre lands in the middle of the output rectangle.
+    # With the default placement the origin lands in the middle of the output.
     assert off.fit.apply(np.array([60.0, 30.0])) == pytest.approx([off.width / 2, off.height / 2])
+
+
+@pytest.mark.parametrize("border", ["crop", "auto_zoom"])
+@pytest.mark.parametrize("placement", [(0.5, 0.5), (1 / 3, 1 / 3), (0.2, 0.85), (0.0, 1.0)])
+def test_the_origin_lands_exactly_on_its_placement_in_the_output(border, placement):
+    """The identity the whole output-space vocabulary rests on (todo 1, eighth round).
+
+    A target's position is stated as a fraction of the *output* frame, and the
+    only reason that can be honoured exactly is that the crop/zoom fit is built
+    to satisfy ``fit(origin) == placement × output size``. If this drifts, every
+    mark the operator places is quietly wrong by the crop.
+    """
+    shifted = [SimilarityTransform(tx=6.0, ty=-4.0), SimilarityTransform(tx=-6.0, ty=4.0)]
+    origin = (WIDTH / 2 + 12.0, HEIGHT / 2 - 5.0)
+    geometry = plan_output(shifted, WIDTH, HEIGHT, border, origin=origin, placement=placement)
+    landed = geometry.fit.apply(np.array(origin))
+    assert landed == pytest.approx(
+        [placement[0] * geometry.width, placement[1] * geometry.height], abs=1e-9
+    )
+    assert geometry.placement == pytest.approx(placement)
 
 
 def test_coverage_measured_about_an_off_centre_point_is_smaller():
     shifted = [SimilarityTransform(tx=10.0), SimilarityTransform(tx=-10.0)]
     centred = coverage_scale(shifted, WIDTH, HEIGHT)
-    off = coverage_scale(shifted, WIDTH, HEIGHT, centre=(WIDTH / 2 + 30.0, HEIGHT / 2))
+    off = coverage_scale(shifted, WIDTH, HEIGHT, origin=(WIDTH / 2 + 30.0, HEIGHT / 2))
     assert off < centred
 
 
-def test_crop_around_the_target_needs_a_target(clip):
-    """With no target to pin, "centre on the target" falls back to the frame."""
+def test_a_placement_off_the_centre_costs_crop():
+    """Composing on a thirds line is not free — the rectangle grows one-sided."""
+    shifted = [SimilarityTransform(tx=10.0), SimilarityTransform(tx=-10.0)]
+    centred = coverage_scale(shifted, WIDTH, HEIGHT)
+    thirds = coverage_scale(shifted, WIDTH, HEIGHT, placement=(1 / 3, 0.5))
+    assert thirds < centred
+
+
+def test_the_crop_can_be_measured_over_a_sub_range_only():
+    """Todo 1, eighth round: frames that are not being written get no vote on the crop.
+
+    The whole clip's answer is limited by the worst frame in it. An export that
+    writes only the calm half should be croppable as if the violent half were
+    not there — because, as far as the file is concerned, it is not.
+    """
+    calm = [SimilarityTransform(tx=2.0), SimilarityTransform(tx=-2.0)]
+    violent = [SimilarityTransform(tx=40.0), SimilarityTransform(tx=-40.0)]
+    whole = plan_output(calm + violent, WIDTH, HEIGHT, "auto_zoom")
+    windowed = plan_output(calm + violent, WIDTH, HEIGHT, "auto_zoom", coverage_range=(0, 2))
+    assert windowed.coverage > whole.coverage
+    assert windowed.measured_frames == 2
+    assert whole.measured_frames == 4
+
+
+def test_an_empty_or_disjoint_crop_range_is_refused():
+    still = [SimilarityTransform.identity(), SimilarityTransform.identity()]
+    with pytest.raises(RenderError, match="non-empty"):
+        plan_output(still, WIDTH, HEIGHT, "crop", coverage_range=(3, 3))
+    with pytest.raises(RenderError, match="does not overlap"):
+        plan_output(still, WIDTH, HEIGHT, "crop", coverage_range=(9, 12))
+
+
+def test_the_crop_is_pinned_to_the_marks_centroid(clip):
+    """The output rectangle is grown around where the marks put the picture.
+
+    Under the fit the origin is the marks' own destination, not the feature's
+    position — the fit is what put the feature there. So a mark at the centre
+    leaves the origin at the frame centre, and moving it moves the rectangle
+    with it, which is what makes the placement identity hold at every crop.
+    """
     motion = motion_for(clip, SmoothingSettings.uniform("gaussian", {"sigma": 6.0}))
-    plan = StabilizationPlan.build(
-        motion, source_size=(clip.width, clip.height), crop=CropSpec(centre="target")
+    plain = StabilizationPlan.build(motion, source_size=(clip.width, clip.height))
+    assert plain.geometry.centre == (clip.width / 2.0, clip.height / 2.0)
+
+    path = truth_path(clip, GRID[0])
+    centred = held(motion, clip, [path], [(0.5, 0.5)], crop=CropSpec(scale=0.6))
+    assert centred.geometry.centre == (clip.width / 2.0, clip.height / 2.0)
+
+    off = held(motion, clip, [path], [(0.25, 0.75)], crop=CropSpec(scale=0.6))
+    assert off.geometry.centre == pytest.approx((clip.width * 0.25, clip.height * 0.75))
+    # ...and the mark still lands exactly on its fraction of the output.
+    landed = off.geometry.fit.apply(np.asarray(off.geometry.centre))
+    assert landed == pytest.approx(
+        [0.25 * off.geometry.width, 0.75 * off.geometry.height], abs=1e-9
     )
-    assert plan.geometry.centre == (clip.width / 2.0, clip.height / 2.0)
-
-    pinned = StabilizationPlan.build(
-        motion,
-        source_size=(clip.width, clip.height),
-        target_positions=truth_path(clip, GRID[0]),
-        crop=CropSpec(scale=0.6, centre="target"),
-    )
-    assert pinned.geometry.centre != (clip.width / 2.0, clip.height / 2.0)
-
-
-# -- border fill pixels -------------------------------------------------------------
-
-
-def texture() -> np.ndarray:
-    """A frame whose every pixel is bright, so a fill is unmistakable."""
-    rng = np.random.default_rng(3)
-    return rng.integers(120, 256, (HEIGHT, WIDTH, 3), dtype=np.uint8)
-
-
-def black_fraction(image: np.ndarray) -> float:
-    """Fraction of pixels that are (near) black — i.e. letterbox, not picture."""
-    return float(np.count_nonzero(image.max(axis=2) < 12)) / image[:, :, 0].size
-
-
-@pytest.mark.parametrize("mode", ["stretch", "mirror", "blur"])
-def test_every_non_solid_fill_removes_the_black_edge(mode):
-    shifted = SimilarityTransform(tx=40.0, ty=20.0)
-    letterboxed = warp_frame(texture(), shifted, border="crop")
-    assert black_fraction(letterboxed) > 0.2
-
-    filled = warp_frame(texture(), shifted, border="crop", fill=BorderFill(mode=mode))
-    assert black_fraction(filled) == 0.0
-    # The picture itself is untouched: only the exposed area changed.
-    assert np.array_equal(letterboxed[30:80, 60:180], filled[30:80, 60:180])
-
-
-def test_a_solid_fill_uses_its_colour_and_stays_one_warp():
-    shifted = SimilarityTransform(tx=40.0)
-    filled = warp_frame(
-        texture(), shifted, border="crop", fill=BorderFill(mode="solid", color=(200, 10, 10))
-    )
-    assert tuple(int(v) for v in filled[HEIGHT // 2, 5]) == (200, 10, 10)
-
-
-def test_tint_and_feather_combine_with_any_plate():
-    shifted = SimilarityTransform(tx=40.0)
-    mirrored = warp_frame(texture(), shifted, border="crop", fill=BorderFill(mode="mirror"))
-    tinted = warp_frame(
-        texture(),
-        shifted,
-        border="crop",
-        fill=BorderFill(mode="mirror", color=(0, 0, 0), tint=0.8, feather=4.0),
-    )
-    # 80% toward black is much darker out there, but still not a hard black edge.
-    edge = slice(0, 20)
-    assert tinted[:, edge].mean() < mirrored[:, edge].mean() / 2.0
-    assert black_fraction(tinted) == 0.0
-
-
-def test_a_fill_is_ignored_where_alpha_already_answers_the_question():
-    shifted = SimilarityTransform(tx=40.0)
-    rgba = warp_frame(
-        texture(), shifted, border="transparent", fill=BorderFill(mode="mirror")
-    )
-    assert rgba.shape[2] == 4
-    assert rgba[HEIGHT // 2, 5, 3] == 0
-
-
-def test_the_plan_carries_the_fill_into_every_rendered_frame(clip):
-    from stable.render import iter_stabilized_frames, stabilized_frame  # noqa: PLC0415
-
-    motion = motion_for(clip, SmoothingSettings.uniform("gaussian", {"sigma": 6.0}))
-
-    def plan_with(fill: BorderFill | None) -> StabilizationPlan:
-        return StabilizationPlan.build(
-            motion,
-            source_size=(clip.width, clip.height),
-            border="crop",
-            crop=CropSpec(scale=1.0),
-            fill=fill,
-        )
-
-    filled, letterboxed = plan_with(BorderFill(mode="mirror")), plan_with(None)
-    assert filled.geometry.gaps
-    assert filled.to_dict()["fill"]["mode"] == "mirror"
-
-    # This clip's own texture is dark, so "no black at all" is the wrong test:
-    # what matters is that the letterbox the fill was asked to remove is gone.
-    window = (10, 14)
-    baseline = [
-        black_fraction(f) for f in iter_stabilized_frames(clip, letterboxed, frame_range=window)
-    ]
-    assert min(baseline) > 0.005, baseline
-    for index, frame in enumerate(iter_stabilized_frames(clip, filled, frame_range=window)):
-        assert black_fraction(frame) < baseline[index] / 4.0, (index, baseline[index])
-    assert black_fraction(stabilized_frame(clip, filled, 12)) < min(baseline) / 4.0

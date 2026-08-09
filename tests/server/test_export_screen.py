@@ -127,14 +127,26 @@ def test_the_preview_refuses_before_there_is_anything_to_preview(client, tiny_cl
 
 
 def test_the_preview_reports_a_no_op_rather_than_letting_it_be_exported(client, solved):
-    """The same refusal the export gives, but *before* the operator commits."""
-    project_id, _ids, _source = solved
+    """The same refusal the export gives, but *before* the operator commits.
+
+    Only a project with **no targets** can reach it: with nothing to fit, the
+    render falls back to the smoothing warp, and with no filter enabled that is
+    the identity. Any target at all pins a path to a mark and moves the picture.
+    """
+    project_id, ids, _source = solved
     client.put(f"/api/projects/{project_id}/smoothing", json={"filters": []})
+    client.put(
+        f"/api/projects/{project_id}/render/options", json={"target": {"points": []}}
+    )
 
     body = client.get(f"/api/projects/{project_id}/export/preview").json()
     assert body["is_no_op"] is True
     assert body["no_op_detail"]
     assert client.post(f"/api/projects/{project_id}/export/video", json={}).status_code == 400
+
+    # ...and adding a target is one of the two ways out the message offers.
+    client.post(f"/api/projects/{project_id}/render/targets", json={"point_ids": [ids[0]]})
+    assert client.get(f"/api/projects/{project_id}/export/preview").json()["is_no_op"] is False
 
 
 # -- target mapping ------------------------------------------------------------
@@ -146,18 +158,16 @@ def test_a_mapping_is_stored_and_reported_with_its_residuals(client, solved):
         f"/api/projects/{project_id}/render/options",
         json={
             "target": {
-                "mode": "map",
-                "pairs": [
-                    {"point_id": ids[0], "x": 40.0, "y": 30.0},
-                    {"point_id": ids[1], "x": 46.0, "y": 26.0},
-                ],
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}},
+                    {"id": "t2", "point_ids": [ids[1]], "place": {"u": 0.7, "v": 0.6}},
+                ]
             }
         },
     )
     assert response.status_code == 200, response.text
     stored = response.json()["options"]["target"]
-    assert stored["mode"] == "map"
-    assert [p["point_id"] for p in stored["pairs"]] == ids
+    assert [p["point_ids"][0] for p in stored["points"]] == ids
 
     preview = client.get(f"/api/projects/{project_id}/export/preview?frame=10").json()
     assert preview["uses_rotation_and_scale"] is True
@@ -173,7 +183,13 @@ def test_one_pair_is_a_translation_and_says_so(client, solved):
     project_id, ids, _source = solved
     client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": [{"point_id": ids[0], "x": 40.0, "y": 30.0}]}},
+        json={
+            "target": {
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}}
+                ]
+            }
+        },
     )
     preview = client.get(f"/api/projects/{project_id}/export/preview").json()
     assert preview["uses_rotation_and_scale"] is False
@@ -190,7 +206,13 @@ def test_a_mapping_to_an_untracked_point_is_refused_at_the_point_of_setting_it(c
 
     response = client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": [{"point_id": untracked, "x": 10.0, "y": 10.0}]}},
+        json={
+            "target": {
+                "points": [
+                    {"id": "t1", "point_ids": [untracked], "place": {"u": 0.1, "v": 0.1}}
+                ]
+            }
+        },
     )
     assert response.status_code == 400
     assert untracked in response.json()["detail"]
@@ -205,29 +227,30 @@ def test_changing_the_crop_does_not_unset_the_placed_targets(client, solved):
     """
     project_id, ids, _source = solved
     pairs = [
-        {"point_id": ids[0], "x": 40.0, "y": 30.0},
-        {"point_id": ids[1], "x": 46.0, "y": 26.0},
+        {"id": "t1", "place": {"u": 0.25, "v": 0.35}, "point_ids": [ids[0]], "source": "raw",
+         "weight": 1.0},
+        {"id": "t2", "place": {"u": 0.7, "v": 0.6}, "point_ids": [ids[1]], "source": "raw",
+         "weight": 1.0},
     ]
     client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": pairs}},
+        json={"target": {"points": pairs}},
     )
 
     patches = (
         {"crop": {"scale": 0.9}},
         {"crop": {"scale": 0.5}},
-        {"crop": {"centre": "target"}},
+        {"crop": {"limit_to_range": True}},
     )
     for patch in patches:
         response = client.put(f"/api/projects/{project_id}/render/options", json=patch)
         assert response.status_code == 200, response.text
         target = response.json()["options"]["target"]
-        assert target["mode"] == "map"
-        assert target["pairs"] == pairs
+        assert target["points"] == pairs
 
         preview = client.get(f"/api/projects/{project_id}/export/preview")
         assert preview.status_code == 200, preview.text
-        assert preview.json()["target"]["pairs"] == pairs
+        assert preview.json()["target"]["points"] == pairs
         # ...and it is still a real stabilisation, so no "this render would not
         # move the picture at all" warning appears alongside the vanished targets.
         assert preview.json()["is_no_op"] is False
@@ -240,7 +263,13 @@ def test_overlapping_option_updates_do_not_clobber_each_other(client, solved):
     project_id, ids, _source = solved
     client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": [{"point_id": ids[0], "x": 40.0, "y": 30.0}]}},
+        json={
+            "target": {
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}}
+                ]
+            }
+        },
     )
 
     barrier = threading.Barrier(2)
@@ -261,7 +290,7 @@ def test_overlapping_option_updates_do_not_clobber_each_other(client, solved):
     options = client.get(f"/api/projects/{project_id}/render/options").json()["options"]
     assert options["crop"]["scale"] == 0.75
     assert options["fill"]["mode"] == "blur"
-    assert len(options["target"]["pairs"]) == 1
+    assert len(options["target"]["points"]) == 1
 
 
 def test_a_mapping_makes_the_export_worth_running(client, solved):
@@ -272,11 +301,10 @@ def test_a_mapping_makes_the_export_worth_running(client, solved):
         f"/api/projects/{project_id}/render/options",
         json={
             "target": {
-                "mode": "map",
-                "pairs": [
-                    {"point_id": ids[0], "x": 40.0, "y": 30.0},
-                    {"point_id": ids[1], "x": 46.0, "y": 26.0},
-                ],
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}},
+                    {"id": "t2", "point_ids": [ids[1]], "place": {"u": 0.7, "v": 0.6}},
+                ]
             }
         },
     )
@@ -415,7 +443,13 @@ def test_the_preview_sends_the_warp_targets_are_measured_against(client, solved)
     project_id, ids, _source = solved
     client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": [{"point_id": ids[0], "x": 40.0, "y": 30.0}]}},
+        json={
+            "target": {
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}}
+                ]
+            }
+        },
     )
     body = client.get(f"/api/projects/{project_id}/export/preview?frame=8").json()
 
@@ -456,7 +490,13 @@ def test_a_target_placed_on_the_output_round_trips_to_the_same_destination(clien
     project_id, ids, _source = solved
     client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": [{"point_id": ids[0], "x": 40.0, "y": 30.0}]}},
+        json={
+            "target": {
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}}
+                ]
+            }
+        },
     )
     body = client.get(f"/api/projects/{project_id}/export/preview?frame=8").json()
 
@@ -483,7 +523,13 @@ def test_a_targets_wanted_and_landed_positions_are_in_the_same_space(client, sol
     project_id, ids, _source = solved
     client.put(
         f"/api/projects/{project_id}/render/options",
-        json={"target": {"mode": "map", "pairs": [{"point_id": ids[0], "x": 40.0, "y": 30.0}]}},
+        json={
+            "target": {
+                "points": [
+                    {"id": "t1", "point_ids": [ids[0]], "place": {"u": 0.25, "v": 0.35}}
+                ]
+            }
+        },
     )
     row = client.get(f"/api/projects/{project_id}/export/preview?frame=6").json()["targets"][0]
 

@@ -40,9 +40,9 @@ import type {
  * `add-point`
  *     The next click starts a new track there.
  * `add-anchor`
- *     The next click pins the selected track at that position on this frame.
+ *     The next click anchors the selected track at that position on this frame.
  * `delete`
- *     Click an anchor pin to remove it, or a track's marker to remove the whole
+ *     Click an anchor to remove it, or a track's marker to remove the whole
  *     track (confirmed, since that one is not an undoable correction).
  * `pan`
  *     Left-drag pans the view. Middle-drag does this in every tool; the tool
@@ -66,7 +66,7 @@ export interface Overlays {
   smoothed: boolean;
   /** Where the point is on this frame — independent of the trail. */
   markers: boolean;
-  /** Anchor keyframe pins. */
+  /** The anchor markers: where the operator has stated the point's position. */
   anchors: boolean;
   /** The before/after ghost a correction leaves. */
   ghost: boolean;
@@ -110,8 +110,8 @@ export type DragMode = "offset" | "replace";
  * The paths were always confidence-coloured, which is a genuinely useful signal
  * — green means trust it, red means go and look — but it means every track on
  * the frame is drawn from the same ramp and none of them can be told apart.
- * Each point already *has* a colour (`pointColor`, used for its anchor pins,
- * its timeline pins and its panel swatch); this is the switch that lets the
+ * Each point already *has* a colour (`pointColor`, used for its anchors on the
+ * frame and the timeline, and its panel swatch); this is the switch that lets the
  * path use it. The timeline's heat strip stays confidence-coloured either way,
  * so the signal is never entirely given up.
  */
@@ -189,16 +189,42 @@ interface ProjectContextValue {
   tool: Tool;
   setTool: (tool: Tool) => void;
   /**
-   * Pin a point where it already is on the current frame (the `A` shortcut and
-   * the panel's "+ anchor" both go through this).
+   * Anchor a point where it already is on the current frame (the `A` shortcut
+   * and the panel's "+ anchor" both go through this).
    *
    * Returns false when the point has no position on this frame — an untracked
    * point, or a gap — which is the caller's cue to arm click-to-place instead:
-   * there is nowhere to pin it *to* without being told where.
+   * there is nowhere to anchor it *to* without being told where.
    */
   addAnchorHere: (pointId?: string | null) => Promise<boolean>;
   /** Add an anchor at an explicit position, e.g. from a click on the frame. */
   addAnchorAt: (pointId: string, frame: number, x: number, y: number) => Promise<void>;
+  /**
+   * Remove the anchor on a frame, and whatever was tracked from it.
+   *
+   * Lives here rather than in a panel because there are two panels behind a
+   * flag (`flags.ts`) and a rule this load-bearing — "deleting an anchor is one
+   * request, then re-read the track it lived on" — must not have two
+   * implementations that can drift.
+   *
+   * Returns the server's message on refusal (the last anchor, a frame with no
+   * anchor on it), or null on success, leaving each panel to decide where to
+   * put it.
+   */
+  deleteAnchorAt: (pointId: string, frame: number) => Promise<string | null>;
+  /**
+   * Track one direction from one frame, bounded.
+   *
+   * `x`/`y` are deliberately not passed: the run starts from wherever the point
+   * already is on that frame, which is the anchor there when it has one. Same
+   * return contract as `deleteAnchorAt`.
+   */
+  runFrom: (
+    pointId: string,
+    frame: number,
+    direction: "fwd" | "bwd",
+    bounds?: api.RunBounds,
+  ) => Promise<string | null>;
 
   stabilizedPreview: boolean;
   setStabilizedPreview: (on: boolean) => void;
@@ -263,7 +289,7 @@ interface ProjectContextValue {
   // safe. What remains is *what a move means*.
   dragMode: DragMode;
   setDragMode: (mode: DragMode) => void;
-  /** Frames an offset correction blends out over, either side of its keyframe. */
+  /** Frames an offset correction blends out over, either side of the frame dragged. */
   falloff: number;
   setFalloff: (frames: number) => void;
 
@@ -599,11 +625,12 @@ export function ProjectProvider({
 
   // -- anchors ----------------------------------------------------------------
   //
-  // Adding an anchor goes through `settle`, not a bare `refresh`. The pins live
-  // on the point, but the *keyframe list* the panel and the timeline draw is
-  // the server's `ground_truth` (pins plus promoted corrections) and comes with
-  // the track — so refreshing only the project left a just-placed anchor
-  // invisible in the list until the next track run replaced the cached track.
+  // Adding an anchor goes through `settle`, not a bare `refresh`. A point's own
+  // anchors live on the point, but the *list* the card and the timeline draw is
+  // the server's `anchors` (the point's own plus the ones its corrections were
+  // promoted to) and comes with the track — so refreshing only the project left
+  // a just-placed anchor invisible in the list until the next run replaced the
+  // cached track.
   const addAnchorAt = useCallback(
     async (pointId: string, frame: number, x: number, y: number) => {
       setEditError(null);
@@ -617,6 +644,40 @@ export function ProjectProvider({
     [projectId, settle],
   );
 
+  const deleteAnchorAt = useCallback(
+    async (pointId: string, frame: number) => {
+      try {
+        await api.deleteAnchor(projectId, pointId, frame);
+        // Through `settle`, not a bare refresh: the anchor list *and* the spans
+        // a run from that anchor produced both come with the track, which is
+        // cached separately from the project.
+        await settle(pointId);
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    },
+    [projectId, settle],
+  );
+
+  const runFrom = useCallback(
+    async (
+      pointId: string,
+      frame: number,
+      direction: "fwd" | "bwd",
+      bounds: api.RunBounds = {},
+    ) => {
+      try {
+        await api.retrackPoint(projectId, pointId, { frame, direction, ...bounds });
+        invalidateTrack(pointId);
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    },
+    [projectId, invalidateTrack],
+  );
+
   const addAnchorHere = useCallback(
     async (pointId?: string | null) => {
       const id = pointId ?? selectedPointId;
@@ -628,12 +689,12 @@ export function ProjectProvider({
         await addAnchorAt(id, currentFrame, x, y);
         return true;
       }
-      // No tracked position here: an existing pin on this frame is already the
+      // No tracked position here: an anchor already on this frame is the
       // answer, so report success rather than arming a pointless click.
-      const pinned = project.points
+      const anchored = project.points
         .find((p) => p.id === id)
         ?.queries.some((q) => q.frame === currentFrame);
-      return Boolean(pinned);
+      return Boolean(anchored);
     },
     [project, tracks, currentFrame, selectedPointId, addAnchorAt],
   );
@@ -658,12 +719,11 @@ export function ProjectProvider({
   }, [undo, redo]);
 
   // Frame navigation (todo 9): left/right steps a frame, space plays/pauses,
-  // up/down jumps to the selected point's next/previous keyframe (its pins
-  // plus whatever manual corrections have been promoted to ground truth --
-  // W1's `ground_truth`, read the same locally-typed way Timeline.tsx and
-  // PointsPanel.tsx do, since it is not part of the shared `TrackData` type),
-  // home/end jump to the first/last frame. Ignored while typing in a field,
-  // same guard as undo/redo above.
+  // up/down jumps to the selected point's next/previous anchor (its own plus
+  // whatever its manual corrections have been promoted to -- the track's
+  // `anchors`, which is the one list everything reads), home/end jump to the
+  // first/last frame. Ignored while typing in a field, same guard as undo/redo
+  // above.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (!project || event.ctrlKey || event.metaKey || event.altKey) return;
@@ -702,9 +762,9 @@ export function ProjectProvider({
         if (event.shiftKey) goToMarker("out");
         else void setRangeMarker("out", currentFrame + 1);
       } else if (event.key === "a" || event.key === "A") {
-        // Pin the selected point on this frame. Where it already has a
+        // Anchor the selected point on this frame. Where it already has a
         // position that needs no aiming, so plain `A` just does it; with
-        // Shift (or with nothing to pin, e.g. an untracked point) it arms
+        // Shift (or with nothing to anchor, e.g. an untracked point) it arms
         // click-to-place instead, which is the same two-step the panel button
         // uses. Pressing it again disarms, so the key is never a trap.
         if (!selectedPointId) return;
@@ -721,7 +781,7 @@ export function ProjectProvider({
           if (!done) setTool("add-anchor");
         });
       } else if (event.key === "v" || event.key === "V") {
-        // The tool palette's shortcuts (todo 4). `A` is above, because pinning
+        // The tool palette's shortcuts (todo 4). `A` is above, because anchoring
         // where the point already is does not need the tool at all.
         event.preventDefault();
         setTool("move");
@@ -740,9 +800,10 @@ export function ProjectProvider({
       } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         if (!selectedPointId) return;
         const point = project.points.find((p) => p.id === selectedPointId);
-        const promoted = (tracks[selectedPointId] as (TrackData & { ground_truth?: { frame: number }[] }) | undefined)
-          ?.ground_truth;
-        const frames = (promoted ? promoted.map((q) => q.frame) : point?.queries.map((q) => q.frame)) ?? [];
+        // The track's list when it is loaded (it includes the anchors the
+        // corrections were promoted to), the point's own otherwise.
+        const anchors = tracks[selectedPointId]?.anchors;
+        const frames = (anchors ?? point?.queries)?.map((q) => q.frame) ?? [];
         const marks = [...new Set(frames)].sort((a, b) => a - b);
         if (marks.length === 0) return;
         event.preventDefault();
@@ -853,6 +914,8 @@ export function ProjectProvider({
       setTool,
       addAnchorHere,
       addAnchorAt,
+      deleteAnchorAt,
+      runFrom,
       stabilizedPreview,
       setStabilizedPreview,
       overlays,
@@ -908,6 +971,8 @@ export function ProjectProvider({
     tool,
     addAnchorHere,
     addAnchorAt,
+    deleteAnchorAt,
+    runFrom,
     stabilizedPreview,
     overlays,
     overlaysEnabled,

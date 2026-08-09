@@ -31,7 +31,7 @@ function describe(correction: Correction): string {
  * This is what is left of the Edit tab (todo 4, sixth round). That tab held four
  * things and three of them were duplicates by the time it was removed: undo/redo
  * is in the workspace header, "retrack from here" is the bounded run on this
- * same card — which can stop at the next keyframe rather than always ploughing
+ * same card — which can stop at the next anchor rather than always ploughing
  * to the end of the clip — and moving or deleting a point is something the
  * canvas has done directly since the tools landed. The genuinely global setting
  * it carried, what a drag *means*, moved to the viewer's toolbar where the drag
@@ -39,7 +39,7 @@ function describe(correction: Correction): string {
  *
  * What was not a duplicate is here, and it is here rather than on a tab of its
  * own because all of it is per point: a correction belongs to a track, and
- * reading a list of them next to the track's keyframes and its patches is the
+ * reading a list of them next to the track's anchors and its patches is the
  * whole reason the card exists.
  *
  * Nothing here rewrites a track — every button appends, toggles or removes one

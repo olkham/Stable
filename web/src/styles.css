@@ -428,11 +428,40 @@ button:disabled {
 
 .panel__header h3 {
   margin: 0;
+  margin-right: auto;
+}
+
+/* A second header line for settings that govern the whole panel rather than
+   any one row in it — the run reach, and the panel switch. */
+.panel__subhead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+}
+
+.panel__subhead input[type="number"] {
+  width: 4rem;
 }
 
 .panel__empty {
   color: var(--text-dim);
   font-size: 0.85rem;
+}
+
+/* Switching between the two Tracks panels while the redesign is judged
+   (web/src/flags.ts). Quiet on purpose: it is scaffolding, not a feature, and
+   it goes away with the losing variant. */
+.panel-switch {
+  background: none;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  padding: 2px 6px;
+}
+
+.panel-switch:hover {
+  color: var(--text);
 }
 
 .field-row {
@@ -462,6 +491,199 @@ button:disabled {
   align-items: center;
   gap: 4px;
   font-size: 0.8rem;
+}
+
+/* ---- tracks panel, timeline variant (design B, behind flags.ts) ----------
+   A track is drawn on the clip's own time axis, so the row is: what state it
+   is in, the strip, and — for the selected track only — one inspector acting on
+   whichever anchor (or the playhead) was last picked. Everything set once per
+   track hides behind the row's ⋯. Two lines at rest, which is what gets four
+   or five tracks onto one screen. */
+
+.track-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.track-row {
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-left: 3px solid transparent;
+  border-radius: 5px;
+  padding: 6px 8px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* The left edge carries the track's own colour when it is selected — the same
+   colour as its path and its anchors on the frame, so the link needs no label. */
+.track-row--selected {
+  background: #212630;
+  border-color: var(--border);
+}
+
+.track-row__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.track-row__swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  flex: none;
+}
+
+.track-row__id {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+}
+
+.track-row__conf {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.track-row__more {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.track-strip {
+  display: block;
+  width: 100%;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.track-row__legend {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.66rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One inspector, for whatever the strip last had picked. The controls never
+   move; only their subject does — which is the whole design. */
+.track-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border);
+}
+
+.track-inspector__row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.track-inspector__row button {
+  font-size: 0.72rem;
+  padding: 2px 7px;
+}
+
+.track-inspector__subject {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  margin-right: auto;
+}
+
+.track-inspector__delete {
+  color: var(--danger);
+}
+
+.track-inspector__flags {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.72rem;
+}
+
+.track-inspector__flags li {
+  color: #ff3b30;
+  cursor: pointer;
+}
+
+/* The one thing worth saying about a track at a glance. Tone carries it as well
+   as the words, so a healthy list reads as "all quiet" without being read. */
+.track-pill {
+  font-size: 0.66rem;
+  letter-spacing: 0.03em;
+  border-radius: 3px;
+  padding: 1px 5px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+
+.track-pill--ok {
+  color: #5fbf88;
+  border-color: #2f5f45;
+  background: #17231c;
+}
+
+.track-pill--warn {
+  color: #e0b13a;
+  border-color: #5c4a18;
+  background: #241f13;
+}
+
+.track-pill--crit {
+  color: #ff7b72;
+  border-color: #5f2f2c;
+  background: #241717;
+}
+
+.track-pill--idle {
+  color: var(--text-dim);
+  border-color: var(--border);
+  background: var(--bg);
+}
+
+.track-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+.track-setup__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 0.75rem;
+}
+
+.track-setup__delete {
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  color: var(--danger);
+}
+
+/* The uppercase micro-label the panel uses for the word a row is about. */
+.lbl {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-dim);
 }
 
 /* ---- points panel ---- */
@@ -562,6 +784,26 @@ button:disabled {
   gap: 3px;
 }
 
+/* The anchor on the frame being looked at, so "where am I" needs no counting. */
+.anchor-chip--here {
+  border-color: var(--accent);
+}
+
+/* Track forwards / backwards from *this* anchor — the gesture the whole anchor
+   model is for, so it lives on the anchor rather than in a panel elsewhere. */
+.anchor-chip__run {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  padding: 0 1px;
+  font-size: 0.66rem;
+  line-height: 1;
+}
+
+.anchor-chip__run:hover:not(:disabled) {
+  color: var(--text);
+}
+
 .anchor-chip__delete {
   border: none;
   background: none;
@@ -571,9 +813,22 @@ button:disabled {
   line-height: 1;
 }
 
+.anchor-chip__delete:disabled,
+.anchor-chip__run:disabled {
+  opacity: 0.35;
+}
+
 .anchor-add {
   font-size: 0.72rem;
   padding: 1px 6px;
+}
+
+/* The word the row is about, since the row is now the only place it appears. */
+.points-list__label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
 }
 
 .points-list__stats {
@@ -1084,7 +1339,7 @@ button:disabled {
 
 /* The all-points strip cuts its thumbnails out of the frame already decoded on
    the canvas rather than fetching one per point per frame, so those are
-   canvases; the per-point keyframe grid still fetches images at fixed frames. */
+   canvases; the per-point anchor grid still fetches images at fixed frames. */
 .patch-thumb img,
 .patch-thumb canvas {
   display: block;
@@ -1136,19 +1391,11 @@ button:disabled {
   margin: 0;
 }
 
-/* A keyframe patch is what the operator stated; a tracked one is what the
+/* An anchor's patch is what the operator stated; a tracked one is what the
    tracker decided. Different things, so they do not look the same. */
-.patch-thumb--keyframe img {
+.patch-thumb--anchor img {
   outline: 1px solid rgba(255, 209, 102, 0.75);
   outline-offset: -1px;
-}
-
-/* Keyframes with no patch to show (todo 5, sixth round): a tracker that matches
-   whole frames has no region to draw, so the pins are listed as what they are. */
-.patch-panel__keyframes {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
 }
 
 .patch-strip {
@@ -1228,6 +1475,117 @@ button:disabled {
   flex: 1;
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
+}
+
+/* The export's target points: one row per mark, expanding into its editor when
+   selected. The row and the crosshair on the canvas are the same object, so
+   selecting either highlights both. */
+.target-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px;
+  display: grid;
+  gap: 4px;
+}
+
+.target-list__item {
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+
+.target-list__item.is-selected {
+  border-color: var(--accent, #4da3ff);
+}
+
+.target-list__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.target-list__id {
+  min-width: 1.6rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.target-list__where {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.target-list__holds {
+  color: var(--text-dim);
+  font-size: 0.85em;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.target-list__remove {
+  padding: 0 6px;
+  line-height: 1.4;
+}
+
+.target-list__editor {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border, #333);
+  cursor: default;
+}
+
+.target-list__tracks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  align-items: center;
+}
+
+.panel__header--inline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.export-screen__count {
+  color: var(--text-dim);
+  font-size: 0.85em;
+}
+
+/* Setting the export's own range from the playhead, the way In/Out is set on a
+   timeline: scrub to the frame, press the button. */
+.export-screen__markers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 8px;
+}
+
+.export-screen__markers button {
+  font-size: 0.85em;
+  padding: 2px 8px;
+}
+
+/* The named places a target can be dropped on: the centre and the four thirds
+   intersections. The same positions a drag snaps to, reachable without one. */
+.export-screen__spots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 8px;
+}
+
+.export-screen__spots button {
+  font-size: 0.85em;
+  padding: 2px 7px;
+}
+
+.export-screen__spots button.is-active {
+  border-color: var(--accent, #4da3ff);
+  color: var(--accent, #4da3ff);
 }
 
 .export-screen__renders li a {
@@ -1448,7 +1806,7 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-/* -- deleting a keyframe from its image (todo 9, fourth round) -------------- */
+/* -- deleting an anchor from its image (todo 9, fourth round) --------------- */
 
 .patch-thumb {
   position: relative;

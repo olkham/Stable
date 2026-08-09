@@ -31,10 +31,18 @@ from pydantic import BaseModel
 from ...core.errors import StableError
 from ...core.project import Project, SmoothingSpec
 from ...render.fill import FILL_MODES
-from ...render.options import CROP_CENTRES, TARGET_MODES, RenderOptions
+from ...render.options import (
+    TARGET_SOURCES,
+    Placement,
+    RenderOptions,
+    StabilizationTarget,
+    TargetPoint,
+)
 from .. import motion as motion_glue
+from ..clip_range import effective_range
 from ..frames import (
     FrameUnavailable,
+    export_range,
     load_options,
     load_smoothed,
     load_solve,
@@ -54,6 +62,7 @@ __all__ = [
     "load_smoothed",
     "recompute_smoothed",
     "load_options",
+    "export_range",
     "preview_plan",
 ]
 
@@ -283,31 +292,65 @@ def get_smoothed_tracks(
 # -- stabilisation options (target / crop / fill) -------------------------------
 
 
-class TargetPairIn(BaseModel):
-    """One point-to-destination pair of a ``map`` stabilisation target."""
+class PlacementIn(BaseModel):
+    """Where a mark sits in the delivered frame, as a fraction of it."""
 
-    point_id: str
-    x: float
-    y: float
+    u: float
+    v: float
+
+
+class TargetPointIn(BaseModel):
+    """One mark on the output, and the tracked path held on it."""
+
+    id: str | None = None
+    place: PlacementIn | None = None
+    point_ids: list[str] | None = None
+    source: str | None = None
+    weight: float | None = None
 
 
 class TargetUpdate(BaseModel):
-    """The ``target`` block of ``PUT /api/projects/{id}/render/options``."""
+    """The ``target`` block of ``PUT /api/projects/{id}/render/options``.
 
-    mode: str | None = None
-    point_id: str | None = None
-    anchor_frame: int | None = None
-    # Sent whole rather than merged key-by-key: a pair list is a set of
-    # positions the operator has arranged on the canvas, and merging halves of
-    # two arrangements would produce one nobody asked for.
-    pairs: list[TargetPairIn] | None = None
+    The mark list is sent whole rather than merged mark-by-mark: it is one
+    arrangement the operator made on the canvas, and merging halves of two
+    arrangements would produce a third nobody asked for. The single-mark
+    endpoints below are the convenient way to add, move and delete one.
+    """
+
+    points: list[TargetPointIn] | None = None
 
 
 class CropUpdate(BaseModel):
     """The ``crop`` block of ``PUT /api/projects/{id}/render/options``."""
 
     scale: float | None = None
-    centre: str | None = None
+    limit_to_range: bool | None = None
+
+
+class ResolutionUpdate(BaseModel):
+    """The ``resolution`` block of ``PUT /api/projects/{id}/render/options``.
+
+    Either side may be ``null`` on purpose — that side follows the crop — so
+    like the export range this is one of the few places a sent ``null`` means
+    something other than "leave it alone".
+    """
+
+    width: int | None = None
+    height: int | None = None
+
+
+class ExportRangeUpdate(BaseModel):
+    """The ``export_range`` block of ``PUT /api/projects/{id}/render/options``.
+
+    Either end may be ``null`` on purpose — that end follows the clip's In/Out
+    marker — so this is one of the few places a sent ``null`` means something
+    other than "leave it alone". ``exclude_unset`` on the merge below is what
+    keeps the two apart.
+    """
+
+    start: int | None = None
+    end: int | None = None
 
 
 class FillUpdate(BaseModel):
@@ -331,16 +374,32 @@ class RenderOptionsUpdate(BaseModel):
     target: TargetUpdate | None = None
     crop: CropUpdate | None = None
     fill: FillUpdate | None = None
+    export_range: ExportRangeUpdate | None = None
+    resolution: ResolutionUpdate | None = None
 
 
 def _options_payload(workspace: Workspace, project_id: str, project: Project) -> dict[str, Any]:
-    """Return the options plus everything the UI needs to offer valid choices."""
+    """Return the options plus everything the UI needs to offer valid choices.
+
+    ``export_window`` is the frames a render would actually write with these
+    options — the In/Out markers, or the export's own range where it states one.
+    The panel shows it rather than making the operator work out which of the two
+    is in force.
+    """
+    options = load_options(workspace, project_id, project)
+    total = int(project.video.frames or 0)
+    window = export_range(workspace, project_id, options, total) if total else (0, 0)
     return {
-        "options": load_options(workspace, project_id).to_dict(),
-        "target_modes": list(TARGET_MODES),
-        "crop_centres": list(CROP_CENTRES),
+        "options": options.to_dict(),
+        "target_sources": list(TARGET_SOURCES),
         "fill_modes": list(FILL_MODES),
         "points": motion_glue.target_choices(project),
+        "source_size": [int(project.video.w or 0), int(project.video.h or 0)],
+        "clip_frames": total,
+        "clip_range": list(effective_range(workspace.project_dir(project_id), total))
+        if total
+        else [0, 0],
+        "export_window": list(window),
     }
 
 
@@ -369,39 +428,168 @@ than the contention it saves.
 def update_render_options(
     project_id: str, body: RenderOptionsUpdate, workspace: Workspace = Depends(_workspace)
 ) -> dict[str, Any]:
-    """Update the stabilisation target, crop scale and/or border fill.
+    """Update the targets, crop, border fill, export range and/or resolution.
 
     Only the blocks named in the body change: adjusting the crop leaves the
-    placed stabilisation targets exactly as they were, and vice versa.
+    placed target points exactly as they were, and vice versa.
 
     These drive the stabilized preview as well as the export, so the memoised
     render plan is dropped here — the same rule the border policy follows.
 
     Raises:
-        HTTPException: 400 if a mode, colour or number is not a valid choice
+        HTTPException: 400 if a source, colour or number is not a valid choice
             (validated by :mod:`stable.render.options`, not re-implemented here).
     """
     project = workspace.load_project(project_id)
+    return _store_options(workspace, project, project_id, lambda cur: _merge_options(cur, body))
+
+
+def _merge_options(current: dict[str, Any], body: RenderOptionsUpdate) -> dict[str, Any]:
+    """Fold a partial update into the stored options, block by block."""
+    merged = dict(current)
+    for block, update in (
+        ("target", body.target),
+        ("crop", body.crop),
+        ("fill", body.fill),
+        ("export_range", body.export_range),
+        ("resolution", body.resolution),
+    ):
+        if update is None:
+            continue
+        merged[block] = {
+            **merged[block],
+            **{k: v for k, v in update.model_dump(exclude_unset=True).items()},
+        }
+    return merged
+
+
+def _store_options(
+    workspace: Workspace, project: Project, project_id: str, mutate: Any
+) -> dict[str, Any]:
+    """Read, mutate, validate and write the options sidecar, under the lock.
+
+    Every route that changes an option goes through here, so the read-merge-write
+    is serialised in one place rather than once per endpoint — see
+    :data:`_OPTIONS_LOCK` for why that matters.
+    """
     with _OPTIONS_LOCK:
-        current = load_options(workspace, project_id).to_dict()
-        for block, update in (("target", body.target), ("crop", body.crop), ("fill", body.fill)):
-            if update is None:
-                continue
-            current[block] = {
-                **current[block],
-                **{k: v for k, v in update.model_dump(exclude_unset=True).items()},
-            }
+        current = load_options(workspace, project_id, project).to_dict()
         try:
-            options = RenderOptions.from_dict(current)
-            # Fail now, with a message naming the target, rather than inside the
-            # export job twenty seconds later.
-            if motion_glue.resolve_mapped_targets(project, options.target) is None:
-                motion_glue.resolve_target_positions(project, options.target)
+            options = RenderOptions.from_dict(mutate(current))
+            _check_targets(project, options)
         except StableError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         motion_glue.save_render_options(workspace.project_dir(project_id), options)
         motion_glue.clear_plan_cache(project_id)
     return _options_payload(workspace, project_id, project)
+
+
+def _check_targets(project: Project, options: RenderOptions) -> None:
+    """Fail now if a target names a track that cannot supply a path.
+
+    Skipped entirely while the project has no tracked point: a mark over "every
+    track" is unresolvable on a fresh project, and refusing to store a crop
+    scale until something has been tracked would be a wrong answer to a right
+    question. The export checks again before it queues.
+    """
+    if not any(point.raw for point in project.points):
+        return
+    for mark in options.target.points:
+        for point_id in mark.point_ids:
+            motion_glue.named_track(project, point_id)
+
+
+class AddTargetRequest(BaseModel):
+    """Body for ``POST /api/projects/{id}/render/targets``."""
+
+    place: PlacementIn | None = None
+    point_ids: list[str] | None = None
+    source: str | None = None
+
+
+@router.post("/render/targets")
+def add_target(
+    project_id: str, body: AddTargetRequest, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Add one target point, with an id nothing else is using.
+
+    The id is minted here rather than by the client: the list is addressed by id
+    afterwards, so two panels adding a mark at once must not be able to land on
+    the same one and make each other's un-deletable.
+    """
+    project = workspace.load_project(project_id)
+
+    def _add(current: dict[str, Any]) -> dict[str, Any]:
+        target = StabilizationTarget.from_dict(current.get("target"))
+        mark = TargetPoint(
+            id=target.next_id(),
+            place=Placement(**body.place.model_dump()) if body.place else Placement(),
+            point_ids=tuple(body.point_ids or ()),
+            source=body.source or "raw",
+        )
+        points = [*current["target"]["points"], mark.to_dict()]
+        return {**current, "target": {"points": points}}
+
+    return _store_options(workspace, project, project_id, _add)
+
+
+class PatchTargetRequest(BaseModel):
+    """Body for ``PATCH /api/projects/{id}/render/targets/{target_id}``."""
+
+    place: PlacementIn | None = None
+    point_ids: list[str] | None = None
+    source: str | None = None
+    weight: float | None = None
+
+
+@router.patch("/render/targets/{target_id}")
+def patch_target(
+    project_id: str,
+    target_id: str,
+    body: PatchTargetRequest,
+    workspace: Workspace = Depends(_workspace),
+) -> dict[str, Any]:
+    """Move one target point, or change which track it holds.
+
+    Raises:
+        HTTPException: 404 if there is no such mark, 400 if the change is not a
+            valid one.
+    """
+    project = workspace.load_project(project_id)
+    patch = body.model_dump(exclude_unset=True)
+
+    def _patch(current: dict[str, Any]) -> dict[str, Any]:
+        points = list(current["target"]["points"])
+        index = next((i for i, p in enumerate(points) if p.get("id") == target_id), None)
+        if index is None:
+            raise HTTPException(status_code=404, detail=f"no target point {target_id!r}")
+        points[index] = {**points[index], **patch}
+        return {**current, "target": {"points": points}}
+
+    return _store_options(workspace, project, project_id, _patch)
+
+
+@router.delete("/render/targets/{target_id}")
+def delete_target(
+    project_id: str, target_id: str, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Remove one target point.
+
+    Removing the last one is allowed, and means something: with nothing left to
+    fit, the render goes back to undoing what the Smoothing panel removed.
+
+    Raises:
+        HTTPException: 404 if there is no such mark.
+    """
+    project = workspace.load_project(project_id)
+
+    def _delete(current: dict[str, Any]) -> dict[str, Any]:
+        points = [p for p in current["target"]["points"] if p.get("id") != target_id]
+        if len(points) == len(current["target"]["points"]):
+            raise HTTPException(status_code=404, detail=f"no target point {target_id!r}")
+        return {**current, "target": {"points": points}}
+
+    return _store_options(workspace, project, project_id, _delete)
 
 
 @router.get("/frames/{index}/stabilized")

@@ -1,9 +1,15 @@
-"""Point CRUD, anchor pins, the tracking job trigger, and template previews.
+"""Point CRUD, anchors, the tracking job trigger, and template previews.
 
-A "point" is a :class:`~stable.core.project.PointSpec`: a set of anchor
-keyframes plus a tracker choice. Placing more anchors on the timeline (pins) is
-what feeds :mod:`stable.trackers.merge`'s multi-anchor blend — this module is
-the HTTP surface for that, plus submitting the actual tracking job.
+A "point" is a :class:`~stable.core.project.PointSpec`: a set of anchors plus a
+tracker choice. An anchor is one statement of where the feature truly is on one
+frame, and placing more of them across the clip is what feeds
+:mod:`stable.trackers.merge`'s multi-anchor blend — this module is the HTTP
+surface for that, plus submitting the actual tracking job.
+
+*Anchor* is the only word for this, in the API and in the UI. It used to be two
+("anchor" in some places, "keyframe" in others, for one type,
+:class:`stable.core.types.Query`) which is the entire content of todo 6 of the
+seventh round: the operator could not tell whether they were one concept.
 
 Todo 14 adds two routes on top: what patches a point has (``/patches``) and the
 pixels of one of them (``/patches/image``), rendered on demand — see
@@ -26,10 +32,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from ...core.corrections import corrections_anchored_at, ground_truth_anchors
 from ...core.errors import ProjectError, StableError
 from ...core.project import PointSpec, Project
 from ...core.types import Query
 from ...trackers.template import TemplateTracker
+from .. import motion as motion_glue
 from ..jobs import JobManager, get_job_manager
 from ..schemas import (
     AnchorCreate,
@@ -66,6 +74,7 @@ from ..tracking import (
     report_path_for,
     run_point_tracking,
 )
+from .edits import history_for
 
 __all__ = ["router"]
 
@@ -98,7 +107,7 @@ def list_points(
 def create_point(
     project_id: str, body: PointCreate, workspace: Workspace = Depends(_workspace)
 ) -> dict[str, Any]:
-    """Place a new point: its first anchor keyframe.
+    """Place a new point: its first anchor.
 
     Raises:
         HTTPException: 400 if the anchor is invalid (e.g. past the end of the clip).
@@ -117,7 +126,7 @@ def create_point(
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Render its patch now rather than when the panel first asks for it (todo 3,
-    # sixth round): making a keyframe is the moment the pixels it names are
+    # sixth round): making an anchor is the moment the pixels it names are
     # known, and it is not a moment anybody is waiting on a thumbnail.
     warm_patches(workspace, project_id, point_id, [(body.frame, body.x, body.y)])
     return point_summary(project, project.point(point_id))
@@ -197,14 +206,20 @@ def delete_point(
 def add_anchor(
     project_id: str, point_id: str, body: AnchorCreate, workspace: Workspace = Depends(_workspace)
 ) -> dict[str, Any]:
-    """Add an anchor keyframe (a timeline pin) to a point.
+    """Add an anchor to a point: "on this frame, the feature is here".
 
-    Adding an anchor at a frame that already has one replaces it — a pin drag
-    in the UI is expressed as delete-then-add at the new frame, so this only
+    Adding an anchor at a frame that already has one replaces it — dragging an
+    anchor on the frame is expressed as an add at the same frame, so this only
     needs to handle "two anchors, same frame" as a same-position edit.
+
+    Recorded as an undo step, like removing one: an anchor is an input to
+    tracking, and losing one to a stray click should cost a Ctrl+Z rather than
+    the memory of where it was.
     """
+    history = history_for(workspace, project_id)
 
     def _mutate(project: Project) -> None:
+        history.record(project, f"anchor {point_id} @ {body.frame}")
         spec = project.point(point_id)
         spec.queries = [q for q in spec.queries if q.frame != body.frame]
         spec.queries.append(Query(frame=body.frame, x=body.x, y=body.y))
@@ -213,8 +228,10 @@ def add_anchor(
         project = workspace.update_project(project_id, _mutate)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    history.save()
+    motion_glue.clear_plan_cache(project_id)
     # Same as placing a point: the patch is rendered while the operator is still
-    # looking at the frame they pinned, not when they next open the card.
+    # looking at the frame they anchored, not when they next open the card.
     warm_patches(workspace, project_id, point_id, [(body.frame, body.x, body.y)])
     return point_summary(project, project.point(point_id))
 
@@ -223,24 +240,53 @@ def add_anchor(
 def delete_anchor(
     project_id: str, point_id: str, frame: int, workspace: Workspace = Depends(_workspace)
 ) -> dict[str, Any]:
-    """Remove an anchor keyframe.
+    """Remove the anchor on ``frame``, and whatever put it there.
+
+    An anchor is one thing to the operator, but it can be asserted from two
+    places: the point's own ``queries``, and a manual correction that states a
+    position (:func:`stable.core.corrections.ground_truth_anchors`). Deleting
+    only the first left the second standing — the anchor came straight back on
+    the next read, which is why the UI used to disable the delete button on half
+    of them and explain a workaround instead. So this removes both, via
+    :func:`stable.core.corrections.corrections_anchored_at`.
+
+    That is also what makes "delete an anchor and the tracking updates" true: a
+    directional run is stored as a correction rooted on the frame it started
+    from, so deleting that anchor takes the span it tracked with it, and the
+    displayed track is right again with no re-tracking at all. The merged
+    baseline is a different matter — see
+    :func:`stable.server.tracking.anchors_changed`, which is what tells the card
+    to offer a re-track.
+
+    Recorded as an undo step, so a deletion that took a run with it is one
+    Ctrl+Z away from coming back whole.
 
     Raises:
-        HTTPException: 400 if this would leave the point with zero anchors —
-            every point needs at least one truth position to track from.
+        HTTPException: 400 if there is no anchor on that frame, or if this would
+            leave the point with none — every point needs at least one truth
+            position to track from.
     """
+    history = history_for(workspace, project_id)
 
     def _mutate(project: Project) -> None:
+        history.record(project, f"delete anchor {point_id} @ {frame}")
         spec = project.point(point_id)
-        remaining = [q for q in spec.queries if q.frame != frame]
-        if not remaining:
+        doomed = {c.id for c in corrections_anchored_at(spec.corrections, frame)}
+        if not doomed and all(q.frame != frame for q in spec.queries):
+            raise ProjectError(f"point {point_id!r} has no anchor on frame {frame}")
+        queries = [q for q in spec.queries if q.frame != frame]
+        corrections = [c for c in spec.corrections if c.id not in doomed]
+        if not queries and not ground_truth_anchors(corrections):
             raise ProjectError("cannot delete a point's last remaining anchor")
-        spec.queries = remaining
+        spec.queries = queries
+        spec.corrections = corrections
 
     try:
         project = workspace.update_project(project_id, _mutate)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    history.save()
+    motion_glue.clear_plan_cache(project_id)
     return point_summary(project, project.point(point_id))
 
 
@@ -260,7 +306,7 @@ def track_point(
 
     "Every one of its anchors" includes the ones the operator's manual
     corrections promoted (:func:`stable.server.tracking.effective_anchors`), and
-    a run that reaches a keyframe it disagrees with is stopped there rather than
+    a run that reaches an anchor it disagrees with is stopped there rather than
     drifting past it — the job result names the frame and the pixel distance.
     """
     project = workspace.load_project(project_id)
@@ -347,10 +393,12 @@ def get_track(
         "disagreement": (report or {}).get("disagreement", [None] * track.n_frames),
         "contributions": (report or {}).get("contributions", [0] * track.n_frames),
         "anchor_frames": (report or {}).get("anchor_frames", [q.frame for q in anchors]),
-        # Every position the operator has stated, pins plus promoted manual
-        # corrections — what the panel lists and the timeline pins.
-        "ground_truth": [q.to_dict() for q in anchors],
-        # Keyframes a run reached and disagreed with: drawn red on the timeline
+        # Every position the operator has stated — the point's own anchors plus
+        # the ones its manual corrections were promoted to. One list, under one
+        # name (it was `ground_truth`, a fourth word for the same thing), and it
+        # is what the card lists and the timeline marks.
+        "anchors": [q.to_dict() for q in anchors],
+        # Anchors a run reached and disagreed with: drawn red on the timeline
         # and the reason a track needs manual review (todos 13, 15).
         "anchor_violations": violations,
         "flagged_anchors": sorted({int(v["frame"]) for v in violations}),
@@ -397,17 +445,17 @@ def _patch_position(
 ) -> tuple[tuple[float, float], str] | None:
     """Where a point is on ``frame``, and whether that is stated or tracked.
 
-    A keyframe wins over the track: on a frame the operator has pinned, the
+    An anchor wins over the track: on a frame the operator has anchored, the
     patch they want to see is the one at the position they stated, which is also
     what a run would build its template from.
 
     Returns:
-        ``((x, y), kind)`` with ``kind`` in ``{"keyframe", "tracked"}``, or
+        ``((x, y), kind)`` with ``kind`` in ``{"anchor", "tracked"}``, or
         ``None`` if the point has neither there.
     """
     for anchor in effective_anchors(point):
         if anchor.frame == frame:
-            return (anchor.x, anchor.y), "keyframe"
+            return (anchor.x, anchor.y), "anchor"
     track = load_display_track(project, point)
     if track is None or not 0 <= frame < track.n_frames:
         return None
@@ -426,16 +474,16 @@ def get_point_patches(
 
     Args:
         frame: The frame being viewed, added to the list as a ``"tracked"``
-            entry when the point has a position there and it is not already a
-            keyframe. This is what makes the panel show the region being
-            followed *now*, not only where it was pinned.
+            entry when the point has a position there and it is not already an
+            anchor. This is what makes the panel show the region being followed
+            *now*, not only where it was anchored.
 
     Returns:
         The effective window radius and where it came from, every setting this
         point's tracker lets the operator change (``settings``, one control per
         row), the pattern/search summary the canvas draws its boxes from, and
         one entry per patch with ``available`` saying whether it can actually be
-        built — a keyframe too close to the frame edge is reported rather than
+        built — an anchor too close to the frame edge is reported rather than
         404-ing later, so the grid can show *why* a thumbnail is missing.
     """
     project = workspace.load_project(project_id)
@@ -458,7 +506,7 @@ def get_point_patches(
             "available": patch_bounds(position, radius, video.width, video.height) is not None,
         }
 
-    patches = [entry((q.x, q.y), q.frame, "keyframe") for q in effective_anchors(point)]
+    patches = [entry((q.x, q.y), q.frame, "anchor") for q in effective_anchors(point)]
     current: dict[str, Any] | None = None
     if frame is not None:
         found = _patch_position(project, point, frame)
@@ -466,10 +514,10 @@ def get_point_patches(
             current = entry(found[0], frame, found[1])
 
     window_setting = next((s for s in settings if s["role"] == "window"), None)
-    # The grid this describes is about to ask for one image per keyframe, and on
+    # The grid this describes is about to ask for one image per anchor, and on
     # a cold cache each of those is a seek into the clip. Rendering them now, in
     # the background, is what makes the panel appear filled rather than filling
-    # (todo 3, sixth round) — and it covers the keyframes that pre-date the
+    # (todo 3, sixth round) — and it covers the anchors that pre-date the
     # warm-on-create above, plus every server restart, which an eager hook at
     # creation time cannot.
     warm_patches(workspace, project_id, point_id, [(p["frame"], p["x"], p["y"]) for p in patches])
@@ -614,11 +662,11 @@ def clear_patch_cache() -> None:
 # the only thing that ever filled it was the first request for a patch — the slow
 # one. That is what "patches are slow to load, they seem to come from the video
 # file" describes: the panel that judges texture asks for ``source="original"``,
-# which is a random-access seek into the full-resolution clip per keyframe, so
+# which is a random-access seek into the full-resolution clip per anchor, so
 # opening a card with eight of them is eight seeks queued behind the decoder's
 # single lock, on every fresh server.
 #
-# So the patch is rendered when the keyframe is *made* (and, for the anchors that
+# So the patch is rendered when the anchor is *made* (and, for the anchors that
 # pre-date this and for every restart, when the grid that will show them is
 # listed). One worker, because the cost being avoided is contention for the
 # decoder — several warmers would recreate exactly the pile-up they exist to
@@ -676,7 +724,7 @@ def warm_patches(
     point_id: str,
     positions: Iterable[tuple[int, float, float]],
 ) -> None:
-    """Render the given keyframes' patches in the background, if it is worth it.
+    """Render the given anchors' patches in the background, if it is worth it.
 
     Args:
         positions: ``(frame, x, y)`` per patch, in source pixels — resolved by
@@ -755,10 +803,10 @@ def get_point_patch_image(
     source: str = "proxy",
     workspace: Workspace = Depends(_workspace),
 ) -> Response:
-    """Return the patch at one frame as a PNG — a keyframe's, or the tracked one.
+    """Return the patch at one frame as a PNG — an anchor's, or the tracked one.
 
     Args:
-        frame: Any frame the point has a position on, pinned or tracked.
+        frame: Any frame the point has a position on, anchored or tracked.
         radius: Override the effective radius, so the grid can preview a size
             the slider is still being dragged through without saving it first.
         source: ``"proxy"`` (default) reads the pixels from the proxy tier the

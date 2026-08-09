@@ -1,14 +1,16 @@
 import { useState } from "react";
 import * as api from "../api/client";
 import { pointColor } from "../colors";
+import type { TracksPanel as PanelVariant } from "../flags";
 import { useProjectContext } from "../state/ProjectContext";
-import type { Query, TrackData, TrackerInfo } from "../types";
+import type { Query, TrackerInfo } from "../types";
 import { JobProgress } from "./JobProgress";
+import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 import { TrackEdits } from "./TrackEdits";
 import { OVERLAY_LABELS } from "./Viewer";
 
-/** How far a keyframe may be from where a run landed before it is flagged. */
+/** Colour of an anchor no tracking run could reach — the "go and look" mark. */
 const FLAGGED_ANCHOR_COLOR = "#ff3b30";
 
 /**
@@ -25,54 +27,25 @@ function unavailableReason(trackers: TrackerInfo[], name: string): string | null
   return match.unavailable_reason ?? `${name} is not available in this environment`;
 }
 
-/** One keyframe a tracking run reached and disagreed with. */
-interface AnchorViolation {
-  frame: number;
-  anchor: [number, number];
-  tracked: [number, number];
-  distance: number;
-  origin: number;
-  direction: "fwd" | "bwd";
-}
+/** How far a run started from an anchor should reach (todos 12 and 20). */
+type RunLimit = "anchor" | "clip" | "frames";
 
 /**
- * The anchor-integrity fields `GET .../points/{id}/track` adds (W1), kept local
- * to the components that read them rather than on the shared `TrackData`.
+ * What an anchor is, in one sentence, on the row that lists them.
  *
- * `ground_truth` is every position the operator has stated — the point's pins
- * *plus* the keyframes their manual corrections were promoted to — so a drag
- * appears here as the anchor it has become.
+ * The report this round answers is "the user doesn't understand what they are
+ * or how to use them", and the answer is not only to stop calling them two
+ * things — it is to say what they do, where they are.
  */
-interface AnchorIntegrity {
-  ground_truth?: Query[];
-  anchor_violations?: AnchorViolation[];
-  flagged_anchors?: number[];
-}
+const ANCHOR_HELP =
+  "An anchor says where this point really is on one frame. Tracking runs out from " +
+  "the anchors, so ◀ / ▶ track from one, and deleting one removes what was tracked from it.";
 
-type PointTrack = TrackData & AnchorIntegrity;
-
-/** How far a bounded run should reach (todos 12 and 20). */
-type RunLimit = "clip" | "keyframe" | "frames";
-
-/** The bounded-run body `POST .../points/{id}/retrack` accepts (W1). */
-interface BoundedRunBody {
-  frame: number;
-  direction: "fwd" | "bwd";
-  stop_at_keyframe?: boolean;
-  max_frames?: number;
-}
-
-/**
- * Submit a bounded run.
- *
- * The endpoint takes an *optional* position (omitted here: the run starts from
- * wherever the point already is) plus the two bounds. `web/src/api/client.ts`
- * still describes the older, position-required body and belongs to another
- * workstream, so the shape is asserted here rather than by widening that file.
- */
-function submitBoundedRun(projectId: string, pointId: string, body: BoundedRunBody) {
-  type ClientBody = Parameters<typeof api.retrackPoint>[2];
-  return api.retrackPoint(projectId, pointId, body as unknown as ClientBody);
+/** How far a run will go, for the tooltips on the buttons that start one. */
+function runLabel(limit: RunLimit, frames: number): string {
+  if (limit === "anchor") return "as far as the next anchor";
+  if (limit === "frames") return `${frames} frames`;
+  return "to the end of the clip";
 }
 
 /**
@@ -80,18 +53,28 @@ function submitBoundedRun(projectId: string, pointId: string, body: BoundedRunBo
  *
  * This was a list of *points*, which is how the data model thinks but not how
  * the work does. The unit an operator handles is a track — its tracker, its
- * keyframes, its patches, its runs, and (todo 9) which of its overlays are on
- * the canvas. Putting the visibility toggles on the card is the whole point of
- * the change: with several tracks up, "hide the dotted trails" almost always
- * means *that* track's trails, and the global checkboxes above the canvas could
- * only ever mean all of them.
+ * anchors, its patches, its runs, and (todo 9) which of its overlays are on the
+ * canvas. Putting the visibility toggles on the card is the whole point of the
+ * change: with several tracks up, "hide the dotted trails" almost always means
+ * *that* track's trails, and the global checkboxes above the canvas could only
+ * ever mean all of them.
  *
- * Keyframes are ground truth. A pin the tracker could not reconcile with what it
- * saw is listed in red here and on the timeline rather than being quietly
- * averaged away, and a run started from one is bounded — to the next keyframe,
- * or to a number of frames — instead of always ploughing to the end of the clip.
+ * **Anchors are the whole model** (todo 6, seventh round). An anchor is one
+ * statement of where the feature is on one frame; every anchor is listed here
+ * once, tracks forwards or backwards from itself, and can be deleted — taking
+ * whatever it anchored with it. An anchor the tracker could not reconcile with
+ * what it saw is listed in red here and on the timeline rather than being
+ * quietly averaged away, and a run started from one is bounded — to the next
+ * anchor, or to a number of frames — instead of always ploughing to the end of
+ * the clip.
  */
-export function TracksPanel() {
+export function TracksPanel({
+  variant,
+  onVariantChange,
+}: {
+  variant: PanelVariant;
+  onVariantChange: (next: PanelVariant) => void;
+}) {
   const {
     project,
     trackers,
@@ -103,7 +86,8 @@ export function TracksPanel() {
     tool,
     setTool,
     addAnchorHere,
-    afterEdit,
+    deleteAnchorAt,
+    runFrom,
     latestJobFor,
     tracks,
     invalidateTrack,
@@ -113,7 +97,7 @@ export function TracksPanel() {
     trackOverrides,
   } = useProjectContext();
 
-  const [runLimit, setRunLimit] = useState<RunLimit>("keyframe");
+  const [runLimit, setRunLimit] = useState<RunLimit>("anchor");
   const [runFrames, setRunFrames] = useState(10);
   const [runError, setRunError] = useState<string | null>(null);
   // Which cards the operator has explicitly opened or closed (todo 5, fourth
@@ -145,40 +129,35 @@ export function TracksPanel() {
     await refresh();
   }
 
+  // Deleting an anchor and starting a run both go through the context, because
+  // the timeline panel behind the flag does the same two things and a rule this
+  // load-bearing must not have two implementations that can drift apart.
   async function handleDeleteAnchor(pointId: string, frame: number) {
-    try {
-      await api.deleteAnchor(project.id, pointId, frame);
-      // The track carries the keyframe list, so it has to be re-read too — a
-      // project refresh alone would leave the deleted pin listed as if it had
-      // been promoted from a correction.
-      await afterEdit(pointId);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : String(err));
-    }
+    setRunError(await deleteAnchorAt(pointId, frame));
   }
 
   /**
-   * Retrack from the current frame in one direction, bounded by the panel's
-   * limit. No x/y is sent: the run starts from wherever the point already is,
-   * which is what "carry on tracking from here" means.
+   * Track one direction from `frame`, bounded by the panel's limit.
+   *
+   * No x/y is sent: the run starts from wherever the point already is on that
+   * frame — the anchor there when there is one, which is what makes the chips'
+   * ◀ / ▶ mean "track from *this* anchor", and the tracked position otherwise,
+   * which is what "carry on from the playhead" means.
    */
-  async function handleBoundedRun(pointId: string, direction: "fwd" | "bwd") {
-    setRunError(null);
-    const body: BoundedRunBody = { frame: currentFrame, direction };
-    if (runLimit === "keyframe") body.stop_at_keyframe = true;
-    if (runLimit === "frames") body.max_frames = runFrames;
-    try {
-      await submitBoundedRun(project.id, pointId, body);
-      invalidateTrack(pointId);
-    } catch (err) {
-      setRunError(err instanceof Error ? err.message : String(err));
-    }
+  async function handleRun(pointId: string, frame: number, direction: "fwd" | "bwd") {
+    setRunError(
+      await runFrom(pointId, frame, direction, {
+        ...(runLimit === "anchor" ? { stop_at_anchor: true } : {}),
+        ...(runLimit === "frames" ? { max_frames: runFrames } : {}),
+      }),
+    );
   }
 
   return (
     <div className="panel points-panel">
       <div className="panel__header">
         <h3>Tracks</h3>
+        <PanelSwitch variant={variant} onChange={onVariantChange} />
         <button
           className={tool === "add-point" ? "button--active" : ""}
           onClick={() => setTool(tool === "add-point" ? "move" : "add-point")}
@@ -200,15 +179,15 @@ export function TracksPanel() {
           const trackJob = latestJobFor("track", point.id);
           const retrackJob = latestJobFor("retrack", point.id);
           const isSelected = point.id === selectedPointId;
-          const track = tracks[point.id] as PointTrack | undefined;
-          // The point's own pins, plus the keyframes its corrections were
-          // promoted to. Pins come from the project (refreshed the moment one
-          // is placed); promotions only exist on the track, which is fetched
-          // and cached separately — so reading the list off `ground_truth`
-          // alone left a just-placed anchor missing here until the next track
-          // run replaced that cache, even though the canvas drew it at once.
-          const promoted = (track?.ground_truth ?? []).filter(
-            (g) => !point.queries.some((q) => q.frame === g.frame),
+          const track = tracks[point.id];
+          // The point's own anchors, plus the ones its corrections were
+          // promoted to. Its own come from the project (refreshed the moment
+          // one is placed); promotions only exist on the track, which is
+          // fetched and cached separately — so reading the list off the track
+          // alone left a just-placed anchor missing here until the next run
+          // replaced that cache, even though the canvas drew it at once.
+          const promoted = (track?.anchors ?? []).filter(
+            (a) => !point.queries.some((q) => q.frame === a.frame),
           );
           const anchors: Query[] = [...point.queries, ...promoted].sort(
             (a, b) => a.frame - b.frame,
@@ -288,39 +267,66 @@ export function TracksPanel() {
                 </button>
               </div>
 
+              {/* The anchors, and everything an anchor can do: go there, track
+                  forwards or backwards from it, or be deleted — which takes the
+                  run it started with it. One row, one word, one × per anchor
+                  whether the operator placed it or a drag promoted it (todo 6,
+                  seventh round). */}
               {isOpen && (
               <div className="points-list__anchors" onClick={(e) => e.stopPropagation()}>
+                <span className="points-list__label" title={ANCHOR_HELP}>
+                  Anchors
+                </span>
                 {anchors.map((q) => {
                   const missed = flagged.has(q.frame);
-                  const pinned = point.queries.some((p) => p.frame === q.frame);
+                  const own = point.queries.some((p) => p.frame === q.frame);
+                  const last = anchors.length <= 1;
                   return (
                     <span
                       key={q.frame}
-                      className="anchor-chip"
+                      className={`anchor-chip ${q.frame === currentFrame ? "anchor-chip--here" : ""}`}
                       style={missed ? { borderColor: FLAGGED_ANCHOR_COLOR } : undefined}
-                      title={
-                        missed
-                          ? "No tracking run reached this keyframe — needs manual review"
-                          : pinned
-                            ? "Anchor keyframe"
-                            : "Keyframe promoted from a manual correction"
-                      }
-                      onClick={() => setCurrentFrame(q.frame)}
                     >
-                      <span style={missed ? { color: FLAGGED_ANCHOR_COLOR } : undefined}>
-                        {pinned ? "" : "✎"}f{q.frame}
-                      </span>
-                      {pinned && point.queries.length > 1 && (
-                        <button
-                          className="anchor-chip__delete"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteAnchor(point.id, q.frame);
-                          }}
-                        >
-                          ×
-                        </button>
-                      )}
+                      <button
+                        className="link-button"
+                        style={missed ? { color: FLAGGED_ANCHOR_COLOR } : undefined}
+                        title={
+                          missed
+                            ? "No tracking run reached this anchor — needs manual review. Click to go there."
+                            : own
+                              ? "You put this anchor here. Click to go to it."
+                              : "Anchor from an edit you made on this frame. Click to go to it."
+                        }
+                        onClick={() => setCurrentFrame(q.frame)}
+                      >
+                        f{q.frame}
+                      </button>
+                      <button
+                        className="anchor-chip__run"
+                        title={`Track backwards from this anchor (${runLabel(runLimit, runFrames)})`}
+                        onClick={() => handleRun(point.id, q.frame, "bwd")}
+                      >
+                        ◀
+                      </button>
+                      <button
+                        className="anchor-chip__run"
+                        title={`Track forwards from this anchor (${runLabel(runLimit, runFrames)})`}
+                        onClick={() => handleRun(point.id, q.frame, "fwd")}
+                      >
+                        ▶
+                      </button>
+                      <button
+                        className="anchor-chip__delete"
+                        disabled={last}
+                        title={
+                          last
+                            ? "A track needs at least one anchor to track from — this is its last one"
+                            : "Delete this anchor, and whatever was tracked from it"
+                        }
+                        onClick={() => handleDeleteAnchor(point.id, q.frame)}
+                      >
+                        ×
+                      </button>
                     </span>
                   );
                 })}
@@ -328,21 +334,46 @@ export function TracksPanel() {
                   className={`anchor-add ${
                     tool === "add-anchor" && isSelected ? "button--active" : ""
                   }`}
-                  title={`Pin this point at frame ${currentFrame} where it already is (shortcut: A), or click the frame to place it somewhere else (⇧A)`}
+                  title={`Anchor this track at frame ${currentFrame} where it already is (shortcut: A), or click the frame to place it somewhere else (⇧A)`}
                   onClick={async () => {
                     setSelectedPointId(point.id);
                     if (tool === "add-anchor" && isSelected) {
                       setTool("move");
                       return;
                     }
-                    // Same rule as the shortcut: pin where the point already
+                    // Same rule as the shortcut: anchor where the point already
                     // is, and only ask for a click when there is nothing there
-                    // to pin.
+                    // to anchor.
                     if (!(await addAnchorHere(point.id))) setTool("add-anchor");
                   }}
                 >
-                  + anchor
+                  + anchor at f{currentFrame}
                 </button>
+                {/* How far every ◀ / ▶ on this panel reaches. Beside the
+                    buttons it governs rather than in a settings panel: it is
+                    read once per run and changed almost as often. */}
+                <select
+                  value={runLimit}
+                  onChange={(e) => setRunLimit(e.target.value as RunLimit)}
+                  title="How far a run from an anchor should go"
+                >
+                  <option value="anchor">runs stop at the next anchor</option>
+                  <option value="frames">runs cover N frames</option>
+                  <option value="clip">runs go to the end of the clip</option>
+                </select>
+                {runLimit === "frames" && (
+                  <input
+                    type="number"
+                    min={1}
+                    max={Math.max(project.video.frames, 1)}
+                    value={runFrames}
+                    style={{ width: "4rem" }}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      if (!Number.isNaN(v)) setRunFrames(Math.max(1, Math.round(v)));
+                    }}
+                  />
+                )}
               </div>
               )}
 
@@ -388,9 +419,32 @@ ${
 
               {isOpen && (
               <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
-                <button onClick={() => handleTrack(point.id)}>
+                <button
+                  className={point.anchors_changed ? "button--active" : ""}
+                  title={
+                    point.anchors_changed
+                      ? "Track every anchor again, forwards and backwards, and merge the runs"
+                      : "Track every anchor, forwards and backwards, and merge the runs"
+                  }
+                  onClick={() => handleTrack(point.id)}
+                >
                   {point.has_track ? "Re-track" : "Track"}
                 </button>
+                {/* An anchor is an input to tracking, so changing one leaves
+                    this track answering the old question. Saying so is the
+                    whole of "delete an anchor and the tracking updates" for the
+                    merged baseline — the spans a run from an anchor produced go
+                    away on their own, but the merge cannot be un-merged without
+                    running it again, and that is minutes of GPU nobody asked
+                    for on a click. */}
+                {point.anchors_changed && (
+                  <span
+                    className="points-list__warning"
+                    title="This track was computed from a different set of anchors. Re-track to plan through the ones you have now."
+                  >
+                    ⟳ anchors changed
+                  </span>
+                )}
                 {point.has_track && (
                   <span className="points-list__confidence">
                     {point.tracked_frames} frames · {(point.mean_confidence * 100).toFixed(0)}%
@@ -410,43 +464,25 @@ ${
               </div>
               )}
 
-              {point.has_track && isOpen && (
+              {/* The same run, from the playhead rather than from an anchor:
+                  "carry on from where I am", for the frames between anchors.
+                  No longer behind `has_track` — a run from an anchor is how a
+                  track gets started, not only how one gets repaired. */}
+              {isOpen && (
                 <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                   <button
-                    title={`Track backwards from frame ${currentFrame}`}
-                    onClick={() => handleBoundedRun(point.id, "bwd")}
+                    title={`Track backwards from frame ${currentFrame} (${runLabel(runLimit, runFrames)})`}
+                    onClick={() => handleRun(point.id, currentFrame, "bwd")}
                   >
                     ◀ track
                   </button>
                   <button
-                    title={`Track forwards from frame ${currentFrame}`}
-                    onClick={() => handleBoundedRun(point.id, "fwd")}
+                    title={`Track forwards from frame ${currentFrame} (${runLabel(runLimit, runFrames)})`}
+                    onClick={() => handleRun(point.id, currentFrame, "fwd")}
                   >
                     track ▶
                   </button>
                   <span>from f{currentFrame}</span>
-                  <select
-                    value={runLimit}
-                    onChange={(e) => setRunLimit(e.target.value as RunLimit)}
-                    title="How far the run should go"
-                  >
-                    <option value="keyframe">to next keyframe</option>
-                    <option value="frames">for N frames</option>
-                    <option value="clip">to end of clip</option>
-                  </select>
-                  {runLimit === "frames" && (
-                    <input
-                      type="number"
-                      min={1}
-                      max={Math.max(project.video.frames, 1)}
-                      value={runFrames}
-                      style={{ width: "4rem" }}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        if (!Number.isNaN(v)) setRunFrames(Math.max(1, Math.round(v)));
-                      }}
-                    />
-                  )}
                   <JobProgress job={retrackJob} />
                 </div>
               )}
@@ -454,7 +490,7 @@ ${
               {/* This track's gaps, range repairs and corrections (todo 4,
                   sixth round) — what the Edit tab held that was not already
                   somewhere better. All of it is per point, so it belongs on the
-                  point's card next to its keyframes and its patches. */}
+                  point's card next to its anchors and its patches. */}
               {isOpen && <TrackEdits pointId={point.id} />}
 
               {isOpen && violations.length > 0 && (
@@ -463,10 +499,10 @@ ${
                     <li
                       key={`${v.frame}-${v.origin}-${v.direction}`}
                       style={{ color: FLAGGED_ANCHOR_COLOR, cursor: "pointer", listStyle: "none" }}
-                      title={`The run from frame ${v.origin} stopped here rather than drift past a keyframe it disagreed with`}
+                      title={`The run from frame ${v.origin} stopped here rather than drift past an anchor it disagreed with`}
                       onClick={() => setCurrentFrame(v.frame)}
                     >
-                      ⚑ keyframe f{v.frame} missed by {v.distance.toFixed(1)} px
+                      ⚑ anchor f{v.frame} missed by {v.distance.toFixed(1)} px
                     </li>
                   ))}
                 </ul>
