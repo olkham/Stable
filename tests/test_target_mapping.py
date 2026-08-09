@@ -256,32 +256,60 @@ def test_the_target_round_trips_through_its_dict_form():
     assert restored.points[1].label() == "smoothed(p2)"
 
 
-def test_two_marks_land_on_their_output_fractions_and_leave_no_zoom_to_apply():
-    """Todo 1, eighth round: two marks state the framing completely.
+def test_two_marks_land_on_their_output_fractions_under_the_crop_policy():
+    """Two marks state the framing completely, and ``crop`` honours it exactly.
 
-    Each one is a fraction of the delivered frame, and with two of them the
-    similarity that satisfies both is unique — so an auto-zoom on top would
-    slide them both off. The plan therefore does not zoom, and reports the gaps
-    that leaves instead of hiding them.
+    The similarity taking two tracked points to two chosen fractions of the
+    frame is unique, so how much of the shot is in view is settled by where the
+    marks were put. ``crop`` is the policy that keeps them there and reports
+    whatever gaps that leaves; ``auto_zoom`` is the policy that closes the gaps
+    instead, and the marks ride the zoom outwards.
     """
     paths, _start = _moving_paths(lambda f: SimilarityTransform(tx=3.0 * f, rotation=0.01 * f))
     marks = np.array([[0.25, 0.3], [0.7, 0.65]])
 
-    plan = StabilizationPlan.build(
+    exact = StabilizationPlan.build(
+        _identity_motion(),
+        source_size=SIZE,
+        border="crop",
+        sources=paths,
+        placements=marks,
+    )
+    assert exact.geometry.zoom == pytest.approx(1.0)
+    assert exact.geometry.gaps is True  # honest, rather than quietly moved marks
+    width, height = exact.geometry.width, exact.geometry.height
+    for frame in (0, 11, FRAMES - 1):
+        for k in range(2):
+            landed = exact.output_transform(frame).apply(paths[k, frame])
+            assert landed == pytest.approx([marks[k, 0] * width, marks[k, 1] * height], abs=1e-6)
+
+
+def test_auto_zoom_closes_the_gaps_and_the_marks_ride_it():
+    """The other half of the trade, and what makes ``auto_zoom`` mean something.
+
+    No similarity both covers the frame and satisfies two marks at fixed
+    fractions of it, so the zoom pushes them outwards from their centroid by
+    exactly the zoom factor. That is reported rather than hidden — the plan
+    knows where they land and the export screen shows it.
+    """
+    paths, _start = _moving_paths(lambda f: SimilarityTransform(tx=3.0 * f, rotation=0.01 * f))
+    marks = np.array([[0.25, 0.3], [0.7, 0.65]])
+
+    zoomed = StabilizationPlan.build(
         _identity_motion(),
         source_size=SIZE,
         border="auto_zoom",
         sources=paths,
         placements=marks,
     )
-
-    assert plan.geometry.zoom == pytest.approx(1.0)
-    assert plan.geometry.gaps is True  # honest, rather than zoomed away
-    width, height = plan.geometry.width, plan.geometry.height
-    for frame in (0, 11, FRAMES - 1):
-        for k in range(2):
-            landed = plan.output_transform(frame).apply(paths[k, frame])
-            assert landed == pytest.approx([marks[k, 0] * width, marks[k, 1] * height], abs=1e-6)
+    assert zoomed.geometry.zoom > 1.0
+    assert zoomed.geometry.gaps is False
+    width, height = zoomed.geometry.width, zoomed.geometry.height
+    centre = marks.mean(axis=0)
+    for k in range(2):
+        landed = zoomed.output_transform(11).apply(paths[k, 11]) / np.array([width, height])
+        expected = centre + zoomed.geometry.zoom * (marks[k] - centre)
+        assert landed == pytest.approx(expected, abs=1e-6)
 
 
 def test_one_mark_still_gets_the_auto_zoom():

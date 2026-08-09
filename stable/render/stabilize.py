@@ -126,12 +126,14 @@ def _mapped_transforms(
     reported rather than hidden — see
     :func:`stable.server.motion.target_residuals`.
 
-    Two or more pairs also spend the framing budget completely. The similarity
-    that satisfies them is unique, so any crop/zoom fit applied afterwards would
-    slide every point off the mark it was placed on; :meth:`StabilizationPlan.build`
-    therefore plans those with ``allow_zoom=False``. Gaps are then real and
-    reported rather than zoomed away — the way to close them is to move the
-    marks closer together.
+    Two or more pairs also settle how much of the shot is in view: the
+    similarity taking two tracked points to two chosen fractions of the frame is
+    unique. So the border policy has a real choice to make rather than a free
+    parameter — ``crop`` keeps the marks exactly and reports whatever gaps that
+    leaves, ``auto_zoom`` scales up about their centroid until the frame is
+    covered and the marks ride outwards with it. Neither is hidden: the geometry
+    reports the coverage and :func:`stable.server.motion.target_residuals` says
+    where each mark actually landed.
 
     Args:
         warps: The base each fit is composed onto; the identity, from
@@ -263,7 +265,7 @@ class StabilizationPlan:
         warps: Sequence[SimilarityTransform] = motion.stabilization_transforms()
         origin: tuple[float, float] | None = None
         place = (0.5, 0.5)
-        allow_zoom = True
+        marks_fix_scale = False
         marks = (
             np.zeros((0, 2))
             if placements is None
@@ -294,9 +296,9 @@ class StabilizationPlan:
             origin = (float(centroid[0]), float(centroid[1]))
             place = (float(marks[:, 0].mean()), float(marks[:, 1].mean()))
             # Two or more marks pin rotation and scale as well as position, so
-            # the similarity is already determined and there is no zoom left to
-            # apply. One mark is a translation, which leaves the zoom free.
-            allow_zoom = marks.shape[0] < 2
+            # how much of the shot is in view is settled by where they were put.
+            # One mark is a translation, which leaves the scale free.
+            marks_fix_scale = marks.shape[0] >= 2
         transforms = tuple(warps)
         geometry = plan_output(
             transforms,
@@ -308,7 +310,7 @@ class StabilizationPlan:
             placement=place,
             crop=crop,
             coverage_range=coverage_range,
-            allow_zoom=allow_zoom,
+            marks_fix_scale=marks_fix_scale,
             resolution=resolution,
         )
         return cls(

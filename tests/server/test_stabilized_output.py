@@ -740,8 +740,13 @@ def test_a_mark_over_several_tracks_holds_their_mean(client, solved_project):
 
 
 def test_two_marks_fix_rotation_and_scale_and_both_land_exactly(client, solved_project):
-    """Item 4: the picture is fitted to the marks, least squares."""
+    """Item 4: the picture is fitted to the marks, least squares.
+
+    Under the ``crop`` policy, which is the one that keeps the marks exactly
+    where they were put — ``auto_zoom`` trades that for closing the gaps.
+    """
     project_id, _clip, point_ids = solved_project
+    client.put(f"/api/projects/{project_id}/render", json={"border": "crop"})
     client.post(
         f"/api/projects/{project_id}/render/targets",
         json={"point_ids": [point_ids[0]], "place": {"u": 0.3, "v": 0.35}},
@@ -760,6 +765,7 @@ def test_two_marks_fix_rotation_and_scale_and_both_land_exactly(client, solved_p
 def test_three_marks_that_disagree_are_a_least_squares_fit_not_a_failure(client, solved_project):
     """A similarity has four degrees of freedom; three marks ask for six."""
     project_id, _clip, point_ids = solved_project
+    client.put(f"/api/projects/{project_id}/render", json={"border": "crop"})
     for point_id, place in zip(
         point_ids[:3],
         ({"u": 0.2, "v": 0.2}, {"u": 0.8, "v": 0.2}, {"u": 0.2, "v": 0.9}),
@@ -826,3 +832,60 @@ def test_clearing_the_output_resolution_goes_back_to_the_crop_size(client, solve
     )
     natural = client.get(f"/api/projects/{project_id}/export/preview").json()
     assert natural["output"]["width"] != 800
+
+
+# -- border policy ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("marks", [1, 2, 3])
+def test_auto_zoom_always_closes_the_gaps(client, solved_project, marks):
+    """The reported bug: auto-zoom measured a crop and then never applied it.
+
+    It worked with one target, where the zoom is free, and did nothing with two
+    or more, where the marks had already fixed the scale — so the delivered
+    frame kept showing area the camera never shot. It now scales up about the
+    marks' centroid whatever their number, which is what the name says and the
+    only thing that makes the policy worth having.
+    """
+    project_id, _clip, point_ids = solved_project
+    client.put(f"/api/projects/{project_id}/render", json={"border": "auto_zoom"})
+    places = ({"u": 0.35, "v": 0.4}, {"u": 0.65, "v": 0.6}, {"u": 0.5, "v": 0.35})
+    for point_id, place in zip(point_ids[:marks], places[:marks], strict=True):
+        client.post(
+            f"/api/projects/{project_id}/render/targets",
+            json={"point_ids": [point_id], "place": place},
+        )
+
+    preview = client.get(f"/api/projects/{project_id}/export/preview").json()
+    assert preview["coverage"] < 1.0, "this clip should need a crop, or nothing is tested"
+    assert preview["zoom"] == pytest.approx(1.0 / preview["coverage"], rel=1e-6)
+    assert preview["gaps"] is False
+
+
+@pytest.mark.parametrize("marks", [1, 2, 3])
+def test_crop_keeps_the_marks_and_reports_what_that_leaves(client, solved_project, marks):
+    """The other side of the same trade, so the two policies stay distinguishable."""
+    project_id, _clip, point_ids = solved_project
+    client.put(f"/api/projects/{project_id}/render", json={"border": "crop"})
+    places = ({"u": 0.35, "v": 0.4}, {"u": 0.65, "v": 0.6}, {"u": 0.5, "v": 0.35})
+    for point_id, place in zip(point_ids[:marks], places[:marks], strict=True):
+        client.post(
+            f"/api/projects/{project_id}/render/targets",
+            json={"point_ids": [point_id], "place": place},
+        )
+
+    preview = client.get(f"/api/projects/{project_id}/export/preview").json()
+    assert preview["zoom"] == pytest.approx(1.0)
+    if marks == 1:
+        # One mark leaves the scale free, so the window shrinks to fit and the
+        # mark stays put — no gaps and no compromise.
+        assert preview["gaps"] is False
+    else:
+        # Two or more fix the scale, so the window is the whole frame and the
+        # gaps are real. What is *not* traded away is the marks.
+        assert preview["crop_scale"] == pytest.approx(1.0)
+    if marks <= 2:
+        # One or two marks a similarity can satisfy exactly; three cannot, and
+        # that miss is the fit's, not the policy's.
+        for row in preview["targets"]:
+            assert row["residual"] == pytest.approx(0.0, abs=0.5)

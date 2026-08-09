@@ -8,12 +8,25 @@ import type { JobEvent } from "../types";
 
 const CODECS = ["h264", "h265", "vp9"];
 
+const BORDER_LABEL: Record<string, string> = {
+  crop: "keep the picture, lose frame",
+  auto_zoom: "keep the frame, zoom in",
+  transparent: "keep everything, alpha the gaps",
+};
+
 const BORDER_HELP: Record<string, string> = {
-  crop: "Output the largest area every frame covers. Nothing is scaled, so the picture stays pixel-exact and the file is smaller than the source.",
+  crop: "Output the largest area every frame covers. Nothing is scaled, so the picture stays pixel-exact and the delivered frame is smaller than the source.",
   auto_zoom:
-    "That same area scaled back to delivery size — the minimal zoom that leaves no gaps. Same resolution in, same resolution out.",
+    "Scale that same area back up to fill the frame — the minimal zoom that leaves no gaps, and never more than the shot needed.",
   transparent:
     "No crop at all; uncovered area becomes alpha. Renders a PNG sequence, since no video codec here carries an alpha channel.",
+};
+
+/** What the two policies cost once the targets have fixed the scale. */
+const BORDER_WITH_MARKS: Record<string, string> = {
+  crop: " Two or more targets already fix how much of the shot is in view, so this keeps them exactly where you put them and shows whatever gaps that leaves.",
+  auto_zoom:
+    " Two or more targets already fix how much of the shot is in view, so closing the gaps means zooming past them: they ride outwards from their centre, and the list above shows where they actually land.",
 };
 
 const SOURCE_HELP: Record<string, string> = {
@@ -518,7 +531,7 @@ export function ExportPanel() {
           positions. The fit satisfies as many of them as a similarity can —
           one or two exactly, three or more in the least-squares sense — so the
           miss is shown per mark rather than averaged into a single number. */}
-      <div className="panel__header panel__header--inline">
+      <div className="panel-section panel-section--counted">
         <h4>Targets</h4>
         <span className="export-screen__count">
           {points.length === 0
@@ -697,7 +710,26 @@ export function ExportPanel() {
         Snap targets to the centre, thirds and other points
       </label>
 
-      <h4>Crop</h4>
+      <div className="panel-section">
+        <h4>Crop</h4>
+        <span className="panel-section__note">How much of the shot survives, and what happens at the edges</span>
+      </div>
+      <div className="field-row">
+        <label>When it overruns</label>
+        <select value={border} onChange={(e) => void handleBorderChange(e.target.value)}>
+          {borders.map((name) => (
+            <option key={name} value={name}>
+              {BORDER_LABEL[name] ?? name}
+            </option>
+          ))}
+        </select>
+      </div>
+      <p className="export-screen__hint">
+        {BORDER_HELP[border] ?? ""}
+        {border !== "transparent" && points.length >= 2
+          ? BORDER_WITH_MARKS[border] ?? ""
+          : ""}
+      </p>
       <div className="field-row">
         <label>Size</label>
         <select
@@ -770,7 +802,10 @@ export function ExportPanel() {
           hard into a shot and still hand over 1920x1080. Setting both sides
           also sets the crop window's shape, so a square delivery crops a square
           out of a 16:9 source rather than squeezing one into it. */}
-      <h4>Output resolution</h4>
+      <div className="panel-section">
+        <h4>Output resolution</h4>
+        <span className="panel-section__note">The pixel size the crop is delivered at</span>
+      </div>
       <div className="field-row">
         <label>Deliver at</label>
         <input
@@ -820,7 +855,10 @@ export function ExportPanel() {
           : `Scaling the crop to ${outSize ? `${outSize.width}x${outSize.height}` : "the size above"}. Leave a side empty and it follows the crop; set both and the crop takes that shape.`}
       </p>
 
-      <h4>Export range</h4>
+      <div className="panel-section">
+        <h4>Export range</h4>
+        <span className="panel-section__note">Which frames get written</span>
+      </div>
       {/* Marked from the playhead, the way an In/Out pair is actually set:
           scrub to the frame you mean and press the button. Typing the number is
           still there for when you know it, but nobody knows it by looking. */}
@@ -872,18 +910,10 @@ export function ExportPanel() {
           : `Following the In/Out markers, so this render writes frames ${exportWindow[0]}–${exportWindow[1] - 1}. Setting either end above makes it the export's own range and leaves the markers alone.`}
       </p>
 
-      <h4>Border</h4>
-      <div className="field-row">
-        <label>Policy</label>
-        <select value={border} onChange={(e) => void handleBorderChange(e.target.value)}>
-          {borders.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
+      <div className="panel-section">
+        <h4>Edge fill</h4>
+        <span className="panel-section__note">What goes in the area no frame covers</span>
       </div>
-      <p className="export-screen__hint">{BORDER_HELP[border] ?? ""}</p>
       <div className="field-row">
         <label>Fill edge</label>
         <select
@@ -939,7 +969,10 @@ export function ExportPanel() {
         a mirrored edge faded toward a colour is one setting away.
       </p>
 
-      <h4>Encode</h4>
+      <div className="panel-section">
+        <h4>Encode</h4>
+        <span className="panel-section__note">The file itself</span>
+      </div>
       <div className="field-row">
         <label>Filename</label>
         <input
@@ -986,7 +1019,10 @@ export function ExportPanel() {
           with, so several can be lined up with different crops and each renders
           the one it was queued with; they run one at a time, because two FFmpeg
           encodes fight over the same cores to nobody's benefit. */}
-      <h4>Queue</h4>
+      <div className="panel-section">
+        <h4>Queue</h4>
+        <span className="panel-section__note">Exports waiting and running</span>
+      </div>
       {queue.length === 0 ? (
         <p className="export-screen__hint">Nothing queued. Exports run in the background.</p>
       ) : (
@@ -1013,7 +1049,10 @@ export function ExportPanel() {
         </ul>
       )}
 
-      <h4>Renders</h4>
+      <div className="panel-section">
+        <h4>Renders</h4>
+        <span className="panel-section__note">Finished files</span>
+      </div>
       {renders.length === 0 ? (
         <p className="export-screen__hint">No exports yet.</p>
       ) : (
@@ -1033,7 +1072,10 @@ export function ExportPanel() {
       )}
 
       {/* The old modal's second tab: the numbers behind the picture. */}
-      <h4>Data</h4>
+      <div className="panel-section">
+        <h4>Data</h4>
+        <span className="panel-section__note">Tracks and curves as numbers</span>
+      </div>
       <p className="export-screen__hint">Point tracks (raw + corrections applied):</p>
       <div className="export-links">
         <a href={api.tracksExportUrl(project.id, "csv")} download="tracks.csv">

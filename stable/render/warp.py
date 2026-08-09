@@ -8,17 +8,26 @@ edges, because moving the frame necessarily uncovers area the camera never shot.
 The three policies
 ------------------
 ``crop``
-    Output the largest centred rectangle of the original aspect ratio that
-    every frame covers. Nothing is scaled, so the picture stays pixel-exact;
-    the output is simply smaller than the input.
+    Keep the picture pixel-exact and give up frame instead: output the largest
+    rectangle every frame covers. Nothing is scaled, so a mark stays on the
+    exact fraction it was placed on; the output is simply smaller than the
+    input.
 ``auto_zoom``
-    The same rectangle, scaled back up to the original size — the *minimal*
-    zoom that covers every frame. This is the default: same delivery
-    resolution, guaranteed no gaps, and the zoom is only ever as much as the
-    shot actually needed.
+    Keep the frame and give up pixels instead: scale up by the *minimal* zoom
+    that covers every frame. This is the default — same delivery resolution,
+    guaranteed no gaps, and never more zoom than the shot actually needed.
 ``transparent``
     No cropping at all. The output is RGBA with alpha 0 wherever no source
     pixel exists, for compositing the gaps in another application.
+
+They are two answers to one question, and which one is right depends on what
+the operator would rather lose. That only becomes a real choice once two or
+more marks are placed: the similarity taking two tracked points to two chosen
+fractions of the frame is unique, so how much of the shot is in view is already
+settled. ``crop`` then keeps the marks and reports the gaps; ``auto_zoom``
+closes the gaps and the marks ride the zoom outwards from their centroid. With
+one mark or none there is a free scale, so ``auto_zoom`` closes the gaps for
+free and nothing moves.
 
 Finding the minimal zoom
 ------------------------
@@ -389,7 +398,7 @@ def plan_output(
     placement: tuple[float, float] = (0.5, 0.5),
     crop: CropSpec | None = None,
     coverage_range: tuple[int, int] | None = None,
-    allow_zoom: bool = True,
+    marks_fix_scale: bool = False,
     resolution: OutputResolution | None = None,
 ) -> OutputGeometry:
     """Work out the output size and fit transform for a border policy.
@@ -420,11 +429,12 @@ def plan_output(
             "the biggest crop with no gaps *between the export markers*" is
             computed — the frames outside are not being written, so letting them
             veto the crop is answering a question nobody asked.
-        allow_zoom: Whether the ``auto_zoom`` policy may actually zoom. False
-            for a fit of two or more marks: those state the framing completely,
-            so any zoom on top would slide every point off the mark it was
-            placed on. The geometry still reports the coverage, so the gaps such
-            a fit leaves are visible rather than silent.
+        marks_fix_scale: Whether two or more marks have already determined the
+            picture's scale. They have: the similarity taking two tracked points
+            to two chosen fractions of the frame is unique, so how much of the
+            shot is in view is settled by where the marks were put. That leaves
+            the two policies a real choice to make rather than a bug to hide —
+            see the note below on what each one does about it.
         resolution: The pixel size to deliver the crop window at. ``None`` (or
             an unset :class:`~stable.render.options.OutputResolution`) delivers
             it at whatever size it came out, which is what every policy did
@@ -485,6 +495,14 @@ def plan_output(
     gaps = requested > coverage + 1e-9
 
     if border == "crop":
+        # With two or more marks the window has to be the whole box. Shrinking
+        # it at a fixed picture scale moves every mark off the fraction it was
+        # placed on — the marks' separation in pixels does not shrink with the
+        # window — so `crop` is the policy that keeps the marks exactly where
+        # they were put and reports whatever gaps that leaves.
+        if marks_fix_scale:
+            requested = 1.0
+            gaps = coverage < 1.0 - 1e-9
         crop_w = _even(int(requested * box_w))
         crop_h = _even(int(requested * box_h))
         out_w, out_h = delivery.resolve((crop_w, crop_h))
@@ -510,11 +528,17 @@ def plan_output(
             measured_frames=len(measured),
         )
 
-    zoom = 1.0 / requested if allow_zoom else 1.0
+    # `auto_zoom` is the other answer to the same question: rather than keeping
+    # the marks and living with the gaps, it scales the picture up about their
+    # centroid until the delivered frame is covered. With one mark that is a
+    # pure zoom and the mark does not move — it *is* the centre of it. With two
+    # or more the marks ride the zoom outwards, which is not a rounding error
+    # but the trade: no other similarity both covers the frame and satisfies
+    # them, so the render shows where they actually land and the operator can
+    # switch policy or move them closer together.
+    zoom = 1.0 / requested
     clamped = False
-    if not allow_zoom:
-        gaps = gaps or coverage < 1.0 - 1e-9
-    elif max_zoom is not None and zoom > float(max_zoom):
+    if max_zoom is not None and zoom > float(max_zoom):
         if float(max_zoom) < 1.0:
             raise RenderError(f"max_zoom must be >= 1, got {max_zoom}")
         zoom, clamped = float(max_zoom), True
@@ -534,7 +558,7 @@ def plan_output(
         zoom=zoom,
         border=border,
         clamped=clamped,
-        crop_scale=requested if allow_zoom else 1.0,
+        crop_scale=requested,
         centre=pinned,
         placement=place,
         gaps=gaps,
