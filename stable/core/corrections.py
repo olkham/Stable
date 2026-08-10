@@ -10,7 +10,7 @@ always ``apply_corrections(raw, corrections)``, so:
 * the project file stays small and human-readable.
 
 Corrections apply **in list order**; each one is a pure function of the track it
-receives. The five types cover the editing vocabulary of Phase 5:
+receives. The six types cover the editing vocabulary:
 
 ===================== ===============================================================
 :class:`OffsetCorrection`      nudge a point, blended out over a falloff range
@@ -18,6 +18,7 @@ receives. The five types cover the editing vocabulary of Phase 5:
 :class:`GapFillCorrection`     interpolate across a range with no valid samples
 :class:`DeleteRangeCorrection` mark a range invalid (bad/occluded tracking)
 :class:`RetrackCorrection`     re-run the tracker from a corrected position
+:class:`SmoothCorrection`      filter the path itself over a range
 ===================== ===============================================================
 """
 
@@ -40,6 +41,10 @@ __all__ = [
     "GapFillCorrection",
     "DeleteRangeCorrection",
     "RetrackCorrection",
+    "SmoothCorrection",
+    "DEFAULT_SMOOTH_FILTER",
+    "DEFAULT_SMOOTH_BLEND",
+    "DEFAULT_SMOOTH_FPS",
     "CORRECTION_TYPES",
     "GROUND_TRUTH_KINDS",
     "ANCHORING_KINDS",
@@ -61,6 +66,33 @@ INTERPOLATION_METHODS: tuple[str, ...] = ("linear", "spline")
 
 DIRECTIONS: tuple[str, ...] = ("fwd", "bwd", "bidir")
 """Tracking directions, shared with the tracker plugin contract."""
+
+DEFAULT_SMOOTH_FILTER = "gaussian"
+"""The filter a :class:`SmoothCorrection` uses when none is named.
+
+A Gaussian rather than the Butterworth the *camera* channels default to: a
+track path is a couple of hundred noisy pixel samples, not a motion curve being
+cut by frequency, and a Gaussian's parameter is a width in frames — which is the
+unit an operator thinks in when they say "this jitters over about ten frames".
+"""
+
+DEFAULT_SMOOTH_BLEND = 5
+"""Frames of cross-fade at each edge of a smoothed range.
+
+Zero would put a step in the path where the smoothing stops, and a step in a
+track is exactly the artefact smoothing is being asked to remove. Same default,
+and the same reason, as :data:`stable.smoothing.edit.DEFAULT_RANGE_BLEND`.
+"""
+
+DEFAULT_SMOOTH_FPS = 25.0
+"""Frame rate assumed when :func:`apply_corrections` is not told the clip's.
+
+Only the filters that work in Hz consult it (Butterworth, and the optional
+``cutoff_hz`` of the Gaussian and the spline); everything else is in frames and
+does not care. The server always passes the real one — see
+:func:`stable.server.tracking.load_display_track` — so this is the value a bare
+library caller gets, stated rather than hidden.
+"""
 
 
 def _new_id() -> str:
@@ -293,6 +325,71 @@ class RetrackCorrection(Correction):
             raise ContractError(f"unknown direction {self.direction!r}; expected {DIRECTIONS}")
 
 
+@dataclass(frozen=True, kw_only=True)
+class SmoothCorrection(Correction):
+    """Filter the point's own path over ``[start, end]`` (inclusive).
+
+    The Smoothing panel's ``X``, ``Y``, ``Rotation`` and ``Scale`` are the
+    *camera* curves the solver recovered from every solve-enabled track at once
+    — they belong to no single track, which is the whole of todo 1, tenth round
+    ("it's not clear which track path this applies to": it applies to none of
+    them). This is the other thing: one track's trajectory, smoothed on its own,
+    for the point that is jittering while the rest of the solve is fine.
+
+    The filter is the same catalogue the channels use
+    (:mod:`stable.smoothing.filters`), run over ``x`` and ``y`` separately, and
+    the result is cross-faded into the range with
+    :func:`stable.smoothing.edit.blend_subrange` so the edges do not step.
+
+    Two things it deliberately does not do:
+
+    * **Fill gaps.** Filtering is a global operation, so the curve handed to a
+      filter has its non-finite samples interpolated away first; those
+      interpolated values are then dropped again, and only frames that already
+      had a position are written. Inventing a sample is
+      :class:`GapFillCorrection`'s job, and it should stay a separate, visible
+      edit.
+    * **Touch confidence.** Smoothing changes where the tracker says the feature
+      is, not how sure it was.
+
+    Args:
+        start: First frame of the range, inclusive.
+        end: Last frame of the range, inclusive.
+        filter: A name from :data:`stable.smoothing.filters.FILTERS`.
+        params: That filter's parameters, including the universal ``strength``.
+            Missing ones fall back to the filter's own defaults.
+        blend: Frames of cross-fade at each edge of the range.
+
+    Raises:
+        ContractError: On a negative or inverted range, or a negative blend. The
+            filter name and its parameters are validated where they are applied,
+            by the catalogue that owns them.
+    """
+
+    kind: ClassVar[str] = "smooth"
+
+    start: int
+    end: int
+    filter: str = DEFAULT_SMOOTH_FILTER
+    params: dict[str, Any] = field(default_factory=dict)
+    blend: int = DEFAULT_SMOOTH_BLEND
+
+    def __post_init__(self) -> None:
+        """Validate the smoothed range (dataclass hook)."""
+        if self.start < 0:
+            raise ContractError(f"SmoothCorrection.start must be >= 0, got {self.start}")
+        if self.end < self.start:
+            raise ContractError(f"invalid range [{self.start}, {self.end}]: end < start")
+        if self.blend < 0:
+            raise ContractError(f"SmoothCorrection.blend must be >= 0, got {self.blend}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the project-file dict, with ``params`` copied out."""
+        data = super().to_dict()
+        data["params"] = dict(self.params)
+        return data
+
+
 CORRECTION_TYPES: dict[str, type[Correction]] = {
     cls.kind: cls
     for cls in (
@@ -301,6 +398,7 @@ CORRECTION_TYPES: dict[str, type[Correction]] = {
         GapFillCorrection,
         DeleteRangeCorrection,
         RetrackCorrection,
+        SmoothCorrection,
     )
 }
 """Discriminator (``kind``) to class map used for project-file deserialisation."""
@@ -608,11 +706,49 @@ def _apply_retrack(
     state.set_position(correction.frame, correction.x, correction.y, 1.0)
 
 
+def _apply_smooth(state: _Editable, correction: SmoothCorrection, fps: float) -> None:
+    """Filter the path over the correction's range, leaving its gaps alone.
+
+    The import of :mod:`stable.smoothing` is deferred on purpose, and it is not
+    a style choice: ``stable/smoothing/__init__.py`` imports
+    :mod:`stable.smoothing.channels`, which imports :mod:`stable.core.project`,
+    which imports *this* module. At module level that is an import cycle; inside
+    the one function that needs it, it is simply a filter catalogue being
+    reached for at the moment a correction of this kind is applied.
+    """
+    from ..smoothing.edit import blend_subrange
+    from ..smoothing.filters import FilterContext, apply_filter
+
+    if state.n_frames == 0:
+        return
+    # Which frames actually have a position, recorded *before* filtering: the
+    # filter is handed a gap-filled curve (it has to be — one NaN poisons a
+    # global operation), and writing its answer back everywhere would turn every
+    # gap into invented positions.
+    known = state.valid()
+    if not known.any():
+        return
+    context = FilterContext(
+        fps=fps if fps > 0.0 else DEFAULT_SMOOTH_FPS,
+        reference_frame=correction.start,
+        channel="x",
+        n_frames=state.n_frames,
+    )
+    for axis in (0, 1):
+        raw = state.points[:, axis]
+        filtered = apply_filter(correction.filter, raw, context, correction.params)
+        blended = blend_subrange(
+            raw, filtered, correction.start, correction.end, blend=correction.blend
+        )
+        state.points[known, axis] = blended[known]
+
+
 def apply_corrections(
     track: PointTrack,
     corrections: Sequence[Correction],
     *,
     resolve_retrack: RetrackResolver | None = None,
+    fps: float = DEFAULT_SMOOTH_FPS,
 ) -> PointTrack:
     """Return ``track`` with the correction layer applied, leaving it untouched.
 
@@ -636,6 +772,9 @@ def apply_corrections(
       visible.
     * :class:`RetrackCorrection` — splice ``resolve_retrack``'s cached run over
       the direction's frame span, then re-assert the corrected position.
+    * :class:`SmoothCorrection` — filter ``x`` and ``y`` over the range and
+      cross-fade back to the unfiltered path at its edges, writing only where a
+      position already existed.
 
     Args:
         track: The immutable raw track (or the output of an earlier stage).
@@ -645,6 +784,9 @@ def apply_corrections(
             a retrack still contributes its corrected position, so the edit is
             never silently lost — only the re-tracked span is missing until the
             run is computed.
+        fps: The clip's frame rate, which the filters that work in Hz need to
+            turn a cutoff into frames. Defaults to :data:`DEFAULT_SMOOTH_FPS`;
+            only :class:`SmoothCorrection` reads it.
 
     Returns:
         A new :class:`PointTrack`; ``track`` itself is never modified.
@@ -652,6 +794,8 @@ def apply_corrections(
     Raises:
         ContractError: If a resolved retrack run does not span the same clip
             timeline as ``track``.
+        stable.core.errors.SmoothingError: If a :class:`SmoothCorrection` names
+            a filter or a parameter the catalogue does not have.
     """
     active = [c for c in corrections if c.enabled]
     if not active:
@@ -670,6 +814,8 @@ def apply_corrections(
         elif isinstance(correction, RetrackCorrection):
             resolved = resolve_retrack(correction) if resolve_retrack is not None else None
             _apply_retrack(state, correction, resolved)
+        elif isinstance(correction, SmoothCorrection):
+            _apply_smooth(state, correction, fps)
         else:  # pragma: no cover - a third-party Correction subclass
             raise ContractError(
                 f"don't know how to apply correction kind {correction.kind!r}; "

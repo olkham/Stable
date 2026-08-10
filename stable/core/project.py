@@ -177,6 +177,19 @@ class PointSpec:
             can end up the same colour with no way to tell them apart on the
             frame; this is the operator's answer to that, and it belongs with
             the project rather than in one browser tab.
+        derived_from: The ids this point's path was averaged from, or empty for
+            an ordinary tracked point. A **composite** track is not a tracked
+            one: nothing chose a tracker for it, no window was matched, no run
+            produced it, and the anchor it carries is a formality. The UI has to
+            know that to stop offering the controls for all of those (todo 2,
+            tenth round, second pass), and it has to know it *after a reload* —
+            which is why this is on the point rather than in the response that
+            created it, where it started out.
+
+            Stale ids are kept rather than pruned when a source is deleted: "made
+            from p1 and p2" is what happened, and the path baked from them does
+            not change when one of them goes. The panel draws a missing source as
+            plain text instead of a link.
     """
 
     id: str
@@ -186,6 +199,7 @@ class PointSpec:
     raw: str | None = None
     corrections: list[Correction] = field(default_factory=list)
     color: str | None = None
+    derived_from: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Normalise and validate :attr:`color` (dataclass hook).
@@ -200,6 +214,11 @@ class PointSpec:
             raise ProjectError(f"point colour must be #rrggbb, got {self.color!r}")
         self.color = color
 
+    @property
+    def is_composite(self) -> bool:
+        """Whether this point's path was averaged from other tracks."""
+        return bool(self.derived_from)
+
     def to_dict(self) -> dict[str, Any]:
         """Return the project-file dict for this point."""
         return {
@@ -210,6 +229,7 @@ class PointSpec:
             "raw": self.raw,
             "corrections": [c.to_dict() for c in self.corrections],
             "color": self.color,
+            "derived_from": list(self.derived_from),
         }
 
     @classmethod
@@ -231,6 +251,9 @@ class PointSpec:
             # Absent on every project written before colours existed, which is
             # the same as "use the palette" — no migration needed.
             color=data.get("color") or None,
+            # Likewise: absent means "an ordinary tracked point", which is what
+            # every point written before composites existed was.
+            derived_from=[str(source) for source in data.get("derived_from") or []],
         )
 
     def sorted_queries(self) -> list[Query]:

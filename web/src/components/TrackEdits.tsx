@@ -1,7 +1,18 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import * as api from "../api/client";
+import { useFilterCatalogue } from "../hooks/useFilterCatalogue";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Correction } from "../types";
+
+/**
+ * The filter a new per-track smoothing starts on.
+ *
+ * Mirrors `stable/core/corrections.py`'s `DEFAULT_SMOOTH_FILTER`, and for the
+ * same reason: a track path is a few hundred noisy pixel samples, not a motion
+ * curve being cut by frequency, so a width in frames is the parameter an
+ * operator can actually reason about.
+ */
+const DEFAULT_SMOOTH_FILTER = "gaussian";
 
 /** One-line human description of what an edit does, for the correction list. */
 function describe(correction: Correction): string {
@@ -20,6 +31,8 @@ function describe(correction: Correction): string {
       return `delete ${correction.start}–${correction.end}`;
     case "retrack":
       return `retrack ${correction.direction} from ${correction.frame}`;
+    case "smooth":
+      return `${correction.filter ?? "smooth"} smooth ${correction.start}–${correction.end}`;
     default:
       return correction.kind;
   }
@@ -66,6 +79,34 @@ export function TrackEdits({ pointId }: { pointId: string }) {
   const [rangeStart, setRangeStart] = useState(0);
   const [rangeEnd, setRangeEnd] = useState(0);
   const [method, setMethod] = useState<"spline" | "linear">("spline");
+  // The per-track smoothing (todo 1, tenth round): which filter, and its own
+  // parameters. The catalogue is the server's, so nothing about a filter is
+  // written down here — see `useFilterCatalogue`.
+  const catalogue = useFilterCatalogue();
+  const [filter, setFilter] = useState(DEFAULT_SMOOTH_FILTER);
+  const [params, setParams] = useState<Record<string, number>>({});
+  const info = useMemo(
+    () => catalogue.find((entry) => entry.name === filter),
+    [catalogue, filter],
+  );
+
+  const defaultsFor = useCallback(
+    (name: string): Record<string, number> => {
+      const entry = catalogue.find((row) => row.name === name);
+      const values: Record<string, number> = {};
+      for (const param of entry?.params ?? []) values[param.name] = param.default;
+      return values;
+    },
+    [catalogue],
+  );
+
+  // Seed the parameter boxes from the chosen filter's own defaults, and re-seed
+  // them when the catalogue arrives (it is a request, so the first render has
+  // nothing to read). Never overwrites a value the operator has typed for the
+  // filter currently chosen — the effect is keyed on the filter, not on them.
+  useEffect(() => {
+    setParams(defaultsFor(filter));
+  }, [filter, defaultsFor]);
 
   // Default the range fields to a sensible window around the playhead the first
   // time the section is opened, so the buttons are usable without typing.
@@ -210,6 +251,86 @@ export function TrackEdits({ pointId }: { pointId: string }) {
           <p className="modal__hint">
             Deleting a bad span is often the whole repair: the solver carries those frames on the
             remaining points. Fill it when this point itself is needed.
+          </p>
+
+          {/* Smoothing *this* track's path (todo 1, tenth round). The Smoothing
+              tab's X/Y/Rotation/Scale are the camera motion solved from every
+              track at once and belong to none of them individually; this is the
+              other thing, and it is on the track's own card because that is the
+              only place the question "which path?" has an answer. Same filter
+              catalogue, same controls, built from the server's registry. */}
+          <span className="patch-panel__label">Smooth path</span>
+          <div className="field-row">
+            <select
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              title="Which filter to run over this track's x and y between the frames above"
+            >
+              {catalogue.map((entry) => (
+                <option key={entry.name} value={entry.name} title={entry.description}>
+                  {entry.display_name}
+                </option>
+              ))}
+            </select>
+            <button
+              disabled={!info}
+              title={
+                info
+                  ? `Smooth this track's path over frames ${rangeStart}–${rangeEnd}. Non-destructive: it lands in the list below and can be toggled off.`
+                  : "Waiting for the filter catalogue"
+              }
+              onClick={() =>
+                void applyCorrection(pointId, {
+                  kind: "smooth",
+                  start: rangeStart,
+                  end: rangeEnd,
+                  filter,
+                  params,
+                })
+              }
+            >
+              Smooth path
+            </button>
+            <button
+              disabled={!info}
+              title="Smooth the whole clip rather than the range above"
+              onClick={() =>
+                void applyCorrection(pointId, {
+                  kind: "smooth",
+                  start: 0,
+                  end: Math.max(project.video.frames - 1, 0),
+                  filter,
+                  params,
+                })
+              }
+            >
+              whole clip
+            </button>
+          </div>
+          {info && (
+            <div className="smoothing-channel__params">
+              {info.params.map((param) => (
+                <label key={param.name} className="param-input" title={param.description}>
+                  {param.name}
+                  {param.unit ? ` (${param.unit})` : ""}
+                  <input
+                    type="number"
+                    step={param.kind === "int" ? 1 : 0.1}
+                    min={param.minimum ?? undefined}
+                    max={param.maximum ?? undefined}
+                    value={params[param.name] ?? param.default}
+                    onChange={(e) =>
+                      setParams((prev) => ({ ...prev, [param.name]: Number(e.target.value) }))
+                    }
+                  />
+                </label>
+              ))}
+            </div>
+          )}
+          <p className="modal__hint">
+            Smooths this track's own trajectory, and nothing else — the frames outside the range
+            are untouched, gaps stay gaps, and the confidence is left alone. The edges of the
+            range are cross-faded so the path does not step where the smoothing stops.
           </p>
 
           {corrections.length === 0 ? (

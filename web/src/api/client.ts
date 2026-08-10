@@ -14,6 +14,7 @@ import type {
   PointSummary,
   ProjectDetail,
   ProjectMeta,
+  RenderQueueState,
   RenderSettings,
   SmoothedTracksResponse,
   SmoothingFilter,
@@ -172,6 +173,28 @@ export const updatePoint = (
   pointId: string,
   patch: { tracker?: string; enabled_for_solve?: boolean; color?: string },
 ): Promise<PointSummary> => patchJson(`/api/projects/${projectId}/points/${pointId}`, patch);
+
+/** Which frames a derived path covers when its sources do not agree. */
+export type DeriveSpan = "overlap" | "union";
+
+/**
+ * Create a new track from the per-frame mean of existing ones (todo 2, tenth round).
+ *
+ * On each frame the new path sits at the midpoint of the line joining the
+ * sources on *that* frame. `mode` is what a length mismatch means: `overlap`
+ * keeps only the frames every source covers, `union` keeps every frame any of
+ * them covers.
+ *
+ * The response is an ordinary point summary with two extra keys saying what it
+ * was made from — provenance the project file does not carry, so it is worth
+ * showing while it is in hand.
+ */
+export const derivePoint = (
+  projectId: string,
+  pointIds: string[],
+  mode: DeriveSpan = "overlap",
+): Promise<PointSummary & { derived_from: string[]; derived_frames: [number, number] }> =>
+  postJson(`/api/projects/${projectId}/points/derive`, { point_ids: pointIds, mode });
 
 export const deletePoint = (projectId: string, pointId: string): Promise<{ status: string }> =>
   request(`/api/projects/${projectId}/points/${pointId}`, { method: "DELETE" });
@@ -416,9 +439,13 @@ export function curvesExportUrl(projectId: string, format: "csv" | "json"): stri
 }
 
 /**
- * Queue a stabilized render. Omit `filename` (or send an empty one) and the
- * server names it for the time, so two exports are two files rather than one
- * overwriting the other.
+ * Render a stabilized video **now**. Omit `filename` (or send an empty one) and
+ * the server names it for the time, so two exports are two files rather than
+ * one overwriting the other.
+ *
+ * The panel uses `enqueueRender` instead (todo 6, tenth round): an export is
+ * minutes of work, and lining several up with different settings before any of
+ * them starts is the point of a queue. This is the one-off.
  */
 export const exportVideo = (
   projectId: string,
@@ -428,6 +455,53 @@ export const exportVideo = (
     ...opts,
     filename: opts.filename ? opts.filename : null,
   });
+
+// -- the render queue (todo 6, tenth round) ------------------------------------
+//
+// Five verbs over one stored list: add, read, reorder, drop, run. Each answers
+// with the whole queue, so the panel never has to reconcile a local copy with
+// what the server did — the same reasoning the target routes follow.
+
+export const getRenderQueue = (projectId: string): Promise<RenderQueueState> =>
+  request(`/api/projects/${projectId}/export/queue`);
+
+/**
+ * Capture the current export settings as a queued render, without starting it.
+ *
+ * Refuses exactly what an immediate render refuses — an unsolved project, a
+ * transparent border, a render that would not move the picture — so a bad entry
+ * is rejected while the settings that caused it are still on screen, rather
+ * than minutes later at the front of the queue.
+ */
+export const enqueueRender = (
+  projectId: string,
+  opts: { filename?: string | null; codec: string; crf: number },
+): Promise<RenderQueueState> =>
+  postJson(`/api/projects/${projectId}/export/queue`, {
+    ...opts,
+    filename: opts.filename ? opts.filename : null,
+  });
+
+/** Put the pending entries in this order. Entries already running do not move. */
+export const reorderRenderQueue = (
+  projectId: string,
+  ids: string[],
+): Promise<RenderQueueState> =>
+  putJson(`/api/projects/${projectId}/export/queue/order`, { ids });
+
+export const removeQueuedRender = (
+  projectId: string,
+  entryId: string,
+): Promise<RenderQueueState> =>
+  request(`/api/projects/${projectId}/export/queue/${encodeURIComponent(entryId)}`, {
+    method: "DELETE",
+  });
+
+/** Start working through the pending entries, one render at a time, in order. */
+export const runRenderQueue = (
+  projectId: string,
+): Promise<RenderQueueState & { started: boolean }> =>
+  postJson(`/api/projects/${projectId}/export/queue/run`);
 
 export const deleteRender = (projectId: string, filename: string): Promise<{ status: string }> =>
   request(`/api/projects/${projectId}/export/renders/${encodeURIComponent(filename)}`, {

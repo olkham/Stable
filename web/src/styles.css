@@ -1719,6 +1719,23 @@ button:disabled {
   white-space: nowrap;
 }
 
+/* What an entry is and how long it should take (todo 6, tenth round). Dim,
+   because it is the answer to a question you only ask about one row at a time —
+   the filename is what you scan the list by. */
+.export-queue__meta {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.export-queue__job--pending .export-queue__status {
+  color: var(--text-dim);
+}
+
+.export-queue__job--done .export-queue__status {
+  opacity: 0.7;
+}
+
 .export-queue__bar {
   flex-basis: 100%;
   height: 3px;
@@ -1731,6 +1748,60 @@ button:disabled {
   display: block;
   height: 100%;
   background: var(--accent);
+}
+
+/* -- a track derived from other tracks (todo 2, tenth round) ---------------- */
+
+.derive-track {
+  margin: 10px 0 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.derive-track__pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 6px 0;
+}
+
+/* What a composite is made of, shown where a tracked point shows its anchors. */
+.composite-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 4px 0;
+}
+
+.composite-sources__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  font-size: 0.78rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-alt);
+}
+
+.composite-sources__gone {
+  padding: 1px 7px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
+/* "composite" where a tracked point has its algorithm picker. */
+.points-list__composite {
+  padding: 1px 8px;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-alt);
 }
 
 /* -- per-track overlay toggles (todo 9) ------------------------------------- */

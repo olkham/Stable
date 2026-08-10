@@ -33,6 +33,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from ...core.corrections import corrections_anchored_at, ground_truth_anchors
+from ...core.derive import SPAN_MODES, covered_span, mean_track
 from ...core.errors import ProjectError, StableError
 from ...core.project import PointSpec, Project
 from ...core.types import Query
@@ -41,6 +42,7 @@ from .. import motion as motion_glue
 from ..jobs import JobManager, get_job_manager
 from ..schemas import (
     AnchorCreate,
+    DeriveTrackRequest,
     PointCreate,
     PointUpdate,
     TemplateOptionsUpdate,
@@ -130,6 +132,131 @@ def create_point(
     # known, and it is not a moment anybody is waiting on a thumbnail.
     warm_patches(workspace, project_id, point_id, [(body.frame, body.x, body.y)])
     return point_summary(project, project.point(point_id))
+
+
+@router.post("/derive")
+def derive_point(
+    project_id: str, body: DeriveTrackRequest, workspace: Workspace = Depends(_workspace)
+) -> dict[str, Any]:
+    """Create a new track from the per-frame mean of existing ones (todo 2, tenth round).
+
+    "Create path3 from path1 and path2, where p3 = mean(p1, p2)." On each frame
+    the new path sits at the midpoint of the straight line joining the sources on
+    *that* frame — the centroid, for more than two. See :mod:`stable.core.derive`,
+    including why this is not done by matching progress along each path (it
+    time-warps any source that covers fewer frames, so the result leads and lags
+    the very features it should sit between).
+
+    ``mode`` is what a length mismatch means: ``overlap`` keeps only the frames
+    every source covers, so every sample really is the mean of all of them;
+    ``union`` keeps every frame any of them covers.
+
+    Two things the request does not state, decided here because they are
+    questions about the project rather than about the arrays:
+
+    **Its tracker.** Meaningless for a path nobody tracked, but every point
+    carries one and a later re-track has to do something; it takes the first
+    contributor's, which is the closest thing to a true answer.
+
+    **Its anchor.** The new point gets one, at the first frame of its path — a
+    point with no anchor cannot be tracked, re-tracked or extended, and the
+    derived position there is a perfectly honest statement of where that path
+    starts.
+
+    Not an undo step: :mod:`stable.server.history` snapshots the *corrections*
+    layer, so adding a point is not something it can restore, and creating one
+    by clicking the frame is not recorded either. Removing a derived track is
+    the same ``×`` that removes any other, and :func:`delete_point` already
+    takes every file named for it.
+
+    Raises:
+        HTTPException: 400 if fewer than two distinct tracks were named, if one
+            of them has not been tracked, or if the chosen mode leaves no frames
+            at all; 404 if a named point does not exist.
+    """
+    project = workspace.load_project(project_id)
+
+    # Ordered, de-duplicated: naming the same track twice would weight it twice,
+    # which is a different operation from the one being asked for.
+    wanted: list[str] = []
+    for point_id in body.point_ids:
+        if point_id not in wanted:
+            wanted.append(point_id)
+    if len(wanted) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="deriving a track needs at least two different tracks to average",
+        )
+    if body.mode not in SPAN_MODES:  # pragma: no cover - the schema already narrows it
+        raise HTTPException(status_code=400, detail=f"mode must be one of {list(SPAN_MODES)}")
+
+    sources: list[PointSpec] = []
+    for point_id in wanted:
+        try:
+            sources.append(project.point(point_id))
+        except StableError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    tracks = []
+    for spec in sources:
+        track = load_display_track(project, spec)
+        if track is None or covered_span(track) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"point {spec.id!r} has no tracked frames to average",
+            )
+        tracks.append(track)
+
+    try:
+        derived = mean_track(tracks, body.mode)
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    span = covered_span(derived)
+    if span is None:
+        # Only reachable in `overlap`, and it is a fact about the tracks rather
+        # than a bug — so it names the way out instead of just refusing.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{' and '.join(wanted)} share no frames, so there is nothing to average. "
+                "Choose 'every frame any track covers' to average whichever are present."
+            ),
+        )
+    offset = span[0]
+    start = derived.position_at(offset)
+    assert start is not None  # noqa: S101 - `covered_span` just found this frame
+
+    tracks_dir = workspace.tracks_dir(project_id)
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+    point_id = project.new_point_id()
+    npz_path = tracks_dir / f"{point_id}.npz"
+    derived.save_npz(npz_path)
+
+    def _mutate(proj: Project) -> None:
+        proj.points.append(
+            PointSpec(
+                id=point_id,
+                queries=[Query(frame=offset, x=start[0], y=start[1])],
+                tracker=sources[0].tracker,
+                raw=proj.relative_path(str(npz_path)),
+                # What it is made of, and what makes it a *composite* rather
+                # than a track: the panel drops the tracker, the window sizes,
+                # the anchors and the run buttons for one of these, and lists
+                # these ids instead.
+                derived_from=wanted,
+            )
+        )
+
+    try:
+        project = workspace.update_project(project_id, _mutate)
+    except StableError as exc:
+        npz_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # `derived_from` rides along on every point summary; the frames it covers is
+    # this call's own news, since it depends on the mode that was just chosen.
+    return {**point_summary(project, project.point(point_id)), "derived_frames": [span[0], span[1]]}
 
 
 @router.patch("/{point_id}")

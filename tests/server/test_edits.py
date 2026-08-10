@@ -46,9 +46,7 @@ def track_of(client: TestClient, project_id: str, point_id: str) -> dict:
 
 def add(client: TestClient, project_id: str, point_id: str, body: dict) -> dict:
     """POST one correction and assert it was accepted."""
-    response = client.post(
-        f"/api/projects/{project_id}/points/{point_id}/corrections", json=body
-    )
+    response = client.post(f"/api/projects/{project_id}/points/{point_id}/corrections", json=body)
     assert response.status_code == 200, response.text
     return dict(response.json())
 
@@ -267,9 +265,12 @@ def test_a_failed_edit_leaves_no_undo_point_behind(client, edited_project):
     add(client, project_id, point_id, {"kind": "replace", "frame": 2, "x": 1.0, "y": 1.0})
     depth = client.get(f"/api/projects/{project_id}/edits/history").json()["undo_depth"]
 
-    assert client.delete(
-        f"/api/projects/{project_id}/points/{point_id}/corrections/missing"
-    ).status_code == 400
+    assert (
+        client.delete(
+            f"/api/projects/{project_id}/points/{point_id}/corrections/missing"
+        ).status_code
+        == 400
+    )
     assert client.get(f"/api/projects/{project_id}/edits/history").json()["undo_depth"] == depth
 
 
@@ -329,3 +330,144 @@ def test_retrack_validates_its_frame_and_point(client, edited_project):
     job = wait_job(client, project_id, submitted.json()["job_id"], timeout=60)
     assert job["status"] == "error"
     assert "outside the clip" in job["error"]
+
+
+# -- smoothing one track's own path (todo 1, tenth round) -------------------------
+#
+# The Smoothing tab's four channels are the camera motion solved from every
+# track at once. This is the other thing, and it arrives over the same endpoint
+# every other edit does: the body *is* the correction's project-file form, so
+# there was no new route to add.
+
+
+def jittery_track(n_frames: int, *, seed: int = 3) -> PointTrack:
+    """A drifting point with pixel noise on it — something worth smoothing."""
+    rng = np.random.default_rng(seed)
+    clean = diagonal_track(n_frames)
+    return PointTrack(
+        points=(np.asarray(clean.points) + rng.normal(0.0, 1.5, size=(n_frames, 2))).astype(
+            np.float32
+        ),
+        confidence=clean.confidence,
+        visible=clean.visible,
+    )
+
+
+def steps(values: list[float | None], start: int, end: int) -> float:
+    """Frame-to-frame movement over a span — the jitter a smooth removes."""
+    span = np.asarray(values[start : end + 1], dtype=np.float64)
+    return float(np.std(np.diff(span)))
+
+
+@pytest.fixture
+def jittery_project(client: TestClient, workspace, tiny_clip):
+    """A project with one seeded, *noisy* tracked point."""
+    path, source = tiny_clip
+    detail = upload_clip(client, path)
+    project_id = detail["id"]
+    wait_job(client, project_id, detail["proxy_job_id"], timeout=60)
+    point_id = seed_tracks(workspace, project_id, [jittery_track(source.frame_count)])[0]
+    return project_id, point_id, source.frame_count
+
+
+def test_smoothing_a_track_lands_as_a_correction_on_that_track(client, jittery_project):
+    project_id, point_id, n_frames = jittery_project
+    before = track_of(client, project_id, point_id)
+
+    created = add(
+        client,
+        project_id,
+        point_id,
+        {
+            "kind": "smooth",
+            "start": 0,
+            "end": n_frames - 1,
+            "filter": "gaussian",
+            "params": {"sigma": 5.0},
+        },
+    )
+    assert [c["kind"] for c in created["corrections"]] == ["smooth"]
+    # No companion anchor: a smooth moves the path, it does not state where the
+    # feature is on any frame.
+    assert created["corrections"][0]["params"] == {"sigma": 5.0}
+
+    after = track_of(client, project_id, point_id)
+    assert after["anchors"] == before["anchors"]
+    assert steps(after["y"], 0, n_frames - 1) < steps(before["y"], 0, n_frames - 1) / 2
+
+
+def test_a_smoothed_range_leaves_the_rest_of_the_track_alone(client, jittery_project):
+    project_id, point_id, n_frames = jittery_project
+    before = track_of(client, project_id, point_id)
+    middle = n_frames // 2
+
+    add(
+        client,
+        project_id,
+        point_id,
+        {
+            "kind": "smooth",
+            "start": middle,
+            "end": n_frames - 1,
+            "filter": "gaussian",
+            "params": {"sigma": 4.0},
+            "blend": 0,
+        },
+    )
+    after = track_of(client, project_id, point_id)
+    assert after["x"][:middle] == pytest.approx(before["x"][:middle], abs=1e-4)
+    assert after["x"][middle:] != pytest.approx(before["x"][middle:], abs=1e-4)
+
+
+def test_a_smooth_can_be_toggled_off_and_undone_like_any_other_edit(client, jittery_project):
+    project_id, point_id, n_frames = jittery_project
+    before = track_of(client, project_id, point_id)
+    created = add(
+        client,
+        project_id,
+        point_id,
+        {"kind": "smooth", "start": 0, "end": n_frames - 1, "params": {"sigma": 6.0}},
+    )
+    correction_id = created["corrections"][0]["id"]
+
+    client.patch(
+        f"/api/projects/{project_id}/points/{point_id}/corrections/{correction_id}",
+        json={"enabled": False},
+    )
+    assert track_of(client, project_id, point_id)["x"] == pytest.approx(before["x"], abs=1e-4)
+
+    client.patch(
+        f"/api/projects/{project_id}/points/{point_id}/corrections/{correction_id}",
+        json={"enabled": True},
+    )
+    assert track_of(client, project_id, point_id)["x"] != pytest.approx(before["x"], abs=1e-4)
+
+    # Three edits were made — the smooth and the two toggles — and each one is
+    # its own undo step, exactly like every other correction.
+    for _ in range(3):
+        assert client.post(f"/api/projects/{project_id}/edits/undo").status_code == 200
+    restored = track_of(client, project_id, point_id)
+    assert restored["corrections"] == []
+    assert restored["x"] == pytest.approx(before["x"], abs=1e-4)
+
+
+def test_a_smooth_naming_an_unknown_filter_is_refused(client, jittery_project):
+    project_id, point_id, n_frames = jittery_project
+    response = client.post(
+        f"/api/projects/{project_id}/points/{point_id}/corrections",
+        json={"kind": "smooth", "start": 0, "end": n_frames - 1, "filter": "polish"},
+    )
+    # Stored happily (the schema is the dataclass's), but the track it produces
+    # cannot be built — and a track that cannot be built must not disappear.
+    assert response.status_code == 200
+    assert track_of(client, project_id, point_id)["x"][0] is not None
+
+
+def test_an_inverted_smooth_range_is_refused_by_the_dataclass(client, jittery_project):
+    project_id, point_id, _n = jittery_project
+    response = client.post(
+        f"/api/projects/{project_id}/points/{point_id}/corrections",
+        json={"kind": "smooth", "start": 30, "end": 10},
+    )
+    assert response.status_code == 400
+    assert "end < start" in response.json()["detail"]

@@ -12,6 +12,7 @@ import * as api from "../api/client";
 import { pointColor } from "../colors";
 import { useJobsSocket } from "../hooks/useJobsSocket";
 import { useLiveTracking, type LiveTracking } from "../hooks/useLiveTracking";
+import { defaultPlaybackRate } from "../playback";
 import type {
   ClipRangeInfo,
   Correction,
@@ -135,7 +136,14 @@ interface ProjectContextValue {
 
   jobs: Record<string, JobEvent>;
   latestJobFor: (kind: string, target?: string | null) => JobEvent | undefined;
-  /** Drop a job that has not started yet — the export queue's cancel (todo 8). */
+  /**
+   * Drop a job that has not started yet.
+   *
+   * This was the export queue's cancel (todo 8, fourth round). Exports no
+   * longer reach the job table until the render queue starts them (todo 6,
+   * tenth round), so removing one from the queue is `removeQueued` on the
+   * export context and this is now what cancels any *other* queued job.
+   */
   cancelJob: (jobId: string) => Promise<void>;
   /** In-flight track/retrack runs, by point id — their live cursor and partial path. */
   liveTracking: Record<string, LiveTracking>;
@@ -144,7 +152,15 @@ interface ProjectContextValue {
   setCurrentFrame: (frame: number) => void;
   isPlaying: boolean;
   setIsPlaying: (playing: boolean) => void;
-  /** Playback speed as a multiple of the clip's own frame rate (todo 3). */
+  /**
+   * Playback speed as a multiple of the clip's own frame rate (todo 3).
+   *
+   * Opens at whatever plays the clip nearest 30 fps rather than always at 1x
+   * (todo 5, tenth round): a 120 fps clip at 1x runs four times faster than the
+   * shot did, which is not a speed anything can be judged at. See
+   * `defaultPlaybackRate`. Changed by hand it stays changed — the default is
+   * re-decided only when the clip does.
+   */
   playbackRate: number;
   setPlaybackRate: (rate: number) => void;
   /**
@@ -357,6 +373,11 @@ export function ProjectProvider({
   const [playbackRate, setPlaybackRate] = useState(1);
   const [playRangeOnly, setPlayRangeOnly] = useState(false);
   const [clipRange, setClipRange] = useState<ClipRangeInfo | null>(null);
+  // Read rather than depended on: `setRangeMarker` needs to know whether a
+  // range was already in force *before* its own write, and rebuilding that
+  // callback on every marker move would rebuild the keyboard handler with it.
+  const clipRangeRef = useRef<ClipRangeInfo | null>(null);
+  clipRangeRef.current = clipRange;
   const [followTracker, setFollowTracker] = useState(true);
   // Set by the follow-the-tracker effect so the setter below can tell its own
   // scrubbing from the operator's (see `setCurrentFrame`).
@@ -579,7 +600,16 @@ export function ProjectProvider({
     async (marker: "in" | "out", frame: number) => {
       setEditError(null);
       try {
-        setClipRange(await api.updateClipRange(projectId, { [marker]: frame }));
+        const previous = clipRangeRef.current;
+        const next = await api.updateClipRange(projectId, { [marker]: frame });
+        setClipRange(next);
+        // Marking a range means wanting to watch it (todo 3, tenth round).
+        // Only on the transition into having one, though: switching it back on
+        // every time a marker moves would override a deliberate un-tick while
+        // the range is in force, which is worse than not helping at all.
+        if ((previous === null || previous.whole_clip) && !next.whole_clip) {
+          setPlayRangeOnly(true);
+        }
       } catch (err) {
         setEditError(err instanceof Error ? err.message : String(err));
       }
@@ -591,10 +621,23 @@ export function ProjectProvider({
     setEditError(null);
     try {
       setClipRange(await api.updateClipRange(projectId, { in: null, out: null }));
+      // There is no range left to limit playback to, and the checkbox that says
+      // so is about to be disabled — leaving it ticked would claim otherwise.
+      setPlayRangeOnly(false);
     } catch (err) {
       setEditError(err instanceof Error ? err.message : String(err));
     }
   }, [projectId]);
+
+  // Open at a review speed, not at the capture speed (todo 5, tenth round).
+  // Keyed on the clip's frame rate, so it is decided once the clip is known and
+  // re-decided only when a different clip arrives — which is exactly when the
+  // previous answer stopped applying. Nothing else moves these dependencies, so
+  // a rate the operator picks afterwards is never overwritten.
+  const clipFps = project?.video.fps ?? 0;
+  useEffect(() => {
+    if (clipFps > 0) setPlaybackRate(defaultPlaybackRate(clipFps));
+  }, [projectId, clipFps]);
 
   const goToMarker = useCallback(
     (marker: "in" | "out") => {

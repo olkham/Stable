@@ -65,6 +65,18 @@ export interface PointSummary {
    * through `colorFor` in the project context, never directly.
    */
   color: string | null;
+  /**
+   * The tracks this one's path was averaged from — empty for a tracked point.
+   *
+   * A **composite** is not a tracked track: nothing chose a tracker for it, no
+   * window was matched, no run produced it, and its single anchor is a
+   * formality. So the card drops the tracker picker, the pattern/search sizes,
+   * the anchors and the run buttons, and lists these instead (todo 2, tenth
+   * round, second pass). An id here whose point has since been deleted is
+   * history rather than a dangling reference — the path baked from it did not
+   * change — so it is drawn as plain text.
+   */
+  derived_from: string[];
   window: PointWindow;
   has_track: boolean;
   tracked_frames: number;
@@ -185,7 +197,13 @@ export interface TrackData {
 
 // -- the corrections layer (stable/core/corrections.py) -----------------------
 
-export type CorrectionKind = "offset" | "replace" | "gap_fill" | "delete_range" | "retrack";
+export type CorrectionKind =
+  | "offset"
+  | "replace"
+  | "gap_fill"
+  | "delete_range"
+  | "retrack"
+  | "smooth";
 
 /**
  * One manual edit. The wire form *is* the project-file form, so these fields
@@ -211,6 +229,17 @@ export interface Correction {
   direction?: "fwd" | "bwd" | "bidir";
   tracker?: string | null;
   source?: string | null;
+  /**
+   * `smooth` only: the filter run over this track's own path, and its settings.
+   *
+   * The name is a key of the same `GET /api/filters` catalogue the Smoothing
+   * panel builds its controls from — those four channels are the camera motion
+   * solved from every track at once, this is one track's trajectory (todo 1,
+   * tenth round). `blend` is the cross-fade at each edge of `[start, end]`.
+   */
+  filter?: string;
+  params?: Record<string, number>;
+  blend?: number;
 }
 
 /** What the undo/redo buttons render from (stable/server/history.py). */
@@ -329,6 +358,56 @@ export interface PointPatches {
   patches: PointPatch[];
   /** The frame being viewed, when the point has a position there. */
   current: PointPatch | null;
+}
+
+// -- the render queue (stable/server/render_queue.py) --------------------------
+
+/**
+ * One render waiting to be asked for (todo 6, tenth round).
+ *
+ * Queueing an export no longer starts it: the entry stores everything the
+ * render depends on — the options, the border policy, the smoothing filters,
+ * the encode settings and the frame range — so several can be lined up with
+ * different settings and each renders *its own*, not whatever was saved last.
+ * It sits in a sidecar rather than in this tab, so reloading the page does not
+ * lose the queue.
+ */
+export interface RenderQueueEntry {
+  id: string;
+  filename: string;
+  codec: string;
+  crf: number;
+  border: string;
+  frame_range: [number, number];
+  frames: number;
+  width: number;
+  height: number;
+  /** `pending` until the runner starts it; then whatever its job reports. */
+  status: "pending" | "queued" | "running" | "done" | "error" | "cancelled";
+  /** The job rendering it, once one has been submitted — null while pending. */
+  job_id: string | null;
+  created_at: number;
+  error: string | null;
+  estimate_seconds: number;
+  /**
+   * Whether the estimate came from a render measured on this machine.
+   *
+   * False means it came from the server's seed constant, which the panel shows
+   * as "rough": an estimate that says where it came from is useful, and an
+   * unlabelled guess is not.
+   */
+  estimate_measured: boolean;
+}
+
+export interface RenderQueueState {
+  entries: RenderQueueEntry[];
+  /** How many are still waiting — what "Process render queue (N)" counts. */
+  pending: number;
+  /** The total for the pending entries only. */
+  estimate_seconds: number;
+  estimate_measured: boolean;
+  /** Whether a runner is already working through the queue. */
+  running: boolean;
 }
 
 export type JobStatus = "queued" | "running" | "done" | "error" | "cancelled";

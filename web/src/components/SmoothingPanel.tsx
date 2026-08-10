@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import * as api from "../api/client";
+import { useCallback, useMemo } from "react";
 import { CHANNEL_COLOR, CHANNEL_LABEL } from "../colors";
+import { useFilterCatalogue } from "../hooks/useFilterCatalogue";
 import { isActive, joinSpecs, splitSpecs, type SmoothingModel } from "../smoothing";
 import { useProjectContext } from "../state/ProjectContext";
-import type { Channel, FilterInfo } from "../types";
+import type { Channel } from "../types";
 import { CHANNELS } from "../types";
 
 /**
@@ -23,19 +23,22 @@ import { CHANNELS } from "../types";
  * curve editor, so a change made in one was invisible to the other until it
  * remounted — "the curves view doesn't get updates until you close and reopen
  * it". Both now read and write the same copy.
+ *
+ * **What these four channels are** (todo 1, tenth round). They are the *camera*
+ * motion the solver recovered from every solve-enabled track at once — they
+ * belong to no single track, which is why "which track path does this apply
+ * to?" had no answer here. It applies to all of them and to none of them. The
+ * other thing, one track's own trajectory smoothed on its own, is a `smooth`
+ * correction on that track's card; the note below says so, because a panel that
+ * silently means something other than what the operator assumed is worse than
+ * one that is missing a feature.
  */
 export function SmoothingPanel() {
-  const { currentFrame, setCurrentFrame, smoothing, smoothingError, commitSmoothing } =
+  const { project, currentFrame, setCurrentFrame, smoothing, smoothingError, commitSmoothing } =
     useProjectContext();
 
-  const [catalogue, setCatalogue] = useState<FilterInfo[]>([]);
-
-  useEffect(() => {
-    api
-      .getFilters()
-      .then(setCatalogue)
-      .catch(() => setCatalogue([]));
-  }, []);
+  const catalogue = useFilterCatalogue();
+  const solving = project.points.filter((point) => point.enabled_for_solve && point.has_track);
 
   const raw = smoothing?.curves.raw ?? null;
   const smoothed = smoothing?.curves.smoothed ?? null;
@@ -87,6 +90,18 @@ export function SmoothingPanel() {
         <h3>Smoothing</h3>
       </div>
       {error && <div className="error-text">{error}</div>}
+      {/* Which paths this is about, said before the first control rather than
+          left to be inferred from four unlabelled axes (todo 1, tenth round). */}
+      <p className="modal__hint">
+        These four are the <strong>camera</strong> motion the solve recovered from{" "}
+        {solving.length === 0
+          ? "the solve-enabled tracks"
+          : solving.length === 1
+            ? `one track (${solving[0].id})`
+            : `${solving.length} tracks together (${solving.map((p) => p.id).join(", ")})`}
+        — not any one track's path. To smooth a single track's own trajectory, open its card on
+        the Tracks tab and use <em>Edits → Smooth path</em>.
+      </p>
       {!raw && <p className="panel__empty">Run solve first to preview smoothing.</p>}
 
       {CHANNELS.map((channel) => {

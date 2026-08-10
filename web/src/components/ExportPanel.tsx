@@ -3,7 +3,6 @@ import * as api from "../api/client";
 import { applyWarp, useExportContext } from "../state/ExportContext";
 import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
-import type { JobEvent } from "../types";
 
 const CODECS = ["h264", "h265", "vp9"];
 
@@ -207,6 +206,21 @@ function humanBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
+/**
+ * A render estimate, in the units the number deserves.
+ *
+ * Rounded hard on purpose: this is a projection from an average of past
+ * renders, and "7m" claims exactly as much as it can support where "6m 52s"
+ * would claim a precision the estimate does not have.
+ */
+function humanDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds < 60) return `${Math.max(1, Math.round(seconds))}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
 function toHex(rgb: number[]): string {
   return `#${rgb
     .map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0"))
@@ -244,7 +258,6 @@ export function ExportPanel() {
     clipRange,
     currentFrame,
     jobs,
-    cancelJob,
     tracks,
     loadTrack,
     colorFor,
@@ -261,6 +274,8 @@ export function ExportPanel() {
     setShowGuides,
     sideBySide,
     setSideBySide,
+    cleanOutput,
+    setCleanOutput,
     snap,
     setSnap,
     selected,
@@ -273,6 +288,12 @@ export function ExportPanel() {
     reloadPreview,
     renders,
     deleteRender,
+    queue,
+    enqueueRender,
+    moveQueued,
+    removeQueued,
+    clearFinishedQueued,
+    runQueue,
   } = useExportContext();
   const { setWantOutput, setWantGeometry, streaming } = useFrameStream();
 
@@ -378,14 +399,14 @@ export function ExportPanel() {
     setCropDraft(undefined);
   }
 
-  // Every export ever submitted for this project, newest first (todo 8).
-  const queue = useMemo(
-    () =>
-      Object.values(jobs)
-        .filter((job: JobEvent) => job.kind === "export")
-        .sort((a, b) => b.updated_at - a.updated_at),
-    [jobs],
-  );
+  // The render queue, in the order it will render (todo 6, tenth round). The
+  // server's list, not a view of the job table: an entry exists before any
+  // worker has it, which is what makes it something to look at and move.
+  const entries = queue?.entries ?? [];
+  const pending = queue?.pending ?? 0;
+  const finished = entries.filter((entry) =>
+    ["done", "error", "cancelled"].includes(entry.status),
+  ).length;
 
   async function handleBorderChange(next: string) {
     setSubmitError(null);
@@ -398,11 +419,19 @@ export function ExportPanel() {
     }
   }
 
+  /**
+   * Capture the settings above as a queued render — and *only* that.
+   *
+   * It used to submit the render there and then, which is what todo 6 of this
+   * round is about: an export is minutes of work, and "queue up many different
+   * runs, then process them" needs the queueing and the starting to be two
+   * decisions. The button below the list is the other one.
+   */
   async function handleExport() {
     setSubmitError(null);
     try {
       await api.updateRenderSettings(project.id, { codec, crf });
-      await api.exportVideo(project.id, { filename, codec, crf });
+      setSubmitError(await enqueueRender({ filename, codec, crf }));
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : String(err));
     }
@@ -527,6 +556,23 @@ export function ExportPanel() {
         />
         Side-by-side output
       </label>
+      {/* The left canvas has had a master overlay switch since the tools
+          landed; the output beside it never did, so the one canvas showing
+          what will actually be delivered could not be looked at on its own
+          (todo 4, tenth round). */}
+      {sideBySide && (
+        <label
+          className="channel-check"
+          title="Draw the output frame with nothing over it — no thirds, no crosshairs, no label — so you can judge the delivered picture. Crosshairs cannot be dragged on that canvas while this is on; the canvas on the left still has them."
+        >
+          <input
+            type="checkbox"
+            checked={cleanOutput}
+            onChange={(e) => setCleanOutput(e.target.checked)}
+          />
+          Clean output (hide its overlays)
+        </label>
+      )}
       {!streaming && (
         <p className="export-screen__hint">
           The frame socket is not connected, so frames and the preview are coming over plain
@@ -1033,7 +1079,7 @@ export function ExportPanel() {
         onClick={handleExport}
         disabled={border === "transparent"}
       >
-        Add to export queue
+        Add to render queue
       </button>
       {border === "transparent" && (
         <p className="export-screen__hint">
@@ -1043,38 +1089,120 @@ export function ExportPanel() {
       )}
       {submitError && <p className="export-screen__warning">{submitError}</p>}
 
-      {/* The queue (todo 8). Each job carries the settings it was submitted
-          with, so several can be lined up with different crops and each renders
-          the one it was queued with; they run one at a time, because two FFmpeg
-          encodes fight over the same cores to nobody's benefit. */}
-      <div className="panel-section">
-        <h4>Queue</h4>
-        <span className="panel-section__note">Exports waiting and running</span>
+      {/* The render queue (todo 6, tenth round). Queueing no longer starts
+          anything: each entry stores the whole configuration it was queued with
+          — options, border, smoothing, codec, range — so several runs can be
+          lined up with different settings, looked at, reordered and dropped
+          before any of them costs a minute of encoding. */}
+      <div className="panel-section panel-section--counted">
+        <h4>Render queue</h4>
+        <span className="export-screen__count">
+          {entries.length === 0
+            ? "empty"
+            : `${pending} waiting${
+                pending > 0 ? ` · ${humanDuration(queue?.estimate_seconds ?? 0)}` : ""
+              }${pending > 0 && !(queue?.estimate_measured ?? false) ? " (rough)" : ""}`}
+        </span>
       </div>
-      {queue.length === 0 ? (
-        <p className="export-screen__hint">Nothing queued. Exports run in the background.</p>
+      {entries.length === 0 ? (
+        <p className="export-screen__hint">
+          Nothing queued. "Add to render queue" captures the settings above as an entry — it does
+          not start rendering, so you can queue several different runs and process them together.
+        </p>
       ) : (
         <ul className="export-queue">
-          {queue.map((job) => (
-            <li key={job.id} className={`export-queue__job export-queue__job--${job.status}`}>
-              <span className="export-queue__status">{job.status}</span>
-              <span className="export-queue__name">
-                {job.result?.filename ?? job.message ?? "queued"}
-              </span>
-              {job.status === "running" && (
-                <span className="export-queue__bar">
-                  <span style={{ width: `${Math.round(job.fraction * 100)}%` }} />
+          {entries.map((entry, index) => {
+            // The live progress of the job rendering it, matched by the id the
+            // entry recorded — so one list shows both what is waiting and how
+            // far the running one has got, rather than two lists to reconcile.
+            const job = entry.job_id ? jobs[entry.job_id] : undefined;
+            const waiting = entry.status === "pending";
+            return (
+              <li
+                key={entry.id}
+                className={`export-queue__job export-queue__job--${entry.status}`}
+              >
+                <span className="export-queue__status">{entry.status}</span>
+                <span className="export-queue__name" title={`${entry.filename} · ${entry.codec} CRF ${entry.crf} · frames ${entry.frame_range[0]}–${entry.frame_range[1] - 1}`}>
+                  {entry.filename}
                 </span>
-              )}
-              {job.status === "queued" && (
-                <button onClick={() => void cancelJob(job.id)} title="Remove from the queue">
-                  cancel
+                <span className="export-queue__meta">
+                  {entry.width}×{entry.height} · {entry.frames}f · {entry.codec}
+                </span>
+                <span
+                  className="export-queue__meta"
+                  title={
+                    entry.estimate_measured
+                      ? "Estimated from renders already finished on this machine"
+                      : "A rough estimate — it sharpens once a render has finished here"
+                  }
+                >
+                  ~{humanDuration(entry.estimate_seconds)}
+                  {entry.estimate_measured ? "" : "?"}
+                </span>
+                {/* Reordering and dropping are for entries nothing has started
+                    yet. One already handed to a worker has a job and soon a
+                    file, and offering to shuffle it would be a promise the
+                    server does not keep. */}
+                <button
+                  disabled={!waiting || index === 0}
+                  title="Render this one earlier"
+                  onClick={() => void moveQueued(entry.id, -1)}
+                >
+                  ▲
                 </button>
-              )}
-              {job.error && <span className="export-screen__warning">{job.error}</span>}
-            </li>
-          ))}
+                <button
+                  disabled={!waiting || index === entries.length - 1}
+                  title="Render this one later"
+                  onClick={() => void moveQueued(entry.id, 1)}
+                >
+                  ▼
+                </button>
+                <button
+                  className="target-list__remove"
+                  title={
+                    waiting
+                      ? "Remove this from the queue"
+                      : "Dismiss this entry. A render already running carries on — an encode cannot be safely abandoned part-way through its file."
+                  }
+                  onClick={() => void removeQueued(entry.id)}
+                >
+                  ×
+                </button>
+                {job && job.status === "running" && (
+                  <span className="export-queue__bar">
+                    <span style={{ width: `${Math.round(job.fraction * 100)}%` }} />
+                  </span>
+                )}
+                {entry.error && <span className="export-screen__warning">{entry.error}</span>}
+              </li>
+            );
+          })}
         </ul>
+      )}
+      {finished > 0 && (
+        <button
+          onClick={() => void clearFinishedQueued()}
+          title="Dismiss the entries that have stopped being work. The files they produced stay under Renders below."
+        >
+          Clear {finished} finished
+        </button>
+      )}
+      {entries.length > 0 && (
+        <button
+          className="export-screen__go"
+          disabled={pending === 0}
+          title={
+            pending === 0
+              ? "Nothing is waiting to be rendered"
+              : `Render the ${pending} waiting ${pending === 1 ? "entry" : "entries"} in order, one at a time`
+          }
+          onClick={() => void runQueue()}
+        >
+          {queue?.running
+            ? `Processing… (${pending} left)`
+            : `Process render queue (${pending})`}
+        </button>
       )}
 
       <div className="panel-section">

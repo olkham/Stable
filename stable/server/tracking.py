@@ -482,6 +482,12 @@ def run_point_tracking(
         spec.raw = p.relative_path(str(npz_path))
         if tracker:
             spec.tracker = tracker
+        # A composite that has just been tracked is not a composite any more:
+        # its path is this run's, not the average of anything. The UI hides the
+        # button that gets here for one, but the API is open and a point whose
+        # `derived_from` outlived the path it described would be a lie the
+        # panel would then draw.
+        spec.derived_from = []
 
     workspace.update_project(project_id, _mutate)
 
@@ -809,7 +815,15 @@ def load_display_track(project: Project, point: PointSpec) -> PointTrack | None:
     if raw is None:
         return None
     try:
-        return apply_corrections(raw, point.corrections, resolve_retrack=retrack_resolver(project))
+        return apply_corrections(
+            raw,
+            point.corrections,
+            resolve_retrack=retrack_resolver(project),
+            # A per-track smoothing correction can be cut by frequency, and only
+            # the clip knows how many frames a second is. Everything else in the
+            # correction layer is in frames and ignores this.
+            fps=project.video.fps,
+        )
     except StableError:
         # A correction this build cannot apply must not hide the track itself.
         return raw

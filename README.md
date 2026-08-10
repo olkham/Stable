@@ -220,6 +220,8 @@ trackers' model code) — the frontend is already built into the package
 | `stable.render.stabilize` | Planning a render, streaming it to a file or PNG sequence |
 | `stable.server.tracker_options` | Per-point pattern/search sizes: which arguments a plugin lets the operator set, in what units |
 | `stable.server.clip_range` | The In/Out markers, bounding both tracking and export |
+| `stable.core.derive` | A track built from other tracks: their per-frame midpoint, on the clip's own clock |
+| `stable.server.render_queue` | Renders that wait to be asked for: the stored queue, its order and its estimates |
 | `stable.trackers.frames` | The bounded per-run cache of colour-converted frames |
 | `stable.trackers.features` | SIFT / ORB feature matching — survives an occlusion instead of drifting through it |
 | `stable.trackers.sam3` | SAM 3 (Meta): segments the object and rides the point on it |

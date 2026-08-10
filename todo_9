@@ -1,0 +1,9 @@
+[feature] ability to smooth individual tracks. We just have X,Y,Rotation,Scale in the smoothing menu. But it's not clear which track path this applies to.
+
+[feature] ability to create a new track from previous tracks. i.e. create path3 from path1 and path2, where p3 = mean(p1,p2). In the case where p1 and p2 are different lengths mean the coordinates at normalised percentage progress through each path. e.g. p3.length = max(p1.length, p2.length) or p3.length = min(p1.length, p2.length) - an optional configuartion for the user to select and p3[0.25] = mean(p1[0.25],[p2[0.25]) where [0.25] representes the point at 25% along each path, thus solving any issue with mismatch lenths when averaging positions.
+
+[improvement] when a range is set with in/out auto enable 'play range'
+[feature] add a toggle to show/hide all the UI elements (markers, gridlines etc.) on the output preview canvas so users can see the clean frame
+[improvement] default the playback speed scaling to be ~30fps. i.e. if the source video is 120fps, then auto set the rate to 0.25x
+[feature] when a render is queued don't auto render it, create a processing queue list so the user can queue up many diffrent runs, then add a button to "Process Render Queue" or "Render Queue" or something to that effect. Let the user delete items from the queue, re-order them, and see the estimated time for each render in the queue.
+

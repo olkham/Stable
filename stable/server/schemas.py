@@ -18,12 +18,14 @@ __all__ = [
     "PointCreate",
     "AnchorCreate",
     "PointUpdate",
+    "DeriveTrackRequest",
     "TrackRequest",
     "SolveSettingsUpdate",
     "SmoothingFilterIn",
     "SmoothingUpdate",
     "RenderSettingsUpdate",
     "ExportVideoRequest",
+    "RenderQueueOrder",
     "ClipRangeUpdate",
     "ProjectRenameRequest",
     "CorrectionIn",
@@ -89,6 +91,20 @@ class PointUpdate(BaseModel):
     color: str | None = None
 
 
+class DeriveTrackRequest(BaseModel):
+    """Body for ``POST /api/projects/{id}/points/derive`` (todo 2, tenth round).
+
+    The mean is always taken frame by frame — on frame ``f`` the derived path
+    sits at the midpoint of the sources' positions on frame ``f``. ``mode`` is
+    what a length mismatch means: ``overlap`` keeps only the frames every source
+    covers, ``union`` keeps every frame any of them covers. See
+    :mod:`stable.core.derive`.
+    """
+
+    point_ids: list[str] = Field(min_length=1)
+    mode: Literal["overlap", "union"] = "overlap"
+
+
 class TrackRequest(BaseModel):
     """Body for ``POST /api/projects/{id}/points/{point_id}/track``.
 
@@ -146,6 +162,18 @@ class ExportVideoRequest(BaseModel):
     filename: str | None = None
     codec: str = "h264"
     crf: int = 18
+
+
+class RenderQueueOrder(BaseModel):
+    """Body for ``PUT /api/projects/{id}/export/queue/order`` (todo 6, tenth round).
+
+    The pending entries' ids, in the order they should render. Sent whole rather
+    than as a move-this-one instruction: it is one arrangement the operator made
+    in one list, and merging halves of two arrangements would produce a third
+    nobody asked for — the same reasoning the target list follows.
+    """
+
+    ids: list[str] = Field(default_factory=list)
 
 
 class ClipRangeUpdate(BaseModel):

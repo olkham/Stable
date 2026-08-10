@@ -4,6 +4,7 @@ import { confidenceColor } from "../colors";
 import type { TracksPanel as PanelVariant } from "../flags";
 import { useProjectContext } from "../state/ProjectContext";
 import type { PointSummary, Query, TrackData, TrackerInfo } from "../types";
+import { CompositeSources, DeriveTrackPanel } from "./DeriveTrack";
 import { JobProgress } from "./JobProgress";
 import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
@@ -112,6 +113,10 @@ export function TrackTimelinePanel({
         ))}
       </ul>
 
+      {/* A track made from the ones above (todo 2, tenth round) — the same
+          component the classic panel uses, so both variants offer it. */}
+      <DeriveTrackPanel />
+
       {error && (
         <p className="panel__empty error-text" onClick={() => setError(null)}>
           {error}
@@ -123,6 +128,15 @@ export function TrackTimelinePanel({
 
 /** How far a run started from this panel should reach (todos 12 and 20). */
 type RunLimit = "anchor" | "clip" | "frames";
+
+/**
+ * A stable empty list, for the strip of a track with no anchors to draw.
+ *
+ * A fresh `[]` each render would change identity every time and redraw every
+ * composite's strip on every render of anything — the same reason `anchors`
+ * below is memoised.
+ */
+const EMPTY_ANCHORS: Query[] = [];
 
 function boundsFor(limit: RunLimit, frames: number): api.RunBounds {
   if (limit === "anchor") return { stop_at_anchor: true };
@@ -225,6 +239,9 @@ function TrackRow({
       : (anchors.find((a) => a.frame === currentFrame)?.frame ?? null);
   const subjectFrame = anchorFrame ?? currentFrame;
   const status = statusOf(point, gaps.length, flagged.size);
+  // A track averaged from other tracks. Not a tracker's output, so most of this
+  // card is about something that did not happen to it.
+  const composite = point.derived_from.length > 0;
   // Whether a run can start here at all: the tracker needs a position to track
   // from, which is an anchor on this frame or a tracked sample there.
   const runnable = anchorFrame !== null || (track?.x[currentFrame] ?? null) !== null;
@@ -282,12 +299,15 @@ function TrackRow({
         point={point}
         color={colorFor(point.id)}
         track={track}
-        anchors={anchors}
+        // A composite carries one anchor because every point must, not because
+        // anything was anchored — drawing a diamond for it would claim a
+        // keyframe that nobody placed and nothing tracked from.
+        anchors={composite ? EMPTY_ANCHORS : anchors}
         flagged={flagged}
         gaps={gaps}
         frames={Math.max(project.video.frames, 1)}
         currentFrame={currentFrame}
-        pickedAnchor={anchorFrame}
+        pickedAnchor={composite ? null : anchorFrame}
         liveFrame={live?.frame ?? null}
         onPick={pick}
       />
@@ -303,7 +323,19 @@ function TrackRow({
         <span>f{Math.max(project.video.frames - 1, 0)}</span>
       </div>
 
-      {selected && (
+      {/* A composite has nothing to run and nothing to anchor — its path is the
+          average of other tracks, not the output of a tracker. So the inspector
+          is replaced by what it *is* made of (todo 2, tenth round, second
+          pass), rather than offering controls that would each need a reason
+          why they do nothing. Its edits stay available under ⋯: a composite
+          path can still be nudged, filled or smoothed like any other. */}
+      {selected && composite && (
+        <div className="track-inspector" onClick={(e) => e.stopPropagation()}>
+          <CompositeSources point={point} />
+        </div>
+      )}
+
+      {selected && !composite && (
         <div className="track-inspector" onClick={(e) => e.stopPropagation()}>
           <div className="track-inspector__row">
             <span className="track-inspector__subject">
@@ -415,27 +447,40 @@ function TrackRow({
         <div className="track-setup" onClick={(e) => e.stopPropagation()}>
           <div className="track-setup__row">
             <span className="lbl">Tracker</span>
-            <select
-              value={point.tracker}
-              onChange={async (e) => {
-                await api.updatePoint(project.id, point.id, { tracker: e.target.value });
-                await refresh();
-              }}
-            >
-              {trackers.map((t) => (
-                <option key={t.name} value={t.name} disabled={!t.available} title={t.unavailable_reason ?? undefined}>
-                  {t.display_name}
-                  {!t.available ? " (unavailable)" : ""}
-                </option>
-              ))}
-            </select>
-            {unavailableReason(trackers, point.tracker) && (
+            {/* No algorithm produced a composite, so there is none to choose.
+                Saying "composite" is the whole of what there is to say. */}
+            {composite ? (
               <span
-                className="points-list__warning"
-                title={unavailableReason(trackers, point.tracker) ?? undefined}
+                className="track-pill track-pill--idle"
+                title="This path is the frame-by-frame average of other tracks, so no tracking algorithm applies to it"
               >
-                ⚠ not installed
+                composite
               </span>
+            ) : (
+              <>
+                <select
+                  value={point.tracker}
+                  onChange={async (e) => {
+                    await api.updatePoint(project.id, point.id, { tracker: e.target.value });
+                    await refresh();
+                  }}
+                >
+                  {trackers.map((t) => (
+                    <option key={t.name} value={t.name} disabled={!t.available} title={t.unavailable_reason ?? undefined}>
+                      {t.display_name}
+                      {!t.available ? " (unavailable)" : ""}
+                    </option>
+                  ))}
+                </select>
+                {unavailableReason(trackers, point.tracker) && (
+                  <span
+                    className="points-list__warning"
+                    title={unavailableReason(trackers, point.tracker) ?? undefined}
+                  >
+                    ⚠ not installed
+                  </span>
+                )}
+              </>
             )}
             <span style={{ flex: 1 }} />
             <button
@@ -485,7 +530,10 @@ ${
             })}
           </div>
 
-          <PatchPanel pointId={point.id} />
+          {/* The pattern and search sizes are a tracker's settings, and a
+              composite has no tracker to settle them for. Its edits stay: an
+              averaged path can be nudged, filled or smoothed like any other. */}
+          {!composite && <PatchPanel pointId={point.id} />}
           <TrackEdits pointId={point.id} />
         </div>
       )}
@@ -707,6 +755,16 @@ function statusOf(
   gaps: number,
   missed: number,
 ): { tone: "ok" | "warn" | "crit" | "idle"; label: string; help: string } {
+  // A composite is not a tracked track and none of the states below apply to
+  // it: no run reached or missed an anchor, and "re-track" is not a thing it
+  // can be asked to do (todo 2, tenth round, second pass).
+  if (point.derived_from.length > 0) {
+    return {
+      tone: "idle",
+      label: "composite",
+      help: `The frame-by-frame average of ${point.derived_from.join(" + ")} — not tracked itself`,
+    };
+  }
   if (!point.has_track) {
     return { tone: "idle", label: "not tracked", help: "Track from an anchor to start this off" };
   }

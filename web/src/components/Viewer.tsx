@@ -460,6 +460,8 @@ export function Viewer() {
   const showOutput = exportState.active && exportState.sideBySide && !stabilizedPreview;
   const outputPicture = frames.view?.images.output ?? null;
   const outputError = frames.view?.errors.output ?? null;
+  // Draw the delivered frame and nothing over it (todo 4, tenth round).
+  const cleanOutput = exportState.cleanOutput;
 
   // The stabilized preview warps (and may crop) the frame, so overlay
   // coordinates — which are in *source* space — no longer line up with what is
@@ -964,6 +966,15 @@ export function Viewer() {
     const top = (dispH - height) / 2;
     if (outputPicture) drawPicture(ctx, outputPicture.image, left, top, width, height);
 
+    // "Show me the frame" (todo 4, tenth round). The picture is drawn and
+    // nothing else is — no thirds, no snap line, no crosshairs. The fit is
+    // cleared with them, which is what makes `grabOutputTarget` a no-op: a mark
+    // that is not drawn must not be grabbable at the place it would have been.
+    if (cleanOutput) {
+      outputFitRef.current = null;
+      return;
+    }
+
     if (!geometry) {
       outputFitRef.current = null;
       return;
@@ -1051,6 +1062,7 @@ export function Viewer() {
     showOutput,
     sizeTick,
     colorFor,
+    cleanOutput,
     frames.view?.revision,
     exportState.frameGeometry,
     exportState.marks,
@@ -1941,14 +1953,21 @@ export function Viewer() {
               onMouseMove={handleOutputMouseMove}
               onMouseLeave={() => setOutputHover(false)}
             />
-            <div className="viewer__canvas-label">
-              output
-              {exportState.preview
-                ? ` · ${exportState.preview.output.width}×${exportState.preview.output.height}`
-                : ""}
-            </div>
+            {/* The label and the hint are drawn over the picture too, so the
+                clean view has to take them with it — an overlay in the corner
+                is still an overlay (todo 4, tenth round). The error is not: a
+                frame that could not be produced has to say so whatever the
+                view preference is. */}
+            {!cleanOutput && (
+              <div className="viewer__canvas-label">
+                output
+                {exportState.preview
+                  ? ` · ${exportState.preview.output.width}×${exportState.preview.output.height}`
+                  : ""}
+              </div>
+            )}
             {outputError && <div className="viewer__error">{outputError}</div>}
-            {exportState.marks.length > 0 && (
+            {!cleanOutput && exportState.marks.length > 0 && (
               <div className="viewer__hint">
                 Drag a crosshair here to place it in the delivered frame.
               </div>

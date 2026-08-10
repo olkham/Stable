@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { confidenceColor } from "../colors";
+import { PLAYBACK_RATES, TARGET_PLAYBACK_FPS } from "../playback";
 import { useProjectContext } from "../state/ProjectContext";
 
 /** Colour of an anchor no tracking run could actually reach (todos 13, 15). */
@@ -16,9 +17,6 @@ const FLAGGED_ANCHOR_COLOR = "#ff3b30";
  * in red when one reached them and disagreed — "this anchor was never hit, go
  * look at it".
  */
-/** Playback speeds offered, as multiples of the clip's own frame rate. */
-const PLAYBACK_RATES = [0.25, 0.5, 1, 2, 4];
-
 /**
  * Why the range and the solve can disagree.
  *
@@ -277,7 +275,7 @@ export function Timeline() {
           className="timeline__rate"
           value={playbackRate}
           onChange={(e) => setPlaybackRate(Number(e.target.value))}
-          title="Playback speed. The clip's own frame rate is 1x."
+          title={`Playback speed. The clip's own frame rate is 1x. A project opens at whichever of these plays it nearest ${TARGET_PLAYBACK_FPS} fps, so a high-frame-rate clip is reviewed at the speed it was shot at rather than at the speed it was captured.`}
         >
           {PLAYBACK_RATES.map((rate) => (
             <option key={rate} value={rate}>
@@ -331,8 +329,8 @@ export function Timeline() {
             className="channel-check"
             title={
               ranged
-                ? "Play only the frames between the In and Out markers. Play stops at the out point and returns to the in point."
-                : "Set In and Out markers first — with no range there is nothing to limit playback to."
+                ? "Play only the frames between the In and Out markers. Play stops at the out point and returns to the in point. Marking a range turns this on for you; un-tick it to watch the whole clip without moving the markers."
+                : "Set In and Out markers first — with no range there is nothing to limit playback to. Marking one turns this on."
             }
           >
             <input

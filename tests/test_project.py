@@ -129,6 +129,33 @@ def test_a_points_colour_survives_the_round_trip_and_defaults_to_the_palette(tmp
     assert [p.color for p in Project.from_dict(legacy).points] == [None, None]
 
 
+def test_a_composite_remembers_what_it_was_made_from(tmp_path):
+    """Provenance is stored, not just returned (todo 2, tenth round, second pass).
+
+    It began as a key on the response that created the point, which was enough
+    to say "made from p1 + p2" once and lost it on the next reload — and the
+    panel needs it *every* time it draws the card, to know it is looking at a
+    composite rather than a tracked track.
+    """
+    project = full_project()
+    assert project.point("p1").derived_from == []
+    assert project.point("p1").is_composite is False
+
+    project.points.append(PointSpec(id="p9", derived_from=["p1", "p2"]))
+    assert project.point("p9").is_composite is True
+
+    loaded = Project.load(project.save(tmp_path / "shot.stable.json"))
+    assert loaded.point("p9").derived_from == ["p1", "p2"]
+    assert loaded.point("p1").derived_from == []
+
+    # Written before composites existed: absent is "an ordinary tracked point",
+    # which is what every point in such a file is.
+    legacy = full_project().to_dict()
+    for point in legacy["points"]:
+        point.pop("derived_from")
+    assert [p.derived_from for p in Project.from_dict(legacy).points] == [[], []]
+
+
 def test_a_colour_the_ui_cannot_draw_is_refused():
     # Not a matter of taste: `#rrggbb` is what an HTML colour input produces and
     # what every canvas here strokes with, so anything else would be stored and

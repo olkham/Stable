@@ -402,9 +402,15 @@ export function AllPatchesStrip() {
   // round). `window.attribute` is null for the trackers that see whole frames,
   // and a thumbnail of a patch such a tracker never looks at answers "which one
   // has drifted" with a picture that has nothing to do with why it drifted.
+  //
+  // A composite is the same case and more so (todo 2, tenth round, second
+  // pass): no tracker matched anything for it, and the pixels under the
+  // midpoint of two features are usually a picture of neither.
   const tracked = project.points.filter(
     (point) =>
-      (point.has_track || point.queries.length > 0) && point.window?.attribute !== null,
+      (point.has_track || point.queries.length > 0) &&
+      point.window?.attribute !== null &&
+      point.derived_from.length === 0,
   );
 
   // The strip needs each point's path to know where to crop.

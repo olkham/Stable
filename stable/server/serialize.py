@@ -100,6 +100,11 @@ def point_summary(
         # pick one from its palette. Carried on every point so a panel never
         # has to ask for it separately.
         "color": point.color,
+        # The tracks this one was averaged from, empty for an ordinary tracked
+        # point. A composite has no tracker, no window and no run behind it, so
+        # the panel draws it as a different kind of thing entirely (todo 2,
+        # tenth round, second pass).
+        "derived_from": list(point.derived_from),
         # The regions this point's tracker matches and searches, in source
         # pixels. Carried on every point so the canvas can draw the pattern and
         # search boxes for all of them without a request per point — see

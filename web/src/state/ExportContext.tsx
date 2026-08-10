@@ -8,7 +8,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import * as api from "../api/client";
 import type { FrameGeometry } from "../api/frameStream";
+import type { RenderQueueState } from "../types";
 import { useFrameStream } from "./FrameStreamContext";
 import { useProjectContext } from "./ProjectContext";
 
@@ -223,6 +225,19 @@ interface ExportContextValue {
   sideBySide: boolean;
   setSideBySide: (on: boolean) => void;
   /**
+   * Whether the output canvas is drawn bare — no thirds, no crosshairs, no
+   * label (todo 4, tenth round).
+   *
+   * The picture on the left has had a master overlay switch since the tools
+   * landed; the output beside it never did, so the one canvas showing what will
+   * actually be delivered could not be seen without something drawn over it.
+   * A view preference like the two above, not a render option: it changes
+   * nothing about the file. Marks cannot be grabbed on that canvas while it is
+   * on, because dragging a crosshair you cannot see is not a feature.
+   */
+  cleanOutput: boolean;
+  setCleanOutput: (on: boolean) => void;
+  /**
    * Whether a dragged mark snaps to the centre, the thirds and the other
    * points on screen. A composing aid, so it lives with the other view
    * preferences rather than in the render options the server stores.
@@ -253,6 +268,28 @@ interface ExportContextValue {
   renders: RenderedFile[];
   reloadRenders: () => void;
   deleteRender: (filename: string) => Promise<void>;
+
+  // -- the render queue (todo 6, tenth round) --
+  //
+  // Queueing an export no longer starts it, so the queue is a *stored list* and
+  // not a filtered view of the job table. That is what makes the other four
+  // asks possible at all: an entry can be looked at, moved, dropped and
+  // estimated because it exists before any worker has it.
+  /** The queued renders and their estimates, or null before the first load. */
+  queue: RenderQueueState | null;
+  reloadQueue: () => void;
+  /** Capture the current settings as a queued render. Returns the failure, if any. */
+  enqueueRender: (opts: {
+    filename?: string | null;
+    codec: string;
+    crf: number;
+  }) => Promise<string | null>;
+  moveQueued: (entryId: string, delta: -1 | 1) => Promise<void>;
+  removeQueued: (entryId: string) => Promise<void>;
+  /** Dismiss every entry that has stopped being work — done, failed, cancelled. */
+  clearFinishedQueued: () => Promise<void>;
+  /** Start working through the pending entries, one at a time, in order. */
+  runQueue: () => Promise<void>;
 }
 
 const ExportContext = createContext<ExportContextValue | null>(null);
@@ -281,11 +318,13 @@ export function ExportProvider({ children }: { children: ReactNode }) {
   const [opts, setOpts] = useState<OptionsResponse | null>(null);
   const [preview, setPreview] = useState<ExportPreview | null>(null);
   const [renders, setRenders] = useState<RenderedFile[]>([]);
+  const [queue, setQueue] = useState<RenderQueueState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [active, setActive] = useState(false);
   const [showGuides, setShowGuides] = useState(true);
   const [sideBySide, setSideBySide] = useState(true);
+  const [cleanOutput, setCleanOutput] = useState(false);
   const [snap, setSnap] = useState(true);
   const [dragging, setDragging] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -338,10 +377,97 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       .catch(() => setRenders([]));
   }, [project.id]);
 
+  const reloadQueue = useCallback(() => {
+    api
+      .getRenderQueue(project.id)
+      .then(setQueue)
+      .catch(() => setQueue(null));
+  }, [project.id]);
+
   useEffect(() => {
     reloadOptions();
     reloadRenders();
-  }, [reloadOptions, reloadRenders]);
+    reloadQueue();
+  }, [reloadOptions, reloadRenders, reloadQueue]);
+
+  const enqueueRender = useCallback(
+    async (opts: { filename?: string | null; codec: string; crf: number }) => {
+      try {
+        setQueue(await api.enqueueRender(project.id, opts));
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    },
+    [project.id],
+  );
+
+  /**
+   * Move one pending entry up or down.
+   *
+   * Expressed as a whole ordering rather than a "swap these two" call: only
+   * pending entries can move, so the neighbour a running one sits between must
+   * be skipped over, and working that out here — where the list is — keeps the
+   * server's contract to one shape (see `reorderRenderQueue`).
+   */
+  const moveQueued = useCallback(
+    async (entryId: string, delta: -1 | 1) => {
+      const pending = (queue?.entries ?? []).filter((entry) => entry.status === "pending");
+      const index = pending.findIndex((entry) => entry.id === entryId);
+      const target = index + delta;
+      if (index < 0 || target < 0 || target >= pending.length) return;
+      const ids = pending.map((entry) => entry.id);
+      [ids[index], ids[target]] = [ids[target], ids[index]];
+      try {
+        setQueue(await api.reorderRenderQueue(project.id, ids));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [project.id, queue],
+  );
+
+  const removeQueued = useCallback(
+    async (entryId: string) => {
+      try {
+        setQueue(await api.removeQueuedRender(project.id, entryId));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [project.id],
+  );
+
+  /**
+   * Dismiss every entry that has stopped being work.
+   *
+   * One request per entry rather than a bulk route: the queue is a handful of
+   * items, the single-entry delete already exists and answers with the whole
+   * list, and a second way to remove things is a second place for "what may be
+   * removed" to be decided.
+   */
+  const clearFinishedQueued = useCallback(async () => {
+    const finished = (queue?.entries ?? []).filter((entry) =>
+      ["done", "error", "cancelled"].includes(entry.status),
+    );
+    try {
+      let latest: RenderQueueState | null = null;
+      for (const entry of finished) {
+        latest = await api.removeQueuedRender(project.id, entry.id);
+      }
+      if (latest) setQueue(latest);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [project.id, queue]);
+
+  const runQueue = useCallback(async () => {
+    try {
+      setQueue(await api.runRenderQueue(project.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [project.id]);
 
   // Only plan while the export is on screen: it is the one call in this app
   // that costs an O(T) fit, and nothing else shows its answer. Notably *not*
@@ -371,6 +497,18 @@ export function ExportProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (lastDone !== undefined) reloadRenders();
   }, [lastDone, reloadRenders]);
+
+  // The queue's own statuses are written by the runner on the server, so the
+  // client learns about them by re-reading. The jobs socket is already
+  // delivering every export job's status change, and every queue transition is
+  // one of those — so this rides on that rather than adding a poll of its own.
+  const exportProgress = useMemo(
+    () => exportJobs.map((job) => `${job.id}:${job.status}`).join(","),
+    [exportJobs],
+  );
+  useEffect(() => {
+    reloadQueue();
+  }, [exportProgress, reloadQueue]);
 
   /**
    * Update the stored render options and re-plan.
@@ -613,6 +751,8 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       setShowGuides,
       sideBySide,
       setSideBySide,
+      cleanOutput,
+      setCleanOutput,
       snap,
       setSnap,
       dragging,
@@ -630,6 +770,13 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       renders,
       reloadRenders,
       deleteRender,
+      queue,
+      reloadQueue,
+      enqueueRender,
+      moveQueued,
+      removeQueued,
+      clearFinishedQueued,
+      runQueue,
     }),
     [
       opts,
@@ -641,6 +788,7 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       active,
       showGuides,
       sideBySide,
+      cleanOutput,
       snap,
       dragging,
       selected,
@@ -655,6 +803,13 @@ export function ExportProvider({ children }: { children: ReactNode }) {
       renders,
       reloadRenders,
       deleteRender,
+      queue,
+      reloadQueue,
+      enqueueRender,
+      moveQueued,
+      removeQueued,
+      clearFinishedQueued,
+      runQueue,
     ],
   );
 

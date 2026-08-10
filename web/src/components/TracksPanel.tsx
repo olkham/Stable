@@ -3,6 +3,7 @@ import * as api from "../api/client";
 import type { TracksPanel as PanelVariant } from "../flags";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackerInfo } from "../types";
+import { CompositeSources, DeriveTrackPanel } from "./DeriveTrack";
 import { JobProgress } from "./JobProgress";
 import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
@@ -196,6 +197,11 @@ export function TracksPanel({
           const flagged = new Set(track?.flagged_anchors ?? []);
           const violations = track?.anchor_violations ?? [];
           const isOpen = expanded[point.id] ?? isSelected;
+          // A track averaged from other tracks (todo 2, tenth round, second
+          // pass). No algorithm produced it, no window was matched, nothing was
+          // anchored and nothing can be re-run — so the controls for all four
+          // are dropped and what it is made of is shown instead.
+          const composite = point.derived_from.length > 0;
           return (
             <li
               key={point.id}
@@ -227,34 +233,48 @@ export function TracksPanel({
                     {point.tracked_frames}f · {(point.mean_confidence * 100).toFixed(0)}%
                   </span>
                 )}
-                <select
-                  value={point.tracker}
-                  onClick={(e) => e.stopPropagation()}
-                  onChange={(e) => handleTrackerChange(point.id, e.target.value)}
-                  style={isOpen ? undefined : { display: "none" }}
-                >
-                  {trackers.map((t) => (
-                    <option
-                      key={t.name}
-                      value={t.name}
-                      disabled={!t.available}
-                      // A disabled option with no explanation is
-                      // indistinguishable from a broken one; the server says
-                      // what to install, so pass it straight through.
-                      title={t.unavailable_reason ?? undefined}
-                    >
-                      {t.display_name}
-                      {!t.available ? " (unavailable)" : ""}
-                    </option>
-                  ))}
-                </select>
-                {unavailableReason(trackers, point.tracker) && (
+                {/* No algorithm produced a composite, so there is none to
+                    choose — "composite" is the whole of what there is to say. */}
+                {composite ? (
                   <span
-                    className="points-list__warning"
-                    title={unavailableReason(trackers, point.tracker) ?? undefined}
+                    className="points-list__composite"
+                    style={isOpen ? undefined : { display: "none" }}
+                    title="This path is the frame-by-frame average of other tracks, so no tracking algorithm applies to it"
                   >
-                    ⚠ not installed
+                    composite
                   </span>
+                ) : (
+                  <>
+                    <select
+                      value={point.tracker}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => handleTrackerChange(point.id, e.target.value)}
+                      style={isOpen ? undefined : { display: "none" }}
+                    >
+                      {trackers.map((t) => (
+                        <option
+                          key={t.name}
+                          value={t.name}
+                          disabled={!t.available}
+                          // A disabled option with no explanation is
+                          // indistinguishable from a broken one; the server says
+                          // what to install, so pass it straight through.
+                          title={t.unavailable_reason ?? undefined}
+                        >
+                          {t.display_name}
+                          {!t.available ? " (unavailable)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {unavailableReason(trackers, point.tracker) && (
+                      <span
+                        className="points-list__warning"
+                        title={unavailableReason(trackers, point.tracker) ?? undefined}
+                      >
+                        ⚠ not installed
+                      </span>
+                    )}
+                  </>
                 )}
                 {/* The "solve" checkbox used to be here (todo 6, fourth
                     round). Choosing which tracks go into the solve now happens
@@ -277,7 +297,16 @@ export function TracksPanel({
                   run it started with it. One row, one word, one × per anchor
                   whether the operator placed it or a drag promoted it (todo 6,
                   seventh round). */}
-              {isOpen && (
+              {/* What a composite is made of, in place of the anchors it does
+                  not have. Its single anchor exists because every point needs
+                  one, not because anything was anchored. */}
+              {isOpen && composite && (
+                <div onClick={(e) => e.stopPropagation()}>
+                  <CompositeSources point={point} />
+                </div>
+              )}
+
+              {isOpen && !composite && (
               <div className="points-list__anchors" onClick={(e) => e.stopPropagation()}>
                 <span className="points-list__label" title={ANCHOR_HELP}>
                   Anchors
@@ -427,9 +456,20 @@ ${
                   tracker see here" is the same question whatever is doing the
                   looking. Behind the card's own disclosure since todo 5, so two
                   tracks' patches can be compared side by side. */}
-              {isOpen && <PatchPanel pointId={point.id} />}
+              {/* Pattern and search sizes are a tracker's settings, and a
+                  composite has no tracker to settle them for. */}
+              {isOpen && !composite && <PatchPanel pointId={point.id} />}
 
-              {isOpen && (
+              {isOpen && composite && (
+                <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
+                  <span className="points-list__confidence">
+                    {point.tracked_frames} frames · {(point.mean_confidence * 100).toFixed(0)}%
+                    confidence
+                  </span>
+                </div>
+              )}
+
+              {isOpen && !composite && (
               <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                 <button
                   className={point.anchors_changed ? "button--active" : ""}
@@ -480,7 +520,7 @@ ${
                   "carry on from where I am", for the frames between anchors.
                   No longer behind `has_track` — a run from an anchor is how a
                   track gets started, not only how one gets repaired. */}
-              {isOpen && (
+              {isOpen && !composite && (
                 <div className="points-list__stats" onClick={(e) => e.stopPropagation()}>
                   <button
                     title={`Track backwards from frame ${currentFrame} (${runLabel(runLimit, runFrames)})`}
@@ -523,6 +563,11 @@ ${
           );
         })}
       </ul>
+
+      {/* A track made from the ones above (todo 2, tenth round). Below the
+          list because it is about the list, and shared with the other Tracks
+          panel so the flag stays a judgement about layout. */}
+      <DeriveTrackPanel />
 
       {runError && <p className="panel__empty">{runError}</p>}
     </div>
