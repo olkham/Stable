@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { confidenceColor, pointColor } from "../colors";
+import { confidenceColor } from "../colors";
 import { useProjectContext } from "../state/ProjectContext";
 
 /** Colour of an anchor no tracking run could actually reach (todos 13, 15). */
@@ -48,6 +48,7 @@ export function Timeline() {
     selectedPointId,
     tracks,
     liveTracking,
+    colorFor,
   } = useProjectContext();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -166,7 +167,7 @@ export function Timeline() {
     // reached and disagreed with goes red and gets a full-height tick, so "this
     // anchor still needs a human" is visible without selecting the point.
     for (const point of project.points) {
-      const color = pointColor(point.id);
+      const color = colorFor(point.id);
       const missed = flagged[point.id];
       for (const frame of anchorFrames[point.id] ?? []) {
         const x = (frame / frames) * width;
@@ -190,7 +191,7 @@ export function Timeline() {
     // reached and mark the frame it is on, so "how far has it got, and is it
     // worth scrubbing back to look" is answerable without opening a panel.
     for (const live of Object.values(liveTracking)) {
-      const color = pointColor(live.pointId);
+      const color = colorFor(live.pointId);
       if (live.span) {
         const x0 = (live.span.from / frames) * width;
         const x1 = ((live.span.to + 1) / frames) * width;
@@ -246,6 +247,7 @@ export function Timeline() {
     anchorFrames,
     liveTracking,
     clipRange,
+    colorFor,
   ]);
 
   function seekFromEvent(evt: React.MouseEvent<HTMLDivElement>) {

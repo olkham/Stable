@@ -7,7 +7,8 @@ The on-disk form is exactly the JSON documented in ``PLAN.md``::
       "points": [ { "id": "p1", "queries": [{"frame": 0, "x": 0, "y": 0}],
                     "tracker": "cotracker3", "enabled_for_solve": true,
                     "raw": "tracks/p1.npz",
-                    "corrections": [ ... ] } ],
+                    "corrections": [ ... ],
+                    "color": "#5b9bd5" } ],
       "solve": { "reference_frame": 0, "channels": {"x": true, "y": true, "r": true, "s": true} },
       "smoothing": [ { "channel": "x", "filter": "butterworth", "params": {"cutoff_hz": 1.0} } ],
       "render": { "border": "auto_zoom", "codec": "h264", "crf": 18 } }
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,6 +59,9 @@ SCHEMA_VERSION = 1
 
 BORDER_POLICIES: tuple[str, ...] = ("crop", "auto_zoom", "transparent")
 """Border handling policies for the stabilised render (Phase 3)."""
+
+_HEX_COLOR = re.compile(r"#[0-9a-f]{6}")
+"""The only colour form a point may carry: what an HTML colour input produces."""
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
 """A function upgrading a project dict by exactly one schema version."""
@@ -166,6 +171,12 @@ class PointSpec:
         raw: Path to the point's ``.npz`` raw track, relative to the project
             file; ``None`` until the point has been tracked.
         corrections: The non-destructive edit layer, applied in order.
+        color: The colour the UI draws this point in, as ``#rrggbb``, or
+            ``None`` to let it pick one from its palette. The palette has eight
+            entries and a project may have more points than that, so two tracks
+            can end up the same colour with no way to tell them apart on the
+            frame; this is the operator's answer to that, and it belongs with
+            the project rather than in one browser tab.
     """
 
     id: str
@@ -174,6 +185,20 @@ class PointSpec:
     enabled_for_solve: bool = True
     raw: str | None = None
     corrections: list[Correction] = field(default_factory=list)
+    color: str | None = None
+
+    def __post_init__(self) -> None:
+        """Normalise and validate :attr:`color` (dataclass hook).
+
+        Raises:
+            ProjectError: If the colour is not ``#rrggbb``.
+        """
+        if self.color is None:
+            return
+        color = str(self.color).strip().lower()
+        if not _HEX_COLOR.fullmatch(color):
+            raise ProjectError(f"point colour must be #rrggbb, got {self.color!r}")
+        self.color = color
 
     def to_dict(self) -> dict[str, Any]:
         """Return the project-file dict for this point."""
@@ -184,6 +209,7 @@ class PointSpec:
             "enabled_for_solve": self.enabled_for_solve,
             "raw": self.raw,
             "corrections": [c.to_dict() for c in self.corrections],
+            "color": self.color,
         }
 
     @classmethod
@@ -202,6 +228,9 @@ class PointSpec:
             enabled_for_solve=bool(data.get("enabled_for_solve", True)),
             raw=data.get("raw"),
             corrections=[correction_from_dict(c) for c in data.get("corrections", [])],
+            # Absent on every project written before colours existed, which is
+            # the same as "use the palette" — no migration needed.
+            color=data.get("color") or None,
         )
 
     def sorted_queries(self) -> list[Query]:

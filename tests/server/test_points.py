@@ -49,6 +49,48 @@ def test_create_update_delete_point(client: TestClient, project) -> None:
     assert client.get(f"/api/projects/{project_id}/points").json() == []
 
 
+def test_a_track_can_be_given_a_colour_and_have_it_taken_away(client: TestClient, project) -> None:
+    detail, source = project
+    project_id = detail["id"]
+    x, y = source.true_position(0)
+    created = client.post(
+        f"/api/projects/{project_id}/points", json={"frame": 0, "x": x, "y": y}
+    ).json()
+    # No colour of its own to start with: the UI's palette decides.
+    assert created["color"] is None
+
+    coloured = client.patch(f"/api/projects/{project_id}/points/p1", json={"color": "#FF8800"})
+    assert coloured.status_code == 200
+    assert coloured.json()["color"] == "#ff8800"
+    # It is on the point, not in the response — so a reload sees it too.
+    assert client.get(f"/api/projects/{project_id}/points").json()[0]["color"] == "#ff8800"
+
+    # Another field on its own leaves the colour alone; `null` means the same.
+    client.patch(f"/api/projects/{project_id}/points/p1", json={"tracker": "template"})
+    assert client.get(f"/api/projects/{project_id}/points").json()[0]["color"] == "#ff8800"
+
+    # The empty string is how it goes back to the palette.
+    cleared = client.patch(f"/api/projects/{project_id}/points/p1", json={"color": ""})
+    assert cleared.status_code == 200
+    assert cleared.json()["color"] is None
+
+
+def test_a_colour_the_ui_cannot_draw_is_refused(client: TestClient, project) -> None:
+    detail, source = project
+    project_id = detail["id"]
+    x, y = source.true_position(0)
+    client.post(f"/api/projects/{project_id}/points", json={"frame": 0, "x": x, "y": y})
+
+    refused = client.patch(f"/api/projects/{project_id}/points/p1", json={"color": "octarine"})
+    assert refused.status_code == 400
+    # And a refusal changes nothing, colour or otherwise.
+    assert client.get(f"/api/projects/{project_id}/points").json()[0]["color"] is None
+
+    # A point that does not exist is still a 404, colour or no colour.
+    missing = client.patch(f"/api/projects/{project_id}/points/p99", json={"color": "#ff8800"})
+    assert missing.status_code == 404
+
+
 def test_point_ids_increment(client: TestClient, project) -> None:
     detail, source = project
     project_id = detail["id"]

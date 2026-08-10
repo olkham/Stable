@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
-import { pointColor } from "../colors";
 import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
 import type { PointPatches, TrackerSetting } from "../types";
@@ -386,7 +385,15 @@ const STRIP_PX = 48;
  * than one the playhead has moved past.
  */
 export function AllPatchesStrip() {
-  const { project, selectedPointId, setSelectedPointId, tracks, loadTrack, stabilizedPreview } =
+  const {
+    project,
+    selectedPointId,
+    setSelectedPointId,
+    tracks,
+    loadTrack,
+    stabilizedPreview,
+    colorFor,
+  } =
     useProjectContext();
   const { view, viewFrame } = useFrameStream();
   const picture = view?.images.source ?? null;
@@ -434,7 +441,7 @@ export function AllPatchesStrip() {
               radius={point.window?.radius || DEFAULT_PREVIEW_RADIUS}
               scale={scale}
             />
-            <figcaption style={{ color: pointColor(point.id) }}>{point.id}</figcaption>
+            <figcaption style={{ color: colorFor(point.id) }}>{point.id}</figcaption>
           </figure>
         ))}
       </div>

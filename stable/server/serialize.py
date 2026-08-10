@@ -96,6 +96,10 @@ def point_summary(
         "queries": [q.to_dict() for q in point.sorted_queries()],
         "tracker": point.tracker,
         "enabled_for_solve": point.enabled_for_solve,
+        # The colour the operator chose for this track, or null to let the UI
+        # pick one from its palette. Carried on every point so a panel never
+        # has to ask for it separately.
+        "color": point.color,
         # The regions this point's tracker matches and searches, in source
         # pixels. Carried on every point so the canvas can draw the pattern and
         # search boxes for all of them without a request per point — see

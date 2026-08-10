@@ -1,6 +1,5 @@
 import { useState } from "react";
 import * as api from "../api/client";
-import { pointColor } from "../colors";
 import type { TracksPanel as PanelVariant } from "../flags";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackerInfo } from "../types";
@@ -8,6 +7,7 @@ import { JobProgress } from "./JobProgress";
 import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 import { TrackEdits } from "./TrackEdits";
+import { TrackEye, TrackSwatch } from "./TrackVisibility";
 import { OVERLAY_LABELS } from "./Viewer";
 
 /** Colour of an anchor no tracking run could reach — the "go and look" mark. */
@@ -95,6 +95,7 @@ export function TracksPanel({
     overlaysFor,
     setTrackOverlay,
     trackOverrides,
+    isTrackHidden,
   } = useProjectContext();
 
   const [runLimit, setRunLimit] = useState<RunLimit>("anchor");
@@ -215,7 +216,11 @@ export function TracksPanel({
                 >
                   {isOpen ? "▾" : "▸"}
                 </button>
-                <span className="points-list__swatch" style={{ background: pointColor(point.id) }} />
+                {/* On the row rather than inside the card: hiding a track and
+                    recolouring it are both one click, from wherever the track
+                    is, open or shut (todos 6 and 7, ninth round). */}
+                <TrackEye pointId={point.id} />
+                <TrackSwatch pointId={point.id} className="points-list__swatch" />
                 <span className="points-list__id">{point.id}</span>
                 {!isOpen && point.has_track && (
                   <span className="points-list__confidence">
@@ -387,17 +392,24 @@ export function TracksPanel({
                 {OVERLAY_LABELS.map(([key, label, help]) => {
                   const override = trackOverrides[point.id]?.[key];
                   const active = overlaysFor(point.id)[key];
+                  // Nothing this row says can change what is drawn while the
+                  // eye is off, so it says nothing rather than lying (the same
+                  // treatment the master Overlays switch gets above the canvas).
+                  const hidden = isTrackHidden(point.id);
                   return (
                     <button
                       key={key}
+                      disabled={hidden}
                       className={`track-overlay ${active ? "track-overlay--on" : ""} ${
                         override === undefined ? "" : "track-overlay--set"
                       }`}
                       title={`${help}
 ${
-                        override === undefined
-                          ? `Following the default (${overlays[key] ? "shown" : "hidden"}) — click to override`
-                          : "Overridden for this track — click again to follow the default"
+                        hidden
+                          ? "This track is hidden — click the eye on its row to show it"
+                          : override === undefined
+                            ? `Following the default (${overlays[key] ? "shown" : "hidden"}) — click to override`
+                            : "Overridden for this track — click again to follow the default"
                       }`}
                       onClick={() =>
                         setTrackOverlay(point.id, key, override === undefined ? !overlays[key] : null)

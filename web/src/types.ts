@@ -56,6 +56,15 @@ export interface PointSummary {
   queries: Query[];
   tracker: string;
   enabled_for_solve: boolean;
+  /**
+   * The colour this track is drawn in, or null for the palette's answer.
+   *
+   * Stored on the point rather than in the tab: the palette has eight colours
+   * for an unbounded number of tracks, so two of them can collide, and a
+   * choice made to break that tie is worth keeping across a reload. Read it
+   * through `colorFor` in the project context, never directly.
+   */
+  color: string | null;
   window: PointWindow;
   has_track: boolean;
   tracked_frames: number;

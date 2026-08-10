@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api/client";
-import { confidenceColor, pointColor } from "../colors";
+import { confidenceColor } from "../colors";
 import type { TracksPanel as PanelVariant } from "../flags";
 import { useProjectContext } from "../state/ProjectContext";
 import type { PointSummary, Query, TrackData, TrackerInfo } from "../types";
@@ -8,6 +8,7 @@ import { JobProgress } from "./JobProgress";
 import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 import { TrackEdits } from "./TrackEdits";
+import { TrackEye, TrackSwatch } from "./TrackVisibility";
 import { OVERLAY_LABELS } from "./Viewer";
 
 /**
@@ -176,6 +177,8 @@ function TrackRow({
     overlaysFor,
     setTrackOverlay,
     trackOverrides,
+    colorFor,
+    isTrackHidden,
   } = useProjectContext();
 
   const track = tracks[point.id];
@@ -245,10 +248,13 @@ function TrackRow({
     <li
       className={`track-row ${selected ? "track-row--selected" : ""}`}
       onClick={onSelect}
-      style={{ borderLeftColor: selected ? pointColor(point.id) : "transparent" }}
+      style={{ borderLeftColor: selected ? colorFor(point.id) : "transparent" }}
     >
       <div className="track-row__head">
-        <span className="track-row__swatch" style={{ background: pointColor(point.id) }} />
+        {/* One click, on the resting row: hide everything this track draws, or
+            give it a colour of its own (todos 6 and 7, ninth round). */}
+        <TrackEye pointId={point.id} />
+        <TrackSwatch pointId={point.id} className="track-row__swatch" />
         <span className="track-row__id">{point.id}</span>
         <span className={`track-pill track-pill--${status.tone}`} title={status.help}>
           {status.label}
@@ -274,6 +280,7 @@ function TrackRow({
 
       <TrackStrip
         point={point}
+        color={colorFor(point.id)}
         track={track}
         anchors={anchors}
         flagged={flagged}
@@ -302,7 +309,7 @@ function TrackRow({
             <span className="track-inspector__subject">
               {anchorFrame !== null ? (
                 <>
-                  <b style={{ color: flagged.has(anchorFrame) ? FLAGGED : pointColor(point.id) }}>
+                  <b style={{ color: flagged.has(anchorFrame) ? FLAGGED : colorFor(point.id) }}>
                     ◆
                   </b>{" "}
                   anchor f{anchorFrame}
@@ -450,17 +457,23 @@ function TrackRow({
             {OVERLAY_LABELS.map(([key, label, help]) => {
               const override = trackOverrides[point.id]?.[key];
               const active = overlaysFor(point.id)[key];
+              // Dead controls while the row's eye is off: nothing here can
+              // change what is drawn until the track is shown again.
+              const hidden = isTrackHidden(point.id);
               return (
                 <button
                   key={key}
+                  disabled={hidden}
                   className={`track-overlay ${active ? "track-overlay--on" : ""} ${
                     override === undefined ? "" : "track-overlay--set"
                   }`}
                   title={`${help}
 ${
-                    override === undefined
-                      ? `Following the default (${overlays[key] ? "shown" : "hidden"}) — click to override`
-                      : "Overridden for this track — click again to follow the default"
+                    hidden
+                      ? "This track is hidden — click the eye on its row to show it"
+                      : override === undefined
+                        ? `Following the default (${overlays[key] ? "shown" : "hidden"}) — click to override`
+                        : "Overridden for this track — click again to follow the default"
                   }`}
                   onClick={() =>
                     setTrackOverlay(point.id, key, override === undefined ? !overlays[key] : null)
@@ -503,6 +516,7 @@ const ANCHOR_GRAB_PX = 8;
  */
 function TrackStrip({
   point,
+  color,
   track,
   anchors,
   flagged,
@@ -514,6 +528,8 @@ function TrackStrip({
   onPick,
 }: {
   point: PointSummary;
+  /** The track's colour, resolved by the row (its own, or the palette's). */
+  color: string;
   track: TrackData | undefined;
   anchors: Query[];
   flagged: Set<number>;
@@ -546,7 +562,6 @@ function TrackStrip({
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const color = pointColor(point.id);
     const atFrame = (frame: number) => (frame / frames) * width;
 
     // Untracked ground.
@@ -618,6 +633,7 @@ function TrackStrip({
     pickedAnchor,
     liveFrame,
     point.id,
+    color,
   ]);
 
   /** Which anchor a click means, or null for "the frame you clicked". */

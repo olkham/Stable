@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api/client";
-import { pointColor } from "../colors";
 import { applyWarp, useExportContext } from "../state/ExportContext";
 import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
@@ -239,8 +238,17 @@ function fromHex(hex: string): number[] {
  * least-squares and pretending otherwise would be a lie about the result.
  */
 export function ExportPanel() {
-  const { project, refresh, clipRange, currentFrame, jobs, cancelJob, tracks, loadTrack } =
-    useProjectContext();
+  const {
+    project,
+    refresh,
+    clipRange,
+    currentFrame,
+    jobs,
+    cancelJob,
+    tracks,
+    loadTrack,
+    colorFor,
+  } = useProjectContext();
   const {
     opts,
     marks,
@@ -559,9 +567,29 @@ export function ExportPanel() {
                   onClick={() => setSelected(isSelected ? null : mark.id)}
                 >
                   <div className="target-list__head">
+                    {/* The card has always opened on a click; nothing said so
+                        (todo 5, ninth round). Same state as the click on the
+                        row, not a second one — selecting a target also picks
+                        out its crosshair on both canvases, and two notions of
+                        "open" would drift apart. */}
+                    <button
+                      className="points-list__disclose"
+                      aria-expanded={isSelected}
+                      title={
+                        isSelected
+                          ? "Hide this target's settings"
+                          : "Source, position, snap spots and which tracks this target holds"
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelected(isSelected ? null : mark.id);
+                      }}
+                    >
+                      {isSelected ? "▾" : "▸"}
+                    </button>
                     <span
                       className="points-list__swatch"
-                      style={{ background: mark.pointId ? pointColor(mark.pointId) : "#e8e8e8" }}
+                      style={{ background: mark.pointId ? colorFor(mark.pointId) : "#e8e8e8" }}
                     />
                     <span className="target-list__id">{mark.id}</span>
                     <span className="target-list__where">
@@ -661,7 +689,7 @@ export function ExportPanel() {
                             />
                             <span
                               className="points-list__swatch"
-                              style={{ background: pointColor(point.id) }}
+                              style={{ background: colorFor(point.id) }}
                             />
                             {point.id}
                           </label>

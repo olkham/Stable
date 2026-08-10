@@ -78,10 +78,15 @@ class AnchorCreate(BaseModel):
 
 
 class PointUpdate(BaseModel):
-    """Body for ``PATCH /api/projects/{id}/points/{point_id}``."""
+    """Body for ``PATCH /api/projects/{id}/points/{point_id}``.
+
+    Every field is optional and ``None`` means "leave this alone", so clearing
+    the colour back to the palette is the empty string rather than ``null``.
+    """
 
     tracker: str | None = None
     enabled_for_solve: bool | None = None
+    color: str | None = None
 
 
 class TrackRequest(BaseModel):

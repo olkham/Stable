@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "../api/client";
-import { CHANNEL_LABEL, pointColor } from "../colors";
+import { CHANNEL_LABEL } from "../colors";
 import type { Channel, SolveCurves } from "../types";
 import { CHANNELS } from "../types";
 import { useProjectContext } from "../state/ProjectContext";
@@ -20,8 +20,15 @@ import { JobProgress } from "./JobProgress";
  * translation curve — see stable/solver/similarity.py.
  */
 export function SolvePanel() {
-  const { project, refresh, currentFrame, setCurrentFrame, latestJobFor, editRevision } =
-    useProjectContext();
+  const {
+    project,
+    refresh,
+    currentFrame,
+    setCurrentFrame,
+    latestJobFor,
+    editRevision,
+    colorFor,
+  } = useProjectContext();
   const [curves, setCurves] = useState<SolveCurves | null>(null);
   const job = latestJobFor("solve");
   const trackedCount = project.points.filter((p) => p.enabled_for_solve && p.has_track).length;
@@ -125,7 +132,7 @@ export function SolvePanel() {
                   />
                   <span
                     className="points-list__swatch"
-                    style={{ background: pointColor(point.id) }}
+                    style={{ background: colorFor(point.id) }}
                   />
                   <span className="solve-tracks__id">{point.id}</span>
                   <span className="solve-tracks__stats">

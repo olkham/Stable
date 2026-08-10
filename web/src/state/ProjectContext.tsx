@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import * as api from "../api/client";
+import { pointColor } from "../colors";
 import { useJobsSocket } from "../hooks/useJobsSocket";
 import { useLiveTracking, type LiveTracking } from "../hooks/useLiveTracking";
 import type {
@@ -68,8 +69,6 @@ export interface Overlays {
   markers: boolean;
   /** The anchor markers: where the operator has stated the point's position. */
   anchors: boolean;
-  /** The before/after ghost a correction leaves. */
-  ghost: boolean;
   /** The pattern and search boxes (selected track only). */
   windows: boolean;
 }
@@ -79,7 +78,6 @@ export const ALL_OVERLAYS: Overlays = {
   smoothed: true,
   markers: true,
   anchors: true,
-  ghost: true,
   windows: true,
 };
 
@@ -89,7 +87,6 @@ export const NO_OVERLAYS: Overlays = {
   smoothed: false,
   markers: false,
   anchors: false,
-  ghost: false,
   windows: false,
 };
 
@@ -97,10 +94,15 @@ export const NO_OVERLAYS: Overlays = {
  * What a drag on the frame means.
  *
  * `offset` nudges the track and blends the nudge out over `falloff` frames
- * either side — the everyday "it's a couple of pixels off through here" fix.
+ * either side — "it's a couple of pixels off through here".
  * `replace` hard-sets one frame and ignores what the tracker said — "I know
  * exactly where this is". Both are non-destructive corrections; the difference
  * is only which one gets appended.
+ *
+ * `replace` is the default (todo 4, ninth round). Putting a point exactly where
+ * it belongs on one frame is what a drag on the picture *looks* like it does,
+ * and a blend that quietly moves twenty frames either side is a surprise the
+ * operator has to know about in advance to avoid.
  */
 export type DragMode = "offset" | "replace";
 
@@ -243,6 +245,28 @@ interface ProjectContextValue {
   /** Whether a track has any override of its own, i.e. whether "reset" does anything. */
   trackOverrides: Record<string, Partial<Overlays>>;
   /**
+   * Whether one track draws nothing at all on the frame (todo 6, ninth round).
+   *
+   * A layer of its own rather than "every element overridden to false": the
+   * per-element state is tri-state on purpose, and turning a track off by
+   * writing five overrides would throw away whatever the operator had chosen
+   * for it, with no way back. This sits *above* them, so unhiding restores
+   * exactly what was there before.
+   */
+  isTrackHidden: (pointId: string) => boolean;
+  setTrackHidden: (pointId: string, hidden: boolean) => void;
+  /**
+   * The colour this track is drawn in — its own, or the palette's (todo 7).
+   *
+   * Every canvas that draws a track goes through this rather than calling
+   * `pointColor` directly: the point's stored colour is the answer whenever it
+   * has one, and "which of these is p3" must have the same answer on the
+   * frame, the timeline, the patches and the panels.
+   */
+  colorFor: (pointId: string) => string;
+  /** Store a track's colour, or clear it back to the palette with `null`. */
+  setPointColor: (pointId: string, color: string | null) => Promise<void>;
+  /**
    * What colours a track's path and marker on the canvas.
    *
    * `confidence` is the red→amber→green quality ramp, which answers "is this
@@ -354,11 +378,12 @@ export function ProjectProvider({
   const [overlays, setOverlays] = useState<Overlays>(ALL_OVERLAYS);
   const [overlaysEnabled, setOverlaysEnabled] = useState(true);
   const [trackOverrides, setTrackOverrides] = useState<Record<string, Partial<Overlays>>>({});
+  const [hiddenTracks, setHiddenTracks] = useState<Record<string, boolean>>({});
   const [pathColor, setPathColor] = useState<PathColor>("confidence");
   const [tracks, setTracks] = useState<Record<string, TrackData>>({});
   const trackRequests = useRef(new Set<string>());
 
-  const [dragMode, setDragMode] = useState<DragMode>("offset");
+  const [dragMode, setDragMode] = useState<DragMode>("replace");
   const [falloff, setFalloff] = useState(8);
   const [history, setHistory] = useState<HistoryStatus>(EMPTY_HISTORY);
   const [editError, setEditError] = useState<string | null>(null);
@@ -600,12 +625,53 @@ export function ProjectProvider({
     return () => clearTimeout(id);
   }, [followTracker, liveTracking]);
 
+  const isTrackHidden = useCallback(
+    (pointId: string) => Boolean(hiddenTracks[pointId]),
+    [hiddenTracks],
+  );
+
+  const setTrackHidden = useCallback((pointId: string, hidden: boolean) => {
+    setHiddenTracks((prev) => {
+      if (Boolean(prev[pointId]) === hidden) return prev;
+      const next = { ...prev };
+      if (hidden) next[pointId] = true;
+      else delete next[pointId];
+      return next;
+    });
+  }, []);
+
+  // Three questions in order: is anything drawn at all, is *this* track drawn,
+  // and then which of its elements. Each layer can only take things away.
   const overlaysFor = useCallback(
     (pointId: string): Overlays => {
-      if (!overlaysEnabled) return NO_OVERLAYS;
+      if (!overlaysEnabled || hiddenTracks[pointId]) return NO_OVERLAYS;
       return { ...overlays, ...(trackOverrides[pointId] ?? {}) };
     },
-    [overlays, overlaysEnabled, trackOverrides],
+    [overlays, overlaysEnabled, trackOverrides, hiddenTracks],
+  );
+
+  // A track's colour: the one stored on the point, else the palette's answer
+  // for its id. Re-made when the points change, which is exactly when a colour
+  // can have changed — so a canvas effect can depend on this and redraw then.
+  const colorFor = useCallback(
+    (pointId: string) =>
+      project?.points.find((p) => p.id === pointId)?.color || pointColor(pointId),
+    [project?.points],
+  );
+
+  // An empty string is how the server is told "back to the palette": `null` on
+  // a PATCH body already means "leave this field alone" for every other field.
+  const setPointColor = useCallback(
+    async (pointId: string, color: string | null) => {
+      setEditError(null);
+      try {
+        await api.updatePoint(projectId, pointId, { color: color ?? "" });
+        await refresh();
+      } catch (err) {
+        setEditError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [projectId, refresh],
   );
 
   const setTrackOverlay = useCallback(
@@ -925,6 +991,10 @@ export function ProjectProvider({
       overlaysFor,
       setTrackOverlay,
       trackOverrides,
+      isTrackHidden,
+      setTrackHidden,
+      colorFor,
+      setPointColor,
       pathColor,
       setPathColor,
       tracks,
@@ -979,6 +1049,10 @@ export function ProjectProvider({
     overlaysFor,
     setTrackOverlay,
     trackOverrides,
+    isTrackHidden,
+    setTrackHidden,
+    colorFor,
+    setPointColor,
     pathColor,
     tracks,
     loadTrack,

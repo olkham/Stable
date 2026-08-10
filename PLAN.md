@@ -69,7 +69,8 @@ Raw tracker output is immutable. User edits are a correction layer: keyframed of
   "points": [ { "id": "p1", "queries": [{"frame": 0, "x": 0, "y": 0}],
                 "tracker": "cotracker3", "enabled_for_solve": true,
                 "raw": "tracks/p1.npz",                  // points/conf/visible
-                "corrections": [ /* keyframed edits, typed */ ] } ],
+                "corrections": [ /* keyframed edits, typed */ ],
+                "color": "#5b9bd5" } ],                  // null = UI palette
   "solve": { "reference_frame": 0, "channels": {"x":true,"y":true,"r":true,"s":true} },
   "smoothing": [ { "channel": "x", "filter": "butterworth", "params": {"cutoff_hz": 1.0} } ],
   "render": { "border": "auto_zoom", "codec": "h264", "crf": 18 } }

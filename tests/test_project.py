@@ -56,6 +56,7 @@ def full_project() -> Project:
                 queries=[Query(10, 5.0, 6.0)],
                 tracker="lk",
                 enabled_for_solve=False,
+                color="#ff8800",
             ),
         ],
         solve=SolveSettings(
@@ -108,6 +109,36 @@ def test_plan_example_parses():
     assert project.solve.channels == {"x": True, "y": True, "r": True, "s": True}
     assert project.smoothing[0].params == {"cutoff_hz": 1.0}
     assert project.render.border == "auto_zoom"
+
+
+def test_a_points_colour_survives_the_round_trip_and_defaults_to_the_palette(tmp_path):
+    project = full_project()
+    # A point with no colour of its own says so, rather than inventing one: the
+    # UI's palette is the answer, and it needs to know it may give one.
+    assert project.point("p1").color is None
+    assert project.point("p2").color == "#ff8800"
+
+    loaded = Project.load(project.save(tmp_path / "shot.stable.json"))
+    assert loaded.point("p1").color is None
+    assert loaded.point("p2").color == "#ff8800"
+
+    # Written before colours existed: absent is the same as "use the palette".
+    legacy = full_project().to_dict()
+    for point in legacy["points"]:
+        point.pop("color")
+    assert [p.color for p in Project.from_dict(legacy).points] == [None, None]
+
+
+def test_a_colour_the_ui_cannot_draw_is_refused():
+    # Not a matter of taste: `#rrggbb` is what an HTML colour input produces and
+    # what every canvas here strokes with, so anything else would be stored and
+    # then silently ignored.
+    for bad in ("red", "#fff", "rgb(1,2,3)", "#gggggg"):
+        with pytest.raises(ProjectError, match="colour"):
+            PointSpec(id="p1", color=bad)
+    # Case and surrounding space are the operator's typing, not a different
+    # colour, so they are normalised rather than refused.
+    assert PointSpec(id="p1", color="  #FF8800 ").color == "#ff8800"
 
 
 def test_defaults_are_sane():

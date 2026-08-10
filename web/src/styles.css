@@ -332,6 +332,17 @@ button:disabled {
   width: 3.2rem;
 }
 
+/* Groups the toolbar into what a click does / how close you are looking / what
+   a drag means / what is drawn on top (todo 9, ninth round). Presentation only,
+   hence aria-hidden on the element itself. */
+.viewer__sep {
+  align-self: stretch;
+  width: 1px;
+  min-height: 18px;
+  background: var(--border);
+  flex: 0 0 auto;
+}
+
 .viewer__tools button {
   min-width: 30px;
   padding: 4px 6px;
@@ -1750,6 +1761,99 @@ button:disabled {
 /* An override is the operator's own decision, not an inherited default. */
 .track-overlay--set {
   border-color: var(--accent, #4da3ff);
+}
+
+/* The track's eye is off: these cannot change what is drawn, so they do not
+   invite the click. */
+.track-overlay:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+/* -- one track, on or off, in one click (todo 6, ninth round) --------------- */
+
+.track-eye {
+  position: relative;
+  border: none;
+  background: transparent;
+  padding: 0 2px;
+  font-size: 0.8rem;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* Struck through rather than swapped for a second glyph: there is no slashed
+   eye that can be relied on to exist in the operator's fonts. */
+.track-eye--off {
+  opacity: 0.45;
+}
+
+.track-eye--off::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--text);
+  transform: rotate(-20deg);
+}
+
+/* -- the track's colour, as the swatch that shows it (todo 7) --------------- */
+
+.track-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* A colour input, wearing whatever swatch class the panel already used, so the
+   thing that says "this track's colour" is the thing that changes it. */
+.track-swatch input[type="color"] {
+  appearance: none;
+  -webkit-appearance: none;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  /* Bigger than the plain swatch it replaces: this one has to be hit. The
+     shape stays the panel's own — a circle on the card, a square on the
+     timeline row — because the swatch is how a track is recognised. */
+  width: 13px;
+  height: 13px;
+}
+
+.track-swatch input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.track-swatch input[type="color"]::-webkit-color-swatch {
+  border: none;
+  border-radius: inherit;
+}
+
+/* Its own rule, not a comma-joined one: a selector list containing a pseudo-
+   element the browser does not know is dropped whole, taking the other half of
+   the styling with it. */
+.track-swatch input[type="color"]::-moz-color-swatch {
+  border: none;
+  border-radius: inherit;
+}
+
+.track-swatch__reset {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0;
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.track-swatch__reset:hover {
+  color: var(--text);
 }
 
 /* -- explanatory copy (todo 11) --------------------------------------------- */

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
-import { confidenceColor, pointColor } from "../colors";
+import { confidenceColor } from "../colors";
 import { applyWarp, unapplyWarp, useExportContext } from "../state/ExportContext";
 import type { FrameGeometry } from "../api/frameStream";
 import { useFrameStream } from "../state/FrameStreamContext";
@@ -26,7 +26,6 @@ export const OVERLAY_LABELS: [keyof Overlays, string, string][] = [
     "Anchors",
     "The frames where you have stated the point's position — what every run tracks from",
   ],
-  ["ghost", "Ghost", "The dotted before/after trail a correction leaves behind"],
   [
     "windows",
     "Window",
@@ -329,9 +328,8 @@ function clampPan(pan: Pan, zoom: number, dispW: number, dispH: number, videoW: 
  * aspect ratio, never the browser's) and supports zoom (wheel, centred on the
  * cursor) and pan (middle-mouse drag) so a point can be placed precisely even
  * on a small or distant subject. A move never rewrites the track. It appends
- * one correction: an offset blended over the falloff window, or a hard
- * replace at this frame. The raw path stays underneath and is ghosted, so the
- * user sees exactly what their edit changed.
+ * one correction: a hard replace at this frame, or an offset blended over the
+ * falloff window.
  */
 export function Viewer() {
   const {
@@ -351,6 +349,8 @@ export function Viewer() {
     overlaysEnabled,
     setOverlaysEnabled,
     overlaysFor,
+    isTrackHidden,
+    colorFor,
     pathColor,
     setPathColor,
     followTracker,
@@ -514,7 +514,7 @@ export function Viewer() {
     for (const point of overlayPoints) {
       const isSelected = point.id === selectedPointId;
       const track = tracks[point.id];
-      const color = pointColor(point.id);
+      const color = colorFor(point.id);
       const live = liveTracking[point.id];
       // What *this* track draws: the global defaults with its own overrides on
       // top (stable/../ProjectContext.tsx `overlaysFor`).
@@ -523,7 +523,6 @@ export function Viewer() {
         smoothed: showSmoothed,
         markers: showMarkers,
         anchors: showAnchors,
-        ghost: showGhost,
         windows: showWindows,
       } = overlaysFor(point.id);
 
@@ -568,33 +567,12 @@ export function Viewer() {
       }
 
       if (track) {
-        // Before/after ghosting: where corrections exist the server also sends
-        // the untouched raw path, drawn faintly behind the corrected one so the
-        // edit is visible rather than merely believed.
-        if (showGhost && track.raw_x && track.raw_y) {
-          ctx.save();
-          ctx.globalAlpha = 0.4;
-          ctx.setLineDash([4, 3]);
-          ctx.lineWidth = 1;
-          ctx.strokeStyle = "#ffffff";
-          ctx.beginPath();
-          let started = false;
-          for (let f = 0; f < track.n_frames; f++) {
-            const rx = track.raw_x[f];
-            const ry = track.raw_y[f];
-            if (rx == null || ry == null) {
-              started = false;
-              continue;
-            }
-            const px = toCanvasX(rx);
-            const py = toCanvasY(ry);
-            if (started) ctx.lineTo(px, py);
-            else ctx.moveTo(px, py);
-            started = true;
-          }
-          ctx.stroke();
-          ctx.restore();
-        }
+        // The before/after "ghost" of the raw path used to be drawn here (todo
+        // 2, ninth round). It was a faint dotted trail a pixel or two from the
+        // corrected one, on top of the trail, the smoothed trail and every
+        // other track's — one more line to read for a fact the correction list
+        // states in words. The server still sends `raw_x` / `raw_y`; nothing on
+        // the canvas draws them.
 
         if (showPaths) {
           // Path: connect consecutive valid frames, coloured one of two ways
@@ -878,7 +856,7 @@ export function Viewer() {
       const cx = toCanvasX(at.x);
       const cy = toCanvasY(at.y);
       ctx.save();
-      ctx.strokeStyle = mark.pointId ? pointColor(mark.pointId) : "#e8e8e8";
+      ctx.strokeStyle = mark.pointId ? colorFor(mark.pointId) : "#e8e8e8";
       ctx.lineWidth =
         exportState.dragging === mark.id || exportState.selected === mark.id ? 3 : 2;
       ctx.beginPath();
@@ -919,6 +897,7 @@ export function Viewer() {
     pan,
     overlaysEnabled,
     overlaysFor,
+    colorFor,
     pathColor,
     exportState.active,
     exportState.frameGeometry,
@@ -1048,7 +1027,7 @@ export function Viewer() {
       const at = markOnOutput(geometry, mark.atU, mark.atV);
       const c = outputToCanvas(fit, at.x, at.y);
       ctx.save();
-      ctx.strokeStyle = mark.pointId ? pointColor(mark.pointId) : "#e8e8e8";
+      ctx.strokeStyle = mark.pointId ? colorFor(mark.pointId) : "#e8e8e8";
       ctx.lineWidth =
         exportState.dragging === mark.id || exportState.selected === mark.id ? 3 : 2;
       ctx.beginPath();
@@ -1071,6 +1050,7 @@ export function Viewer() {
     outputPicture,
     showOutput,
     sizeTick,
+    colorFor,
     frames.view?.revision,
     exportState.frameGeometry,
     exportState.marks,
@@ -1102,6 +1082,10 @@ export function Viewer() {
       const t = computeTransform(rect.width, rect.height, videoW, videoH, zoom, pan);
       let best: { id: string; distance: number } | null = null;
       for (const point of project.points) {
+        // A hidden track is not on the screen, so nothing on the screen can be
+        // it (todo 6, ninth round): selecting — or, with the delete tool,
+        // deleting — something invisible is never what the click meant.
+        if (isTrackHidden(point.id)) continue;
         const track = tracks[point.id];
         const x = track?.x[viewFrame];
         const y = track?.y[viewFrame];
@@ -1114,7 +1098,7 @@ export function Viewer() {
       }
       return best?.id ?? null;
     },
-    [project.points, tracks, viewFrame, videoW, videoH, zoom, pan],
+    [project.points, tracks, viewFrame, videoW, videoH, zoom, pan, isTrackHidden],
   );
 
   /**
@@ -1271,7 +1255,11 @@ export function Viewer() {
       return;
     }
     if (tool === "add-anchor" && selectedPointId) {
-      setTool("move");
+      // The tool stays armed (todo 1, ninth round). It used to put itself away
+      // after one anchor, which made anchoring the same track on four frames
+      // four trips to the toolbar — and anchoring across frames is the whole
+      // gesture. Esc, V, or A again puts it away.
+      //
       // Goes through the context (not api.addAnchor + refresh) so the anchor
       // list is re-read with the track it lives on — see `addAnchorAt`.
       await addAnchorAt(selectedPointId, viewFrame, x, y);
@@ -1312,6 +1300,9 @@ export function Viewer() {
     const bounds = canvas.getBoundingClientRect();
     const t = computeTransform(bounds.width, bounds.height, videoW, videoH, zoom, pan);
     for (const point of project.points) {
+      // Same rule as the marker hit test: a hidden track's anchors are not
+      // drawn, so the delete tool cannot reach one by accident.
+      if (isTrackHidden(point.id)) continue;
       for (const query of point.queries) {
         if (query.frame !== viewFrame) continue;
         const at = sourceToCanvas(query.x, query.y, t, videoW, videoH);
@@ -1733,7 +1724,7 @@ export function Viewer() {
     if (tool === "add-point") return "Click on the video to place a new track";
     if (tool === "add-anchor") {
       return selectedPointId
-        ? `Click on the video to anchor ${selectedPointId} at frame ${viewFrame}`
+        ? `Click on the video to anchor ${selectedPointId} at frame ${viewFrame} — the tool stays on, so scrub and click again for the next one (Esc when done)`
         : "Select a track first — an anchor belongs to one";
     }
     if (tool === "delete") {
@@ -1791,6 +1782,10 @@ export function Viewer() {
             </button>
           ))}
         </div>
+        {/* The toolbar is four unrelated things in a row — what a click does,
+            how close you are looking, what a drag means, and what is drawn on
+            top — and a shared gap said none of that (todo 9, ninth round). */}
+        <span className="viewer__sep" aria-hidden="true" />
         <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
           <button
             onClick={() => {
@@ -1819,6 +1814,7 @@ export function Viewer() {
             Fit
           </button>
         </div>
+        <span className="viewer__sep" aria-hidden="true" />
         {/* What a drag on the frame means (todo 4, sixth round). It was on the
             Edit tab, three clicks away from the gesture it governs and on a
             panel you had to leave to see the picture; the drag happens here, so
@@ -1843,6 +1839,7 @@ export function Viewer() {
             />
           )}
         </div>
+        <span className="viewer__sep" aria-hidden="true" />
         <div className="channel-checks">
           <label className="channel-check" title="Hide every track's overlay to see the frame underneath">
             <input
@@ -1874,14 +1871,16 @@ export function Viewer() {
             className="channel-check"
             title="Colour each track's path and marker by its confidence (green = trust it, red = check it), or by the track's own colour so several tracks can be told apart. The timeline strip always shows confidence."
           >
-            Paths
+            {/* "Paths [by confidence]" read as a noun with an adverb bolted on
+                — it never said what the control *did* (todo 8, ninth round). */}
+            Colour Paths by
             <select
               value={pathColor}
               onChange={(e) => setPathColor(e.target.value as typeof pathColor)}
               disabled={!overlaysEnabled}
             >
-              <option value="confidence">by confidence</option>
-              <option value="track">by track</option>
+              <option value="confidence">confidence</option>
+              <option value="track">track</option>
             </select>
           </label>
           {/* These are the *defaults*: a track card can override any of them

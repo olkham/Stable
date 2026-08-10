@@ -136,7 +136,26 @@ def create_point(
 def update_point(
     project_id: str, point_id: str, body: PointUpdate, workspace: Workspace = Depends(_workspace)
 ) -> dict[str, Any]:
-    """Update a point's tracker choice or solve-eligibility flag."""
+    """Update a point's tracker choice, solve-eligibility flag or colour.
+
+    ``color`` is ``#rrggbb``; the empty string clears it back to the UI's
+    palette, since ``null`` on this body already means "leave it alone".
+
+    Raises:
+        HTTPException: 404 if there is no such point, 400 if the colour is not
+            a form the UI can draw.
+    """
+    # Checked here, before anything is mutated, and checked by *the schema* —
+    # the rule about what a colour is belongs with the file that has to stay
+    # readable, so this borrows the dataclass's own validation rather than
+    # keeping a second copy of it. Inside `_mutate` a refusal would be
+    # indistinguishable from "no such point", which is a different status.
+    color: str | None = None
+    if body.color is not None:
+        try:
+            color = PointSpec(id=point_id, color=body.color or None).color
+        except ProjectError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def _mutate(project: Project) -> None:
         spec = project.point(point_id)
@@ -144,6 +163,8 @@ def update_point(
             spec.tracker = body.tracker
         if body.enabled_for_solve is not None:
             spec.enabled_for_solve = body.enabled_for_solve
+        if body.color is not None:
+            spec.color = color
 
     try:
         project = workspace.update_project(project_id, _mutate)

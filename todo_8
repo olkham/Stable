@@ -1,0 +1,9 @@
+[bug] when add anchor tool is selected from the tool bar, then the user adds one to a frame, moves to a different frame and tries to add another one, they can't because the tool automatically swapped to the Move tool after placing the first anchor.
+
+[improvement] remove the "Ghost" lines, they don't really add anything useful.
+[improvement] default the "Drag makes" to be hard replace
+[improvement] Add a small expand/contract arrow to the target card on the export settings panel so it's clear to users this target config card has more settings inside it
+[improvement] in the Tracks tab, make it possible to hide all aspects of a track with a single click, maybe with an eye icon. Currently the user has to click on every element e.g. Paths, Smoothed, Points, Anchors, Ghost (deprecated), Window. They should be able to toggle the entire track item on/off.
+[improvement] let the user change the colour of the track item
+[improvement] in the tool bar it says "Paths [dropdown] (by confidence, by path)" Make it clearer by saying "Colour Paths by [dropdown] (confidence, track)" where [] represents the UI element and () the contents of the dropdown
+[improvement] put some vertical UI separators in the toolbar between tools, visualisation options

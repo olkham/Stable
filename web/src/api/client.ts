@@ -161,10 +161,16 @@ export const createPoint = (
 ): Promise<PointSummary> =>
   postJson(`/api/projects/${projectId}/points`, { frame, x, y, tracker });
 
+/**
+ * Change a point's tracker, its solve flag or its colour.
+ *
+ * An omitted field is left alone. `color: ""` is how the stored colour is
+ * cleared back to the palette — `null` already means "leave it alone" here.
+ */
 export const updatePoint = (
   projectId: string,
   pointId: string,
-  patch: { tracker?: string; enabled_for_solve?: boolean },
+  patch: { tracker?: string; enabled_for_solve?: boolean; color?: string },
 ): Promise<PointSummary> => patchJson(`/api/projects/${projectId}/points/${pointId}`, patch);
 
 export const deletePoint = (projectId: string, pointId: string): Promise<{ status: string }> =>
