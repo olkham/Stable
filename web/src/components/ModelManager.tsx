@@ -103,7 +103,8 @@ export function ModelManager({ onClose }: { onClose: () => void }) {
         <div className="modal__body">
           <p className="modal__hint">
             Deep trackers (CoTracker3, TAPIR) need weights too large to ship in the package; they
-            download here, once, to <code>~/.stable/models</code>. The checkpoints below ship{" "}
+            download here, once, to the <code>.stable/models</code> folder beside your{" "}
+            install. The checkpoints below ship{" "}
             <strong>unpinned</strong> — no verified checksum yet — and CoTracker3&apos;s are also{" "}
             <strong>non-commercial</strong>. Both fail closed until you opt in below (or set{" "}
             <code>STABLE_ALLOW_UNPINNED_WEIGHTS</code> / <code>STABLE_ACCEPT_NONCOMMERCIAL</code>{" "}

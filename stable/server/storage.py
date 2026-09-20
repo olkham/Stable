@@ -24,6 +24,7 @@ file, not video frames) are fast enough that it is never a bottleneck.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -43,6 +44,18 @@ __all__ = ["ProjectNotFoundError", "ProjectMeta", "Workspace"]
 
 PROJECT_FILENAME = "project.stable.json"
 META_FILENAME = "meta.json"
+
+
+def _is_within(path: str | Path, directory: Path) -> bool:
+    """Return whether ``path`` lies inside ``directory``.
+
+    Compared case-insensitively where the platform is (Windows), and without
+    resolving symlinks: the two paths are both built from the workspace root,
+    so normalising them the same way is what makes them comparable.
+    """
+    parent = os.path.normcase(os.path.abspath(directory))
+    child = os.path.normcase(os.path.abspath(path))
+    return child.startswith(parent + os.sep)
 
 
 class ProjectNotFoundError(StableError):
@@ -182,12 +195,17 @@ class Workspace:
             raise ProjectError(f"could not read uploaded video: {exc}") from exc
 
         project = Project()
+        # Before anything is relativised: Project.relative_path measures against
+        # the project file's directory, and with no path set that is the process
+        # CWD -- which silently stored the clip as an absolute path, defeating
+        # the whole "copied so the project is self-contained" point of this
+        # method and breaking every project the moment the workspace moved.
+        project.path = str(self._project_file(project_id))
         project.video.path = project.relative_path(str(video_path))
         project.video.frames = frames
         project.video.w = w
         project.video.h = h
         project.video.fps = fps
-        project.path = str(self._project_file(project_id))
         project.save()
 
         meta = ProjectMeta(
@@ -230,14 +248,59 @@ class Workspace:
     def load_project(self, project_id: str) -> Project:
         """Load and return a project's current state from disk.
 
+        Repairs a stale video path on the way through — see
+        :meth:`_repair_video_path`.
+
         Raises:
             ProjectNotFoundError: If no such project exists.
         """
         self._require_dir(project_id)
         try:
-            return Project.load(self._project_file(project_id))
+            project = Project.load(self._project_file(project_id))
         except ProjectError as exc:
             raise ProjectNotFoundError(f"no project with id {project_id!r}: {exc}") from exc
+        if self._repair_video_path(project_id, project):
+            project.save(self._project_file(project_id))
+        return project
+
+    def _repair_video_path(self, project_id: str, project: Project) -> bool:
+        """Point a project at the clip inside its own directory, and say so.
+
+        Projects created before the path bug above was fixed hold an *absolute*
+        path to their source clip. That path stops existing the moment the
+        workspace moves to another drive, and the failure surfaces late and
+        obscurely — the project opens, the tracks draw, and the export dies with
+        "cannot open video" naming a drive that no longer holds it. Since the
+        clip is always copied into ``<project>/video/``, the truth is right
+        there to be found.
+
+        Args:
+            project_id: The project being loaded.
+            project: Its freshly loaded state, mutated in place.
+
+        Returns:
+            Whether anything changed, i.e. whether the caller must save. Only
+            a path that is absolute *and* names a file inside this project's own
+            directory is rewritten; an absolute path to a clip the user keeps
+            elsewhere on purpose is left exactly as it is.
+        """
+        stored = project.video.path
+        if not stored or not os.path.isabs(stored):
+            return False  # already portable
+        if os.path.isfile(stored) and not _is_within(stored, self.project_dir(project_id)):
+            return False  # a clip kept outside the project on purpose
+        candidate = Path(stored) if os.path.isfile(stored) else self._stored_clip(project_id)
+        if candidate is None:
+            return False  # nothing to point at; the original error stands
+        project.video.path = project.relative_path(str(candidate))
+        return True
+
+    def _stored_clip(self, project_id: str) -> Path | None:
+        """Return the clip copied into the project's ``video/`` directory, if any."""
+        for candidate in sorted(self.video_dir(project_id).glob("source.*")):
+            if candidate.is_file():
+                return candidate
+        return None
 
     def save_project(self, project_id: str, project: Project) -> None:
         """Persist ``project`` back to disk at its canonical path."""

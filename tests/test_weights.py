@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from stable.core.errors import WeightsError
+from stable.core.paths import data_root
 from stable.trackers.cotracker3 import COTRACKER3_OFFLINE, CoTracker3Tracker
 from stable.trackers.tapir import BOOTSTAPIR, TapirTracker
 from stable.trackers.weights import (
@@ -65,9 +66,9 @@ def spec_for(url: str, **overrides) -> ModelSpec:
 # -- cache layout ---------------------------------------------------------
 
 
-def test_cache_root_defaults_to_the_home_directory(monkeypatch):
+def test_cache_root_defaults_to_the_data_root(monkeypatch):
     monkeypatch.delenv(ENV_MODEL_DIR, raising=False)
-    assert model_root() == Path("~/.stable/models").expanduser()
+    assert model_root() == data_root() / "models"
 
 
 def test_cache_root_is_overridable(cache):

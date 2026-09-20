@@ -43,7 +43,8 @@ def add_models_parser(subparsers: Any) -> argparse.ArgumentParser:
         help="list, download, or remove tracker model checkpoints",
         description=(
             "Manage the model checkpoints deep-learning tracker plugins need, cached "
-            "under ~/.stable/models (override with STABLE_MODEL_DIR)."
+            "in the .stable/models directory beside your install (override with "
+            "STABLE_MODEL_DIR)."
         ),
     )
     parser.add_argument(

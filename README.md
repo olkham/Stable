@@ -102,8 +102,9 @@ pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git"
 ## Model checkpoints — download manager and fail-closed weights
 
 Deep trackers need checkpoints too large to ship in the package, so they
-download on first use to `~/.stable/models` (override with
-`STABLE_MODEL_DIR`). Two things are deliberate, not bugs:
+download on first use to `<data root>/models` (see "Where your data is
+stored" below; override with `STABLE_MODEL_DIR`). Two things are deliberate,
+not bugs:
 
 - **Both shipped checkpoints are unpinned** (no verified sha256 yet) — a
   digest nobody has checked against the publisher would be a lie, so a
@@ -164,6 +165,39 @@ stable sample ./my-sample --tracker lk --border auto_zoom
 # 5. the web UI, built (if needed), served, and opened for you
 stable serve
 ```
+
+## Where your data is stored
+
+Projects are big — a single clip's proxies and renders run to gigabytes — so
+Stable keeps them **next to the installation**, not in your home directory:
+
+```
+<the directory you installed Stable into>/.stable/
+    projects/     one directory per project: source clip, proxies, tracks, renders
+    models/       downloaded tracker checkpoints
+```
+
+`stable serve` prints the exact location on startup. Installing onto a big
+data drive is therefore all it takes to keep the data there too, which is the
+point: a home directory on a small system SSD fills up fast.
+
+The resolution order is `$STABLE_HOME`, then the source checkout Stable is
+installed from, then the active virtualenv, then `~/.stable` as a last resort
+(a system-wide `pip install`, where writing next to the package would mean
+writing into `site-packages`). To put the data somewhere else entirely:
+
+```bash
+STABLE_HOME=/mnt/media/stable stable serve      # both stores
+STABLE_WORKSPACE_DIR=/mnt/media/projects        # just the projects
+STABLE_MODEL_DIR=/mnt/media/checkpoints         # just the checkpoints
+```
+
+**Upgrading from an older version?** Everything used to live under
+`~/.stable`. The first launch after upgrading moves it into the new root and
+says so as it goes. It is a per-project move, so an interrupted run resumes
+next time; it refuses rather than filling the destination drive; and a project
+name already present in the new location is never overwritten. Nothing is
+deleted from the old location until its copy has landed.
 
 ## Docker (CUDA)
 

@@ -33,7 +33,7 @@ from stable.cli.serve import (
 
 
 def _args(**overrides) -> argparse.Namespace:
-    base = dict(host="127.0.0.1", port=8123, no_browser=True, no_build=True, reload=False)
+    base = dict(host="localhost", port=8123, no_browser=True, no_build=True, reload=False)
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -94,7 +94,7 @@ def test_serve_subcommand_is_registered():
     args = parser.parse_args(["serve", "--port", "9999", "--no-browser"])
     assert args.port == 9999
     assert args.no_browser is True
-    assert args.host == "127.0.0.1"  # default
+    assert args.host == "localhost"  # default
 
 
 def test_run_serve_starts_uvicorn_with_the_requested_host_and_port(
@@ -139,7 +139,7 @@ def test_run_serve_opens_a_browser_unless_disabled(fake_uvicorn, monkeypatch, tm
         if opened:
             break
         time.sleep(0.02)
-    assert opened == ["http://127.0.0.1:8123/"]
+    assert opened == ["http://localhost:8123/"]
 
 
 def test_run_serve_announces_the_port_it_actually_bound(
@@ -157,9 +157,9 @@ def test_run_serve_announces_the_port_it_actually_bound(
     rc = run_serve(_args(port=8123))
     assert rc == 0
     out = capsys.readouterr()
-    assert "http://127.0.0.1:8131/" in out.out
+    assert "http://localhost:8131/" in out.out
     assert "8123 is in use" in out.err
-    assert "http://127.0.0.1:8123/" not in out.out  # never advertises the dead port
+    assert "http://localhost:8123/" not in out.out  # never advertises the dead port
     assert fake_uvicorn["kwargs"]["port"] == 8131
 
 
@@ -270,14 +270,14 @@ def test_build_frontend_skips_install_when_node_modules_exists(monkeypatch, tmp_
 
 
 def test_wait_until_serving_returns_false_on_timeout():
-    assert _wait_until_serving("http://127.0.0.1:1/nope", timeout=0.2) is False
+    assert _wait_until_serving("http://localhost:1/nope", timeout=0.2) is False
 
 
 # -- binding ------------------------------------------------------------------
 
 
 def test_bind_listener_takes_the_requested_port_when_it_is_free():
-    sock, port = _bind_listener("127.0.0.1", 0)  # 0: let the OS pick a free one
+    sock, port = _bind_listener("localhost", 0)  # 0: let the OS pick a free one
     try:
         assert port == sock.getsockname()[1]
         assert port > 0
@@ -287,11 +287,11 @@ def test_bind_listener_takes_the_requested_port_when_it_is_free():
 
 def test_bind_listener_steps_past_a_port_that_is_already_taken():
     squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    squatter.bind(("127.0.0.1", 0))
+    squatter.bind(("localhost", 0))
     squatter.listen(1)
     taken = squatter.getsockname()[1]
     try:
-        sock, port = _bind_listener("127.0.0.1", taken)
+        sock, port = _bind_listener("localhost", taken)
         try:
             assert port != taken
             assert port in range(taken + 1, taken + 1 + 10)
@@ -320,7 +320,7 @@ def test_bind_listener_falls_back_to_an_os_assigned_port_when_the_whole_range_is
         return real_bind(self, address)
 
     monkeypatch.setattr(socket.socket, "bind", picky_bind)
-    sock, port = _bind_listener("127.0.0.1", 8123)
+    sock, port = _bind_listener("localhost", 8123)
     try:
         assert attempted == [8123, *range(8124, 8134), 0]
         assert port not in (0, 8123)
@@ -334,4 +334,4 @@ def test_bind_listener_reraises_when_even_an_os_assigned_port_fails(monkeypatch)
 
     monkeypatch.setattr(socket.socket, "bind", always_refuse)
     with pytest.raises(OSError, match="interface is down"):
-        _bind_listener("127.0.0.1", 8123)
+        _bind_listener("localhost", 8123)

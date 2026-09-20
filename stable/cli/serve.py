@@ -9,6 +9,9 @@ This is the one-command launch PLAN.md's Phase 6 promises — the polished
 successor to :mod:`stable.server.__main__` (which Phase 4 added only as a
 thin dev/test runner, deliberately leaving this command for Phase 6). It:
 
+#. Relocates a pre-existing ``~/.stable`` store into the current data root if
+   one is still there (:func:`stable.core.migrate_storage.migrate_legacy_storage`),
+   before anything opens a project.
 #. Looks for an already-built frontend via
    :func:`stable.server.app.web_dist_dir`.
 #. If none is found *and* a ``web/`` source checkout with a ``package.json``
@@ -79,7 +82,7 @@ def add_serve_parser(subparsers: Any) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--host", default="127.0.0.1", help="interface to bind (default: %(default)s)"
+        "--host", default="0.0.0.0", help="interface to bind (default: %(default)s)"
     )
     parser.add_argument(
         "--port", type=int, default=8000, help="port to bind (default: %(default)s)"
@@ -213,7 +216,13 @@ def run_serve(args: argparse.Namespace) -> int:
         )
         return 1
 
+    from ..core.migrate_storage import migrate_legacy_storage  # noqa: PLC0415
     from ..server.app import create_app, web_dist_dir  # noqa: PLC0415 - optional extra
+    from ..server.config import workspace_root  # noqa: PLC0415 - optional extra
+
+    # Before the workspace is opened: an upgrade from a version that kept
+    # everything under the home directory still has the user's projects there.
+    migrate_legacy_storage()
 
     if web_dist_dir() is None and not args.no_build:
         web_dir = _source_web_dir()
@@ -246,6 +255,9 @@ def run_serve(args: argparse.Namespace) -> int:
     # so piping or redirecting `stable serve` would otherwise withhold the one
     # line the user is waiting for until the process exits.
     print(f"Stable is running at {url}  (Ctrl+C to stop)", flush=True)
+    # Where the gigabytes go is worth one line: it moved in this version, and
+    # it is the first thing to check when a drive starts filling up.
+    print(f"Projects are stored in {workspace_root()}", flush=True)
 
     if not args.no_browser:
 

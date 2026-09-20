@@ -1,4 +1,4 @@
-"""Lazy, checksummed model-weight download to ``~/.stable/models``.
+"""Lazy, checksummed model-weight download to the ``models/`` data store.
 
 Deep-learning plugins need checkpoints that are far too large to ship in a pip
 package (and, for CoTracker, are non-commercially licensed and must never be
@@ -23,7 +23,8 @@ bundled). This module is the one place that fetches them, under four rules:
 Environment variables
 ---------------------
 ``STABLE_MODEL_DIR``
-    Overrides the ``~/.stable/models`` root (useful in CI and in Docker).
+    Overrides the model-cache root (useful in CI and in Docker). Without it the
+    cache is ``models/`` inside :func:`stable.core.paths.data_root`.
 ``STABLE_ALLOW_UNPINNED_WEIGHTS``
     ``1`` to permit downloading specs with no pinned digest.
 ``STABLE_ACCEPT_NONCOMMERCIAL``
@@ -50,11 +51,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 from ..core.errors import WeightsError
+from ..core.paths import data_root
 from .base import ProgressCallback, noop_progress
 
 __all__ = [
     "ModelSpec",
     "ENV_MODEL_DIR",
+    "MODEL_DIR_NAME",
     "ENV_ALLOW_UNPINNED",
     "ENV_ACCEPT_NONCOMMERCIAL",
     "model_root",
@@ -76,13 +79,15 @@ logger = logging.getLogger(__name__)
 ENV_MODEL_DIR = "STABLE_MODEL_DIR"
 """Environment variable overriding the model cache root."""
 
+MODEL_DIR_NAME = "models"
+"""The weight cache's sub-directory name inside the data root."""
+
 ENV_ALLOW_UNPINNED = "STABLE_ALLOW_UNPINNED_WEIGHTS"
 """Environment variable allowing downloads of specs with no pinned digest."""
 
 ENV_ACCEPT_NONCOMMERCIAL = "STABLE_ACCEPT_NONCOMMERCIAL"
 """Environment variable accepting non-commercial model licences."""
 
-_DEFAULT_ROOT = Path("~/.stable/models")
 _CHUNK = 1 << 20
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -226,12 +231,14 @@ def model_root() -> Path:
     """Return the directory checkpoints are cached in.
 
     Returns:
-        ``$STABLE_MODEL_DIR`` when set, else ``~/.stable/models``. The directory
-        is not created here — :func:`ensure_weights` creates it on demand.
+        ``$STABLE_MODEL_DIR`` when set, else ``models/`` inside
+        :func:`stable.core.paths.data_root`. The directory is not created here
+        — :func:`ensure_weights` creates it on demand.
     """
     override = os.environ.get(ENV_MODEL_DIR)
-    root = Path(override).expanduser() if override else _DEFAULT_ROOT.expanduser()
-    return root
+    if override:
+        return Path(override).expanduser()
+    return data_root() / MODEL_DIR_NAME
 
 
 def local_path(spec: ModelSpec) -> Path:

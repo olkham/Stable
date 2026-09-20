@@ -26,7 +26,7 @@ DIGEST = hashlib.sha256(PAYLOAD).hexdigest()
 
 @pytest.fixture(autouse=True)
 def _model_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point the model cache at a temp directory so nothing touches ~/.stable."""
+    """Point the model cache at a temp directory so nothing touches the real one."""
     root = tmp_path / "models"
     monkeypatch.setenv(ENV_MODEL_DIR, str(root))
     monkeypatch.delenv("STABLE_ALLOW_UNPINNED_WEIGHTS", raising=False)

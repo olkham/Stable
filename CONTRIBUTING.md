@@ -115,7 +115,9 @@ MY_WEIGHTS = register_model(ModelSpec(
 ))
 ```
 
-Checkpoints land in `~/.stable/models/<key>/` (override with `STABLE_MODEL_DIR`).
+Checkpoints land in `<data root>/models/<key>/` — `.stable/` beside your
+install, see README.md "Where your data is stored" (override with
+`STABLE_MODEL_DIR`).
 **Never commit weights**, and never add a model as a hard dependency.
 
 ### 2. `_build_backend(device, weights) -> TrackerBackend`

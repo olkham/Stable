@@ -7,7 +7,7 @@ import react from "@vitejs/plugin-react";
 // cross-origin request; in production the same FastAPI process serves this
 // build's dist/ directly (see stable/server/app.py's web_dist_dir()/mount), so
 // the relative paths still resolve without any base-URL configuration.
-const BACKEND = process.env.STABLE_BACKEND_URL ?? "http://127.0.0.1:8000";
+const BACKEND = process.env.STABLE_BACKEND_URL ?? "http://localhost:8000";
 
 export default defineConfig({
   plugins: [react()],

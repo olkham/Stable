@@ -12,7 +12,7 @@
 - **Video I/O:** PyAV (FFmpeg) decode; on-disk frame/proxy cache; FFmpeg encode with audio passthrough.
 - **Frontend:** React + TypeScript + Vite. Canvas overlay on video frames served as JPEG proxies over HTTP; no WebRTC.
 - **Classic CV:** OpenCV (pyramidal Lucas-Kanade, NCC template matching) — the no-GPU baseline.
-- **Packaging:** pip package + Dockerfile (CUDA); models downloaded on demand to `~/.stable/models`.
+- **Packaging:** pip package + Dockerfile (CUDA); models downloaded on demand to `<data root>/models`.
 - **License:** MIT for our code. Note: CoTracker weights are non-commercial (CC-BY-NC); TAPIR is Apache-2.0. Plugins declare their license; NC models are opt-in downloads, never bundled.
 
 ## Architecture

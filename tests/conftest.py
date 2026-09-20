@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from stable.core import paths
 from stable.core.geometry import SimilarityTransform
 from stable.core.project import MIGRATIONS
 from stable.core.types import Query, TrackResult
@@ -15,6 +17,26 @@ from stable.core.video import SyntheticVideoSource
 from stable.trackers.base import TrackerPlugin
 from stable.trackers.deep import BackendPrediction
 from stable.trackers.merge import RunSpec, TrackRun
+
+
+@pytest.fixture(autouse=True)
+def isolated_legacy_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Hide the real ``~/.stable`` from every test, no exceptions.
+
+    :func:`stable.core.migrate_storage.migrate_legacy_storage` *moves* whatever
+    it finds under the legacy root — gigabytes of somebody's actual projects —
+    and it runs from ``run_serve``, which the CLI tests call for real with a
+    faked uvicorn. One test exercising the startup path must never be able to
+    relocate the machine's data, so the legacy root is pointed at a path that
+    does not exist and the migration becomes a no-op everywhere. Tests that
+    want to exercise it (``tests/test_paths.py``) override this with a
+    populated temp directory of their own.
+    """
+    legacy = tmp_path_factory.getbasetemp() / "no-legacy-home" / ".stable"
+    monkeypatch.setattr(paths, "LEGACY_HOME", legacy)
+    return legacy
 
 
 class PlainVideoSource:
