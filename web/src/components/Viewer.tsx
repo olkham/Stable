@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
 import { confidenceColor } from "../colors";
+import { keyBelongsToControl } from "../keyboard";
 import { applyWarp, unapplyWarp, useExportContext } from "../state/ExportContext";
 import type { FrameGeometry } from "../api/frameStream";
 import { useFrameStream } from "../state/FrameStreamContext";
@@ -35,6 +36,11 @@ export const OVERLAY_LABELS: [keyof Overlays, string, string][] = [
 
 /** How close (in canvas CSS pixels) a mousedown has to be to grab a point. */
 const GRAB_RADIUS = 12;
+
+/** Why a click on the frame did not edit the selected track: it is hidden. */
+function hiddenTrackRefusal(pointId: string): string {
+  return `${pointId} is hidden — show it with its eye in the Tracks panel to edit it on the frame`;
+}
 
 /** Sentinel `hoverPointId` for "the pointer is on an anchor". */
 const ANCHOR_HOVER = " anchor-marker";
@@ -398,9 +404,10 @@ export function Viewer() {
   // rather than as the drag having gone wrong.
   const [snapGuide, setSnapGuide] = useState<SnapGuide | null>(null);
   const [panning, setPanning] = useState(false);
-  // Why the delete tool did nothing, when it refuses — a click that silently
-  // achieves nothing is indistinguishable from a broken one.
-  const [deleteHint, setDeleteHint] = useState<string | null>(null);
+  // Why a click did nothing, when the canvas refuses one — the delete tool's
+  // "a track needs an anchor", or an edit aimed at a hidden track. A click that
+  // silently achieves nothing is indistinguishable from a broken one.
+  const [refusal, setRefusal] = useState<string | null>(null);
   // A mousedown that grabbed a point (dragged or not) is followed by a native
   // "click" on the same element; without this the click handler would run
   // right after a drag release and re-apply the same move a second time.
@@ -1228,11 +1235,13 @@ export function Viewer() {
   }, [videoW, videoH]);
 
   // '+'/'-' zoom, '0' resets to fit — a keyboard alternative to the wheel,
-  // ignored while typing in a field.
+  // left alone while typing in a field. Not with Ctrl/⌘/Alt held: Ctrl +, −
+  // and 0 are the browser's own page zoom, which this used to swallow and
+  // spend on the canvas instead.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
-      const target = event.target as HTMLElement | null;
-      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (keyBelongsToControl(event)) return;
       const wrap = wrapRef.current;
       if (!wrap) return;
       if (event.key === "+" || event.key === "=") {
@@ -1274,6 +1283,10 @@ export function Viewer() {
       //
       // Goes through the context (not api.addAnchor + refresh) so the anchor
       // list is re-read with the track it lives on — see `addAnchorAt`.
+      if (isTrackHidden(selectedPointId)) {
+        setRefusal(hiddenTrackRefusal(selectedPointId));
+        return;
+      }
       await addAnchorAt(selectedPointId, viewFrame, x, y);
       return;
     }
@@ -1292,6 +1305,13 @@ export function Viewer() {
       return;
     }
     if (!selectedPointId) return;
+    // A hidden track is not on the screen, so no click can have been aimed at
+    // it (todo 7). Hit tests already skip one; this is the selected track's
+    // click-to-move, which needs no hit and so used to edit it anyway.
+    if (isTrackHidden(selectedPointId)) {
+      setRefusal(hiddenTrackRefusal(selectedPointId));
+      return;
+    }
     // Click-to-move (todo 8, first round): the selected point jumps to wherever
     // was clicked, exactly as if it had been dragged there. A move is one
     // undoable correction, so the cost of a stray click is one Ctrl+Z.
@@ -1324,7 +1344,7 @@ export function Viewer() {
         } catch (err) {
           // The server owns the "a point needs one anchor" rule, because it is
           // the only side that can see the anchors a correction implies.
-          setDeleteHint(err instanceof Error ? err.message : String(err));
+          setRefusal(err instanceof Error ? err.message : String(err));
           return;
         }
         await afterEdit(point.id);
@@ -1705,10 +1725,15 @@ export function Viewer() {
     setHoverPointId((prev) => (prev === found ? prev : found));
   }
 
+  // A hidden selected track cannot be edited from the frame (see `handleClick`),
+  // so neither the cursor nor the hint may offer it.
+  const selectedHidden = selectedPointId !== null && isTrackHidden(selectedPointId);
+
   // The cursor is the answer to "what does a click here do?" (todo 4).
   const cursorClass = (() => {
     if (drag || anchorDrag || panning) return "viewer__canvas-wrap--dragging";
     if (tool === "pan") return "viewer__canvas-wrap--grab";
+    if (tool === "add-anchor" && selectedHidden) return "viewer__canvas-wrap--inert";
     if (tool === "add-point" || tool === "add-anchor") return "viewer__canvas-wrap--placing";
     if (tool === "delete") {
       return hoverPointId ? "viewer__canvas-wrap--delete" : "viewer__canvas-wrap--inert";
@@ -1723,7 +1748,7 @@ export function Viewer() {
         ? "viewer__canvas-wrap--grab"
         : "viewer__canvas-wrap--select";
     }
-    return selectedPointId && overlayValid && !exportState.active
+    return selectedPointId && !selectedHidden && overlayValid && !exportState.active
       ? "viewer__canvas-wrap--placing"
       : "";
   })();
@@ -1732,12 +1757,12 @@ export function Viewer() {
   // the cursor answers, in words, and only one of these can be true at a time.
   const hint = (() => {
     if (!overlayValid) return "Turn the stabilized preview off to edit points on the frame";
-    if (deleteHint) return deleteHint;
+    if (refusal) return refusal;
     if (tool === "add-point") return "Click on the video to place a new track";
     if (tool === "add-anchor") {
-      return selectedPointId
-        ? `Click on the video to anchor ${selectedPointId} at frame ${viewFrame} — the tool stays on, so scrub and click again for the next one (Esc when done)`
-        : "Select a track first — an anchor belongs to one";
+      if (!selectedPointId) return "Select a track first — an anchor belongs to one";
+      if (selectedHidden) return hiddenTrackRefusal(selectedPointId);
+      return `Click on the video to anchor ${selectedPointId} at frame ${viewFrame} — the tool stays on, so scrub and click again for the next one (Esc when done)`;
     }
     if (tool === "delete") {
       return "Click an anchor to remove it, or a track's marker to remove the whole track";
@@ -1754,6 +1779,7 @@ export function Viewer() {
     if (hoverPointId === ANCHOR_HOVER) {
       return "Drag this anchor to move it, or use the delete tool to remove it";
     }
+    if (selectedPointId && selectedHidden) return hiddenTrackRefusal(selectedPointId);
     if (selectedPointId) {
       return `Click to move ${selectedPointId}, or drag it directly — ${
         dragMode === "replace" ? "hard replace at this frame" : `offset, ${falloff}f falloff`
@@ -1764,10 +1790,10 @@ export function Viewer() {
 
   // The refusal is about one click, so it must not outlive the next one.
   useEffect(() => {
-    if (!deleteHint) return;
-    const timer = setTimeout(() => setDeleteHint(null), 4000);
+    if (!refusal) return;
+    const timer = setTimeout(() => setRefusal(null), 4000);
     return () => clearTimeout(timer);
-  }, [deleteHint]);
+  }, [refusal]);
 
   // Whether any run is currently reporting a cursor — the only time the
   // follow toggle means anything.

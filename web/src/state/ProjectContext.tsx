@@ -12,6 +12,7 @@ import * as api from "../api/client";
 import { pointColor } from "../colors";
 import { useJobsSocket } from "../hooks/useJobsSocket";
 import { useLiveTracking, type LiveTracking } from "../hooks/useLiveTracking";
+import { keyBelongsToControl } from "../keyboard";
 import { defaultPlaybackRate } from "../playback";
 import type {
   ClipRangeInfo,
@@ -808,12 +809,12 @@ export function ProjectProvider({
     [project, tracks, currentFrame, selectedPointId, addAnchorAt],
   );
 
-  // Ctrl/Cmd+Z and Ctrl+Shift+Z (or Ctrl+Y), ignored while typing in a field.
+  // Ctrl/Cmd+Z and Ctrl+Shift+Z (or Ctrl+Y), left to a text field's own undo
+  // while typing in one.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (!(event.ctrlKey || event.metaKey)) return;
-      const target = event.target as HTMLElement | null;
-      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (keyBelongsToControl(event)) return;
       const key = event.key.toLowerCase();
       if (key === "z" && !event.shiftKey) {
         event.preventDefault();
@@ -831,16 +832,14 @@ export function ProjectProvider({
   // up/down jumps to the selected point's next/previous anchor (its own plus
   // whatever its manual corrections have been promoted to -- the track's
   // `anchors`, which is the one list everything reads), home/end jump to the
-  // first/last frame. Ignored while typing in a field, same guard as undo/redo
-  // above.
+  // first/last frame. Only the keys the focused control uses itself are left
+  // to it (`keyBelongsToControl`): Space on a focused Play button presses the
+  // button rather than also toggling playback here, but the arrows after a
+  // click on that button are still frame steps.
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       if (!project || event.ctrlKey || event.metaKey || event.altKey) return;
-      const target = event.target as HTMLElement | null;
-      // A focused button also treats space/enter as "activate it" -- deferring
-      // to that native behaviour there avoids a focused Play button both
-      // toggling itself and being toggled again by this shortcut.
-      if (target && /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target.tagName)) return;
+      if (keyBelongsToControl(event)) return;
       const lastFrame = Math.max(project.video.frames - 1, 0);
 
       if (event.key === "ArrowRight") {

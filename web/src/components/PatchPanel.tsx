@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
+import { keyBelongsToControl } from "../keyboard";
 import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
 import type { PointPatches, TrackerSetting } from "../types";
@@ -96,14 +97,13 @@ export function PatchPanel({ pointId }: { pointId: string }) {
     [project.id, pointId, afterEdit, reload],
   );
 
-  // Delete/Backspace removes the selected anchor's image. Ignored while typing
-  // in a field, the same guard the rest of the app's shortcuts use.
+  // Delete/Backspace removes the selected anchor's image. Left alone while
+  // typing in a field, the same guard the rest of the app's shortcuts use.
   useEffect(() => {
     if (selectedAnchor === null) return;
     function onKey(event: KeyboardEvent) {
       if (event.key !== "Delete" && event.key !== "Backspace") return;
-      const target = event.target as HTMLElement | null;
-      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (keyBelongsToControl(event)) return;
       event.preventDefault();
       void deleteAnchor(selectedAnchor as number);
     }
