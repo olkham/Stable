@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+from typing import Any
 
 import pytest
 
+from stable.core import project as project_module
 from stable.core.corrections import GapFillCorrection, OffsetCorrection
 from stable.core.errors import ProjectError, SchemaVersionError
 from stable.core.project import (
@@ -98,6 +102,83 @@ def test_saving_twice_is_atomic_and_leaves_no_temp_file(tmp_path):
     project.save()  # saves back to the remembered path
     assert not (tmp_path / "shot.stable.json.tmp").exists()
     assert Project.load(target) == project
+
+
+def test_a_save_waits_out_a_reader_that_has_the_file_open(tmp_path):
+    # The server reads the project file from many threads; on Windows a rename
+    # onto a file another handle has open is refused ("Access is denied"). The
+    # save has to outlast the read rather than fail an edit, or a finished
+    # tracking job, over it. Elsewhere the rename simply succeeds.
+    project = full_project()
+    target = tmp_path / "shot.stable.json"
+    project.save(target)
+    project.point("p2").enabled_for_solve = True
+    reader = open(target, encoding="utf-8")  # noqa: SIM115 - held open on purpose
+    release = threading.Timer(0.05, reader.close)
+    release.start()
+    try:
+        project.save()
+    finally:
+        release.join()
+        reader.close()
+    assert Project.load(target).point("p2").enabled_for_solve is True
+
+
+def _flaky(failures: int, then: Any) -> tuple[list[int], Any]:
+    """An operation that raises PermissionError ``failures`` times, then runs ``then``."""
+    calls: list[int] = []
+
+    def operation(*args: Any) -> Any:
+        calls.append(1)
+        if len(calls) <= failures:
+            raise PermissionError(5, "Access is denied")
+        return then(*args)
+
+    return calls, operation
+
+
+def test_a_briefly_blocked_rename_is_retried_on_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(project_module, "_RETRY_SHARING_VIOLATIONS", True)
+    monkeypatch.setattr(project_module, "_SHARING_RETRY_DELAYS", (0.0,) * 8)
+    calls, flaky_replace = _flaky(3, os.replace)
+    monkeypatch.setattr(project_module.os, "replace", flaky_replace)
+
+    project = full_project()
+    target = project.save(tmp_path / "shot.stable.json")
+
+    assert len(calls) == 4
+    assert Project.load(target) == project
+
+
+def test_a_rename_that_stays_blocked_still_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(project_module, "_RETRY_SHARING_VIOLATIONS", True)
+    monkeypatch.setattr(project_module, "_SHARING_RETRY_DELAYS", (0.0,) * 8)
+    calls, always_refused = _flaky(10**6, os.replace)
+    monkeypatch.setattr(project_module.os, "replace", always_refused)
+
+    with pytest.raises(PermissionError):
+        full_project().save(tmp_path / "shot.stable.json")
+    # Every delay, then one last attempt — bounded, not a hang.
+    assert len(calls) == 9
+
+
+def test_a_permission_error_is_not_retried_where_it_cannot_be_transient(tmp_path, monkeypatch):
+    monkeypatch.setattr(project_module, "_RETRY_SHARING_VIOLATIONS", False)
+    calls, refused_once = _flaky(1, os.replace)
+    monkeypatch.setattr(project_module.os, "replace", refused_once)
+
+    with pytest.raises(PermissionError):
+        full_project().save(tmp_path / "shot.stable.json")
+    assert len(calls) == 1
+
+
+def test_a_read_refused_mid_replace_is_retried_rather_than_reported_missing(monkeypatch):
+    monkeypatch.setattr(project_module, "_RETRY_SHARING_VIOLATIONS", True)
+    monkeypatch.setattr(project_module, "_SHARING_RETRY_DELAYS", (0.0,) * 8)
+    calls, read = _flaky(2, lambda: PLAN_EXAMPLE)
+
+    assert project_module._retry_sharing_violations(read) == PLAN_EXAMPLE
+    assert len(calls) == 3
 
 
 def test_plan_example_parses():
