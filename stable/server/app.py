@@ -25,7 +25,10 @@ from ..core.errors import StableError
 from .routes import edits, export, meta, models, points, projects, solve, ws
 from .storage import ProjectNotFoundError, get_workspace
 
-__all__ = ["create_app", "web_dist_dir"]
+__all__ = ["create_app", "web_dist_dir", "DEV_SERVER_ORIGINS"]
+
+DEV_SERVER_ORIGINS: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
+"""The only cross-origin callers allowed: the Vite dev server (``web/vite.config.ts``)."""
 
 _PACKAGED_WEB_DIST = Path(__file__).resolve().parent / "webdist"
 """Where a packaged build of the frontend lives inside the installed package.
@@ -85,7 +88,7 @@ def create_app() -> FastAPI:
     """Build and return the Stable FastAPI application.
 
     Returns:
-        A fully configured app: CORS open for local development, every REST
+        A fully configured app: CORS limited to the Vite dev server, every REST
         router mounted under ``/api``, the job-progress WebSocket at
         ``/ws/projects/{project_id}`` and ``/ws/models``, and — if a built
         frontend can be found (see :func:`web_dist_dir`) — that build served
@@ -94,13 +97,16 @@ def create_app() -> FastAPI:
     """
     app = FastAPI(title="Stable", version=__version__, lifespan=_lifespan)
 
-    # The frontend normally reaches the API through Vite's dev-server proxy
-    # (same-origin, no CORS involved) or through the static mount below (also
-    # same-origin). This stays permissive anyway since the server never leaves
-    # localhost and never handles credentials.
+    # The frontend reaches the API through Vite's dev-server proxy or through
+    # the static mount below — same-origin either way, so CORS is never what
+    # makes the UI work. It used to allow every origin, which let any web page
+    # the operator happened to visit drive this server (delete projects, start
+    # jobs) and read its answers: "localhost only, no credentials" is exactly
+    # what a drive-by request does not need. Only the dev server's own origins
+    # are allowed, for anything run against it directly.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=list(DEV_SERVER_ORIGINS),
         allow_methods=["*"],
         allow_headers=["*"],
     )

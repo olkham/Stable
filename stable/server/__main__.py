@@ -14,7 +14,10 @@ import argparse
 def main() -> int:
     """Run the Stable server with uvicorn."""
     parser = argparse.ArgumentParser(prog="python -m stable.server")
-    parser.add_argument("--host", default="0.0.0.0")
+    # Loopback, like `stable serve`: the server has no login, so being reachable
+    # from the network is something to ask for with `--host 0.0.0.0`. It is
+    # also what the Vite dev server proxies to (web/vite.config.ts).
+    parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--reload", action="store_true", help="auto-reload on source changes")
     args = parser.parse_args()

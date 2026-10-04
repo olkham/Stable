@@ -37,11 +37,26 @@ first, then the next few, then whatever the OS hands out. Uvicorn is then given
 the already-bound socket to serve on, which is exactly what it does with its
 own internally-bound one. Nothing is printed until that succeeded, and what is
 printed is the port actually held — not the port that was asked for.
+
+Which interface, and which URL
+------------------------------
+The server has no login: anything that can reach it can upload, delete and
+start GPU jobs. So it binds loopback unless asked otherwise (``--host``, or
+``$STABLE_HOST`` to make another choice stick), and ``--host 0.0.0.0`` is the
+deliberate way to let other machines in.
+
+The address that was *bound* is not always one that can be *browsed*: a
+wildcard bind means "every interface", and Windows refuses to connect to
+``0.0.0.0`` at all (``WinError 10049``). Announcing it printed a link that did
+not work and left the browser-opener polling it until it gave up, so the URL
+shown and opened is always one this machine can reach itself
+(:func:`browse_url`), with a separate line for reaching it from elsewhere.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import socket
 import subprocess
@@ -54,6 +69,43 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["add_serve_parser", "run_serve"]
+
+ENV_HOST = "STABLE_HOST"
+"""Environment variable naming the interface ``stable serve`` binds by default."""
+
+DEFAULT_HOST = "localhost"
+"""Loopback only: reaching the server from the network has to be asked for."""
+
+ALL_INTERFACES = frozenset({"0.0.0.0", "::", ""})
+"""Bind addresses meaning "every interface" — never a connectable address."""
+
+
+def default_host() -> str:
+    """Return the interface to bind when ``--host`` is not given.
+
+    Returns:
+        ``$STABLE_HOST`` when it is set, else :data:`DEFAULT_HOST`.
+    """
+    return os.environ.get(ENV_HOST, "").strip() or DEFAULT_HOST
+
+
+def browse_url(host: str, port: int) -> str:
+    """Return the URL to announce and open for a server bound on ``host``.
+
+    Args:
+        host: The interface the socket was bound to.
+        port: The port actually held.
+
+    Returns:
+        ``http://localhost:<port>/`` for a wildcard bind — the machine running
+        the server can always reach it that way — and otherwise a URL for the
+        bound host itself, bracketed when it is an IPv6 literal.
+    """
+    name = "localhost" if host in ALL_INTERFACES else host
+    if ":" in name and not name.startswith("["):
+        name = f"[{name}]"
+    return f"http://{name}:{port}/"
+
 
 PORT_SCAN_RANGE = 10
 """How many ports past the requested one to try before asking the OS to choose.
@@ -82,7 +134,13 @@ def add_serve_parser(subparsers: Any) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--host", default="0.0.0.0", help="interface to bind (default: %(default)s)"
+        "--host",
+        default=default_host(),
+        help=(
+            f"interface to bind (default: %(default)s, or ${ENV_HOST} when set). "
+            "Use 0.0.0.0 to let other machines on your network in -- Stable has "
+            "no login, so only on a network you trust"
+        ),
     )
     parser.add_argument(
         "--port", type=int, default=8000, help="port to bind (default: %(default)s)"
@@ -250,11 +308,18 @@ def run_serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    url = f"http://{args.host}:{port}/"
+    url = browse_url(args.host, port)
     # Flushed explicitly: Python block-buffers stdout when it is not a terminal,
     # so piping or redirecting `stable serve` would otherwise withhold the one
     # line the user is waiting for until the process exits.
     print(f"Stable is running at {url}  (Ctrl+C to stop)", flush=True)
+    if args.host in ALL_INTERFACES:
+        print(
+            "Listening on every network interface: from another machine use "
+            f"http://{socket.gethostname()}:{port}/ or this computer's IP address. "
+            "Stable has no login, so only do this on a network you trust.",
+            flush=True,
+        )
     # Where the gigabytes go is worth one line: it moved in this version, and
     # it is the first thing to check when a drive starts filling up.
     print(f"Projects are stored in {workspace_root()}", flush=True)

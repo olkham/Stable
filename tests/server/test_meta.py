@@ -13,6 +13,28 @@ def test_health(client: TestClient) -> None:
     assert "version" in body
 
 
+def test_only_the_dev_server_may_call_across_origins(client: TestClient) -> None:
+    # The UI is same-origin (static mount or Vite's proxy), so an open CORS
+    # policy only ever helped *other* pages: any site the operator visited
+    # could have deleted projects or started jobs here and read the answers.
+    stranger = client.get("/api/health", headers={"Origin": "https://example.com"})
+    assert stranger.status_code == 200
+    assert "access-control-allow-origin" not in stranger.headers
+
+    preflight = client.options(
+        "/api/projects/abc",
+        headers={
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "DELETE",
+        },
+    )
+    assert preflight.status_code == 400
+    assert "access-control-allow-origin" not in preflight.headers
+
+    dev = client.get("/api/health", headers={"Origin": "http://localhost:5173"})
+    assert dev.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
 def test_trackers_lists_builtins(client: TestClient) -> None:
     response = client.get("/api/trackers")
     assert response.status_code == 200

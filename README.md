@@ -41,6 +41,11 @@ stable sample          # writes ./stable-sample/{clip.mp4, tracks.json, curves.c
 no GPU, no model download, nothing to configure — so there is something
 concrete to look at within seconds of installing.
 
+`stable serve` listens on this machine only. To open it from another computer
+on your network, run `stable serve --host 0.0.0.0` (or set
+`STABLE_HOST=0.0.0.0` to make that the default) — Stable has no login, so do
+that only on a network you trust.
+
 Everything a track does hangs off its **anchors**. An anchor says "on this
 frame, this feature is *here*"; you can place one on any frame, track forwards
 or backwards from it with the `◀` / `▶` beside it on the track's card, and
