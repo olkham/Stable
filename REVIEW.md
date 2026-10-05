@@ -41,18 +41,19 @@ bitmaps on the client. The problems found in this review are almost all
 **cost that grows with clip length** in paths that run once per frame, and a
 handful of **input and launch regressions**.
 
-Baseline measured on this machine before any change (Windows 11, Python
-3.11.9, Node 24):
+Measured on this machine (Windows 11, Python 3.11.9, Node 24), before any
+change and after this pass (§6):
 
-| Check | Result |
-|---|---|
-| `pytest -m "not integration"` | **2,332 passed, 3 failed, 1 error** |
-| `ruff check stable tests` | clean |
-| `mypy stable` | clean (92 files) |
-| `npm run build` | clean (297.8 kB JS, 94.4 kB gzip) |
-| packaged `stable/server/webdist` | **stale** — commit `7129d05` changed `ModelManager.tsx` without rebuilding it |
+| Check | Before | After |
+|---|---|---|
+| `pytest -m "not integration"` | **2,332 passed, 3 failed, 1 error** | 2,350 passed, 2 failed (the two solver-tolerance tests below) |
+| `pytest -m integration` | not run | 8 passed |
+| `ruff check stable tests` | clean | clean; every touched file also `ruff format`-clean |
+| `mypy stable` | clean (92 files) | clean (92 files) |
+| `npm run build` | clean (297.8 kB JS, 94.4 kB gzip) | clean (300.1 kB JS, 95.4 kB gzip) |
+| packaged `stable/server/webdist` | **stale** — commit `7129d05` changed `ModelManager.tsx` without rebuilding it | rebuilt from this source |
 
-The four failures:
+The four failures before:
 
 * `test_phase3_acceptance.py` ×2 — the solver rotation tolerance
   (`2.079e-4` against `2e-4`). Recorded since round 7; numerical, not a
@@ -116,9 +117,9 @@ merged.
 | 6 | `todos_5` | Detached-bitmap crash, play range, live crop preview, targets on the output canvas, Edit tab removed, patch cache warmer | Done |
 | 7 | `todo_6` (rewritten) | One word, *anchor*; every anchor deletable; track forwards/backwards from an anchor; "anchors changed" | Done (`fable_rework`'s keyframe version superseded, §2) |
 | 8 | `todo_7` | Search radius, cancel tracking, per-track eye, hidden = not editable, one bidirectional button, refresh all, delete from canvas, full-res tracking, size interpolation | **Partial** — never had a plan file; audited in §3.8 |
-| 9 | `todo_8` | Add-anchor stays armed, ghost removed, replace by default, disclosure arrow, track eye, track colour, labels, separators | Done (one hole: U6) |
+| 9 | `todo_8` | Add-anchor stays armed, ghost removed, replace by default, disclosure arrow, track eye, track colour, labels, separators | Done; its one hole (U6) closed in this pass |
 | 10 | `todo_9` | Per-track smoothing, composite tracks, play range on In/Out, clean output view, ~30 fps default, render queue | Done |
-| — | commit `7129d05` | Data root beside the install, legacy `~/.stable` migration, video-path repair | Done; introduced U2 and the stale `webdist` |
+| — | commit `7129d05` | Data root beside the install, legacy `~/.stable` migration, video-path repair | Done; introduced U2 and the stale `webdist`, both fixed in this pass |
 
 ### 3.1 Round 1 — `done/todos`
 
@@ -209,7 +210,7 @@ the second anchor list in the patch panel removed.
 | Replace "pyramid levels" with a search radius | **Partial.** LK still exposes `max_level` as its control; the panel adds a derived "Search reach ±N px" beside it (`tracker_options.py`, `PatchPanel.tsx`) |
 | Cancel tracking that is running | **Not done.** `JobManager.cancel` refuses anything past `queued` (U4) |
 | One show/hide toggle per track | Done in round 9 (`TrackVisibility.tsx`) |
-| No edits to a hidden track | **Partial.** Hit tests skip hidden tracks, but click-to-move and the add-anchor tool still edit the *selected* track when it is hidden (U6) |
+| No edits to a hidden track | Hit tests skipped hidden tracks, but click-to-move and the add-anchor tool still edited the *selected* one (U6) — **closed in this pass** (§6.3) |
 | Track forwards and backwards with one button | **Partial.** "Track all N" runs every anchor both ways; there is no single ◀▶ from one anchor, though the API already accepts `direction: "bidir"` |
 | Refresh all tracks between anchors | **Not done** as a multi-track action; per track only |
 | Delete anchors from the canvas | Done in round 7 |
@@ -235,13 +236,13 @@ a stored render queue with an ordered runner and measured estimates.
 
 ## 4. Review findings, 2026-10-04
 
-IDs are stable so later rounds can refer to them. **Priority**: P1 = do now,
-P2 = next, P3 = when convenient. **Effort**: S < ½ day, M ≈ 1–2 days, L > 2
+IDs are stable so later rounds can refer to them. **Priority**: high = do now,
+medium = next, low = when convenient. **Effort**: S < ½ day, M ≈ 1–2 days, L > 2
 days. Line numbers are as of `25f4cf5`.
 
 ### 4.1 Performance
 
-**P1 · Export tab: every streamed frame recomputes the whole clip — P1, M**
+**P1 · Export tab: every streamed frame recomputes the whole clip — high, M**
 `routes/ws.py` `_geometry_payload` runs for each frame the export tab draws. It
 re-reads and re-parses `project.stable.json`, `solve.json` and the render
 options; `frames.load_smoothed` **re-runs the smoothing chain over the whole
@@ -265,7 +266,7 @@ smoothed motion, **resolved target paths**, revision) keyed on file stamps, so a
 frame costs a few `stat`s and O(targets). Fold the project file's stamp into the
 plan key while there (R3).
 
-**P2 · Playback redraws every path, segment by segment, every frame — P1, M**
+**P2 · Playback redraws every path, segment by segment, every frame — high, M**
 `Viewer.tsx` main draw effect (l. 480–911) repaints the frame *and* every
 track's full path on each new frame, hover state change and mouse move during a
 drag. In the default "colour by confidence" mode each segment is its own
@@ -274,12 +275,14 @@ drag. In the default "colour by confidence" mode each segment is its own
 on a 10,000-frame clip — which dominates the frame budget during playback and
 makes dragging a point lag. The canvas backing store is also reallocated on
 every draw (l. 487–490), which clears and re-creates it.
-*Fix:* quantise confidence into a fixed set of colour buckets and stroke one
-path per bucket (≤ 32 strokes per track, visually identical), with the bucket
-of each segment computed once per loaded track; resize the canvas only when its
-size changes.
+*Fix:* the trails do not change from one frame to the next, so draw them once
+into an off-screen layer and copy that per frame, redrawing it only when the
+view, the tracks or the overlay settings change; build each track's paths once
+(confidence quantised into 32 shades, one path per shade); resize the canvas
+only when its size changes. (Stroking cached paths on every frame without the
+layer was tried first and measured: see §6.4.)
 
-**P3 · The timeline repaints the whole clip on every playhead move — P1, S**
+**P3 · The timeline repaints the whole clip on every playhead move — high, S**
 `Timeline.tsx` (l. 128–249) redraws the heat strip with one `fillRect` and one
 `confidenceColor()` string **per frame of the clip** whenever `currentFrame`
 changes, i.e. every frame of playback, and reallocates the canvas each time.
@@ -292,7 +295,7 @@ into an off-screen layer, per pixel column, coloured by the **worst** frame in
 the column; per frame, blit it and draw the playhead. DPR-aware, resized by a
 `ResizeObserver`.
 
-**P4 · Live tracking resends the whole partial path several times a second — P2, M**
+**P4 · Live tracking resends the whole partial path several times a second — medium, M**
 `tracking.LivePartialTrack.publish` puts two clip-length lists on the job, and
 `jobs._FrameCursor` updates the same job every 0.1 s, so `_stream_jobs`
 (`routes/ws.py` l. 80–102) re-sends the complete event — both arrays — on every
@@ -302,7 +305,7 @@ the column; per frame, blit it and draw the playhead. DPR-aware, resized by a
 let the client keep the last one; coalesce socket messages into one state update
 per animation frame.
 
-**P5 · One context for everything — P2, L**
+**P5 · One context for everything — medium, L**
 `ProjectContext` publishes one value containing the playhead, the job table,
 live tracking, tracks, selection and settings. Every consumer — both Tracks
 panels, the Export, Solve and Smoothing panels, the curve editor — re-renders on
@@ -311,7 +314,7 @@ every frame of playback and every job message.
 their own contexts or a selector store (`useSyncExternalStore`), so a panel only
 re-renders for what it reads.
 
-**P6 · Uploading a clip holds all of it in memory and blocks the server — P2, S**
+**P6 · Uploading a clip holds all of it in memory and blocks the server — medium, S**
 `routes/projects.py` `create_project` is an `async` handler that does
 `await file.read()` (the whole clip in RAM — these are multi-GB files) and then
 writes it and probes it with PyAV **on the event loop**, freezing every
@@ -319,22 +322,22 @@ WebSocket and request until it finishes.
 *Fix:* stream the spooled upload to `video/source.<ext>` with
 `shutil.copyfileobj` in a worker thread.
 
-**P7 · `GET /projects/{id}` recomputes every track — P3, S**
+**P7 · `GET /projects/{id}` recomputes every track — low, S**
 `serialize._load_track_stats` loads each point's `.npz`, re-applies its
 corrections (including per-track smoothing) and parses its merge report on every
 project refresh, which the client asks for after most actions.
 *Fix:* cache the stats per point keyed on the project file's and the track's
 stamps.
 
-**P8 · Smaller per-frame costs — P3, S**
-`output_frame_jpeg` re-loads the project for every output frame (`ws.py`
-`_frame_payload`); each Tracks-panel strip redraws its own per-column strip and
-reallocates its canvas on every playhead move; `_stream_jobs` deep-compares
-every job's event dict on every poll.
+**P8 · Smaller per-frame costs — low, S**
+Each Tracks-panel strip redraws its own per-column strip and reallocates its
+canvas on every playhead move (the main timeline's fix, P3, applies as is);
+`_stream_jobs` deep-compares every job's event dict on every poll. (The stream
+also re-loaded the project for every output frame — fixed with P1.)
 
 ### 4.2 UI/UX
 
-**U1 · Keyboard shortcuts stop working after clicking any button or checkbox — P1, S**
+**U1 · Keyboard shortcuts stop working after clicking any button or checkbox — high, S**
 The global handlers (`ProjectContext.tsx` l. 816 and 843, `Viewer.tsx` l. 1235,
 `PatchPanel.tsx` l. 106) ignore **every** key while focus is on a `BUTTON` or
 any `INPUT`. Clicking leaves focus on the control in Chromium, so after
@@ -345,7 +348,7 @@ keys a slider or text field uses should be deferred.
 *Fix:* one shared `keyBelongsToControl(event)` that knows which keys each kind
 of control consumes, used by every handler.
 
-**U2 · `stable serve` on Windows prints a dead URL, never opens the browser, and is open to the LAN — P1, S**
+**U2 · `stable serve` on Windows prints a dead URL, never opens the browser, and is open to the LAN — high, S**
 `7129d05` changed the default `--host` to `0.0.0.0` (`cli/serve.py` l. 85,
 `server/__main__.py`). The announced and auto-opened URL is built from the bind
 address, and on Windows `http://0.0.0.0:8000/` cannot be connected to
@@ -360,12 +363,12 @@ always same-origin (static mount, or Vite's proxy).
 loopback URL whatever was bound, and say how to reach it from elsewhere; limit
 CORS to the Vite dev server's origins.
 
-**U3 · `Ctrl` `+` / `−` / `0` are captured by the canvas zoom — P1, S**
+**U3 · `Ctrl` `+` / `−` / `0` are captured by the canvas zoom — high, S**
 `Viewer.tsx` l. 1232–1252 handles `+`, `-`, `0` without checking modifiers and
 calls `preventDefault`, so the browser's own page zoom shortcuts zoom the
 canvas instead. Bundled with U1.
 
-**U4 · A running track cannot be cancelled — P2, M**
+**U4 · A running track cannot be cancelled — medium, M**
 `todo_7`. Only queued jobs can be dropped (`jobs.py` l. 343–373). A mistaken
 run on a deep tracker is minutes of GPU with no way out but restarting the
 server.
@@ -373,12 +376,12 @@ server.
 callback checks and raises on; trackers already report progress per frame or
 chunk, and nothing is written until a run completes.
 
-**U5 · Mouse-only interaction — P3, M**
+**U5 · Mouse-only interaction — low, M**
 The canvas, timeline, track strips and curve editor use mouse events only, so
 pens and touch screens cannot place, drag or scrub. *Fix:* pointer events with
 pointer capture.
 
-**U6 · Click-to-move edits a hidden track — P1, S**
+**U6 · Click-to-move edits a hidden track — high, S**
 `todo_7`/`todo_8` asked that a hidden track cannot be edited. Hit tests skip
 hidden tracks, but `Viewer.tsx` `handleClick` (l. 1269–1298) still applies a
 correction to the **selected** track at the clicked position when that track is
@@ -387,7 +390,7 @@ screen, on a stray click. The hint line meanwhile invites the click.
 *Fix:* refuse both for a hidden selected track and say why in the hint.
 Bundled with U1.
 
-**U7 · Errors that go nowhere — P2, S**
+**U7 · Errors that go nowhere — medium, S**
 Several buttons await a request without handling its failure, so a refusal is an
 unhandled rejection and nothing on screen changes: "Track all N", the tracker
 picker and "Delete track" (`TrackTimelinePanel.tsx` l. 409–413, 461–466,
@@ -395,31 +398,32 @@ picker and "Delete track" (`TrackTimelinePanel.tsx` l. 409–413, 461–466,
 (`ProjectPicker.tsx` l. 96–100). *Fix:* route them to the panel's existing
 error line.
 
-**U8 · Two Tracks panels — P2, M**
+**U8 · Two Tracks panels — medium, M**
 `flags.ts` keeps the classic card and the timeline redesign side by side
 "while the redesign is being judged"; every feature since has been written
 twice or shared through helper components. The timeline variant is the default.
 *Decide, then delete the other variant and the flag.*
 
-**U9 · The frame label hides a lagging picture — P3, S**
+**U9 · The frame label hides a lagging picture — low, S**
 Round 5 promised `frame 259 / 500 · showing 244` while a frame is in flight; the
 label shows only the playhead (`Viewer.tsx` l. 1978). *Fix:* show `viewFrame`
 when it differs.
 
-**U10 · Accessibility basics — P3, S**
+**U10 · Accessibility basics — low, S**
 Tool buttons are glyphs with a `title` only and no `aria-label`; the tool group
 is `role="radiogroup"` around `aria-pressed` buttons; project rows are clickable
 `<li>`s that cannot be focused; there is no `:focus-visible` style; the
-timeline is not a slider to assistive technology.
+timeline is not a slider to assistive technology. (Cosmetic, same area: there
+is no favicon, so every page load logs a 404.)
 
-**U11 · `todo_7` leftovers — P2, M–L**
+**U11 · `todo_7` leftovers — medium, M–L**
 A pixel search radius for LK instead of pyramid levels; one ◀▶ button from an
 anchor (`direction: "bidir"` is already supported); "re-track every track";
 a window size interpolated between anchors for subjects that change size.
 
 ### 4.3 Reliability and security
 
-**R1 · Saving a project fails on Windows while anything is reading it — P1, S**
+**R1 · Saving a project fails on Windows while anything is reading it — high, S**
 `Project.save` writes a temp file and `os.replace`s it over
 `project.stable.json` (`core/project.py` l. 482–486). On Windows a rename onto
 a file that another handle has open fails with `WinError 5`, and the server
@@ -432,23 +436,30 @@ can fail, which `load_project` turns into a 404.
 *Fix:* retry both briefly (bounded backoff, Windows only) — the standard remedy
 for this sharing violation.
 
-**R2 · Side-car JSON is written in place — P2, S**
+**R2 · Side-car JSON is written in place — medium, S**
 `history.json`, `render_queue.json`, `clip_range.json`, tracker options, merge
 reports and the motion caches use `write_text` (truncate, then write), so a
 concurrent reader can see half a file and fail to parse it. *Fix:* one
 `atomic_write_text` helper (temp file + the R1 retrying replace) for all of
 them.
 
-**R3 · The preview plan ignores track edits until a re-solve — P2, S**
+**R3 · The preview plan can outlive a change to the tracks it holds — medium, S**
 The plan cache key (`frames._plan_key`) covers the caches, options, markers,
 border and clip size, but not the project file, while the plan's targets are
-resolved from the *current* tracks. After an edit to a target's track the
-preview keeps the old fit until something else changes — and an export, which
-builds a fresh plan, does not match it. *Fix:* include the project file's stamp
-in the key (done with P1).
+resolved from the *current* tracks. The interactive edit routes (corrections,
+undo/redo, adding or deleting an anchor) clear the plan cache themselves, but
+the other writers do not: a finished track or retrack job, a `PATCH`ed point
+(taking it out of the solve changes an "all tracks" target), a derived or
+deleted point. After one of those the preview keeps the old fit until something
+else changes — and an export, which builds a fresh plan, does not match it.
+*Fix:* include the project file's stamp in the key, so every writer counts
+(done with P1). *Corrected during execution:* the first draft of this finding
+said every edit was affected; the edit routes' explicit cache clears were
+found when the regression test passed without the fix, and the test now uses
+an uncovered writer.
 
 **R4 · Exposure** — see U2: all interfaces by default, open CORS, no
-authentication. WebSocket origins are not checked either (P3).
+authentication. WebSocket origins are not checked either (low).
 
 ### 4.4 Code health and process
 
@@ -475,7 +486,7 @@ this pass (§6); the rest are proposed.
 | 1 | R1 | Retry Windows sharing violations when saving/loading a project | Reliability | S | Executed |
 | 2 | U2, R4 | `stable serve`: loopback default, a URL that works on Windows, CORS limited to the dev server | UX / security | S | Executed |
 | 3 | U1, U3, U6 | Input handling: shortcuts after clicking a control, browser zoom keys, no click-edits on hidden tracks | UX | S | Executed |
-| 4 | P2, P3 | Playback rendering: bucketed path strokes, cached timeline strip | Performance | M | Executed |
+| 4 | P2, P3 | Playback rendering: trails drawn once into a layer, cached timeline strip | Performance | M | Executed |
 | 5 | P1, R3 | Export tab: memoised per-frame geometry context | Performance | M | Executed |
 | 6 | P4 | Live-tracking events: send the partial path only when it changes; batch on the client | Performance | M | Proposed |
 | 7 | P6 | Stream uploads to disk off the event loop | Performance | S | Proposed |
@@ -493,50 +504,133 @@ this pass (§6); the rest are proposed.
 
 ## 6. Executed in this pass
 
-Branch `review/perf-ux-pass`, on top of `main` and the `fable_rework` merge.
-Each fix is its own commit with its tests.
+Branch `review/perf-ux-pass`, on top of `main` and the `fable_rework` merge
+(`25f4cf5`). One commit per fix, each with its tests (R1 has a small
+follow-up), then one rebuilding the packaged frontend:
+
+| Commit | Fix |
+|---|---|
+| `8dc36b8`, `51fe202` | R1 — retry Windows sharing violations on the project file (and not a directory, which can never clear) |
+| `ab03d8e` | U2, R4 — `stable serve` on loopback, a reachable URL, CORS for the dev server only |
+| `675ea19` | U1, U3, U6 — input handling |
+| `cb03521` | P2, P3 — playback rendering |
+| `19bf7d5` | P1, R3 — export-tab geometry context |
+| `c2dd703` | Packaged `stable/server/webdist` rebuilt (it was already stale, C1) |
+
+The frontend fixes were verified in a real browser: the app served against a
+throwaway workspace (a 3,000-frame, six-track, solved and smoothed synthetic
+project), driven by Playwright in system Chrome on this machine's GPU, with the
+same script run against a build of `main` and a build of this branch.
 
 ### 6.1 R1 — Windows sharing violations on the project file
 
-*Planned:* `Project.save` retries `os.replace` and `Project.load` retries the
-read on `PermissionError`, with a bounded backoff, on Windows only (elsewhere
-the error is never transient, so it is raised at once as before). Tests force
-the error and check both the retry and the give-up.
+`Project.save` retries `os.replace`, and `Project.load` retries the read, on
+`PermissionError` with a bounded backoff (about 0.6 s in all), on Windows only;
+elsewhere the error is never transient and is raised at once, as before. A
+directory where the file should be is also reported as `PermissionError` on
+Windows; it can never clear, so it is not retried (found while checking the
+suite's timings: it cost 0.6 s per failure).
+
+*Verified:* a test that saves while a real reader holds the file open passes,
+and fails with `WinError 5` when the retry is switched off. Five more tests pin
+the retry count, the give-up, no retry off Windows, the read path, and no
+retry for a directory. The `test_frame_stream.py` setup error from the baseline
+is gone.
 
 ### 6.2 U2 + R4 — `stable serve`
 
-*Planned:* default host `localhost` (overridable with `STABLE_HOST`, and
-`--host 0.0.0.0` as before); the announced, polled and opened URL is always a
-loopback one, with a note naming how to reach a network-bound server from
-another machine and that it has no authentication; the dev runner gets the same
-default; CORS allows the Vite dev server's origins only.
+Default host `localhost` again, with `STABLE_HOST` to change the default and
+`--host 0.0.0.0` to opt into the network (the Dockerfile already passes it).
+The announced, polled and opened URL is always one this machine can reach
+(`browse_url`): a wildcard bind is shown as `http://localhost:<port>/`, plus a
+line naming how to reach it from elsewhere and that Stable has no login.
+`python -m stable.server` defaults to loopback too. CORS allows only the Vite
+dev server's origins; the UI itself is same-origin, so nothing it does changed.
+README documents the network option.
+
+*Verified:* the baseline's `test_serve_subcommand_is_registered` failure now
+passes; new tests cover `STABLE_HOST`, the URL for wildcard and IPv6 binds,
+that a wildcard bind polls and opens a loopback URL and prints the warning, and
+that a foreign origin gets no CORS headers (and a failed preflight for `DELETE`)
+while the dev server's origin does.
 
 ### 6.3 U1 + U3 + U6 — input handling
 
-*Planned:* `web/src/keyboard.ts` decides whether a key belongs to the focused
-control (text fields and selects: all keys; sliders: arrows, Home/End, Page
-keys; checkboxes, buttons, colour pickers: Space/Enter) and every global
-shortcut handler uses it. Canvas zoom ignores `Ctrl`/`⌘`/`Alt` chords.
-Click-to-move and the add-anchor tool refuse a hidden selected track, and the
-hint says so.
+`web/src/keyboard.ts` decides which keys the focused control really uses —
+every key for text fields, text areas, selects and editable content; the
+movement keys for sliders and radios; Space/Enter for buttons, checkboxes and
+other activatable controls — and every global handler (frame navigation and
+tools, undo/redo, canvas zoom, the patch panel's Delete) defers only those.
+Canvas zoom ignores `Ctrl`/`⌘`/`Alt` chords, so the browser's page zoom works
+again. Click-to-move and the add-anchor tool refuse a hidden selected track
+with a hint, and the cursor and hint line stop inviting the click.
+
+*Verified:* the key-ownership rules against 18 cases in a scratch harness, and
+in the browser:
+
+| Check | `main` | This branch |
+|---|---|---|
+| Click Play, click Pause, press → three times | frame does not move | frame +3 |
+| Hide the selected track, click the frame | `POST …/p1/corrections` sent | nothing sent; hint explains |
 
 ### 6.4 P2 + P3 — playback rendering
 
-*Planned:* confidence-coloured paths stroked per colour bucket (32 buckets,
-bucket per segment cached per loaded track); canvases resized only when their
-size changes; the timeline's strip drawn once per input change into an
-off-screen layer, per pixel column coloured by the column's worst frame,
-DPR-aware and resized with its container — the playhead is the only thing drawn
-per frame.
+* **Trails as a layer.** Every track's trails (the path, the smoothed path, a
+  running job's partial path) are drawn into an off-screen layer that is
+  redrawn only when the view, the tracks, their smoothing, the selection, the
+  colouring, the overlay switches or a live partial path change; a frame of
+  playback copies the layer and draws only what is about that frame (markers,
+  rings, anchors, windows, the export overlay). The paths themselves are built
+  once per loaded track as `Path2D`s in source pixels (`web/src/trackPaths.ts`),
+  confidence quantised to 32 shades — indistinguishable on the ramp.
+* **Timeline.** The strip is drawn off-screen once per change of what it
+  shows, per pixel column, each column taking its *worst* frame (so short dips
+  stay visible on long clips — the strip's whole job); DPR-aware; resized by a
+  `ResizeObserver`; per frame it is one copy and the playhead.
+* Canvases are reallocated only when their size changes (`web/src/canvas.ts`).
+
+*Measured* over 6 s of playback, two runs each (the clip is 30 fps):
+
+| Playback | Video frames painted | Main thread busy | JS time |
+|---|---|---|---|
+| 1×, `main` | 177–179 | 36–37% | 1.8–1.9 s |
+| 1×, this branch | 176 | 12–13% | 0.4–0.5 s |
+| 4×, `main` | 279–328 | 56–66% | 2.8–3.3 s |
+| 4×, this branch | 450–451 (the display's cap) | 25% | 0.9 s |
+
+*Found on the way, and why the trails are a layer.* The first version stroked
+the cached per-shade paths on every frame instead. In isolation that halved the
+cost of a redraw (9.1 ms against 18.8 ms with a GPU sync, six 3,000-frame
+tracks), and it cut the main thread to 11–17% — but on this machine's
+integrated GPU a few long multi-contour strokes were slower to *rasterise* than
+thousands of one-segment ones, and at 4× it painted fewer frames than `main`
+(244–250 against 279–328). Measuring the Viewer and Timeline halves separately
+isolated it to the Viewer. Drawing pixels that do not change once, rather than
+cheaply every frame, fixed both sides.
 
 ### 6.5 P1 + R3 — export-tab geometry
 
-*Planned:* `frames.geometry_context()` memoises project, plan, options,
-smoothed motion, resolved target paths and revision per project, keyed on the
-stamps of the files they come from; `frame_geometry` / `target_residuals` take
-the resolved paths instead of recomputing them; the frame stream uses it for
-geometry and output frames; the plan key includes the project file. Re-measured
-with the benchmark above.
+`frames.geometry_context()` builds the project, plan, options, smoothed
+motion, every target's resolved path and the revision once, and hands back the
+same object until a file they came from changes (keyed on `stat` stamps, so an
+unchanged call reads nothing). `frame_geometry` and `target_residuals` take the
+resolved paths; the frame stream uses the context for geometry and for output
+frames (no project re-parse per output frame). The plan key now includes the
+project file's stamp (R3), and `recompute_smoothed` clears the contexts along
+with the plan cache.
+
+*Measured* with the same synthetic 4-track, two-target project as §4.1:
+
+| Clip length | Per-frame geometry before | After (warm) | First frame after a change |
+|---|---|---|---|
+| 3,000 frames | 73 ms | 0.1 ms | 0.4 s (as before: the plan build) |
+| 10,000 frames | 235 ms | 0.1 ms | 1.2 s (as before) |
+
+*Verified:* the context is reused while nothing changes and rebuilt after an
+options change; cached geometry equals geometry computed from scratch for a raw
+and a smoothed target; and taking a held point out of the solve moves the
+preview (residual stays ~0) — a test that fails when the project file is left
+out of the key.
 
 ---
 
