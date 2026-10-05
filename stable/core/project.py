@@ -93,11 +93,15 @@ only delay the error.
 """
 
 
-def _retry_sharing_violations(operation: Callable[[], _T]) -> _T:
+def _retry_sharing_violations(operation: Callable[[], _T], path: str) -> _T:
     """Run a file operation, retrying while another handle briefly holds the file.
 
     Args:
         operation: The open or rename to attempt.
+        path: The file it acts on. Windows reports a directory there as
+            ``PermissionError`` too, but that is a mistake rather than a
+            moment's contention, so it fails at once instead of after every
+            retry.
 
     Returns:
         Whatever ``operation`` returns, from the first attempt that succeeds.
@@ -105,7 +109,7 @@ def _retry_sharing_violations(operation: Callable[[], _T]) -> _T:
     Raises:
         PermissionError: From the last attempt, if the file stays held.
     """
-    if _RETRY_SHARING_VIOLATIONS:
+    if _RETRY_SHARING_VIOLATIONS and not os.path.isdir(path):
         for delay in _SHARING_RETRY_DELAYS:
             try:
                 return operation()
@@ -530,7 +534,7 @@ class Project:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(self.to_json())
             handle.write("\n")
-        _retry_sharing_violations(lambda: os.replace(tmp, target))
+        _retry_sharing_violations(lambda: os.replace(tmp, target), target)
         self.path = target
         return target
 
@@ -557,7 +561,7 @@ class Project:
         try:
             # A read that lands while a save is replacing the file can be
             # refused on Windows; it is a moment, not a missing project.
-            text = _retry_sharing_violations(read)
+            text = _retry_sharing_violations(read, target)
         except OSError as exc:
             raise ProjectError(f"cannot read project {target}: {exc}") from exc
         return cls.from_json(text, path=target)

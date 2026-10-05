@@ -172,13 +172,26 @@ def test_a_permission_error_is_not_retried_where_it_cannot_be_transient(tmp_path
     assert len(calls) == 1
 
 
-def test_a_read_refused_mid_replace_is_retried_rather_than_reported_missing(monkeypatch):
+def test_a_read_refused_mid_replace_is_retried_rather_than_reported_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(project_module, "_RETRY_SHARING_VIOLATIONS", True)
     monkeypatch.setattr(project_module, "_SHARING_RETRY_DELAYS", (0.0,) * 8)
     calls, read = _flaky(2, lambda: PLAN_EXAMPLE)
 
-    assert project_module._retry_sharing_violations(read) == PLAN_EXAMPLE
+    target = str(tmp_path / "shot.stable.json")
+    assert project_module._retry_sharing_violations(read, target) == PLAN_EXAMPLE
     assert len(calls) == 3
+
+
+def test_a_directory_where_the_project_should_be_fails_at_once(tmp_path, monkeypatch):
+    # Windows reports opening a directory as PermissionError too; that is a
+    # mistake, not contention, and must not wait out every retry first.
+    monkeypatch.setattr(project_module, "_RETRY_SHARING_VIOLATIONS", True)
+    waits: list[float] = []
+    monkeypatch.setattr(project_module.time, "sleep", waits.append)
+
+    with pytest.raises(ProjectError):
+        Project.load(tmp_path)
+    assert waits == []
 
 
 def test_plan_example_parses():
