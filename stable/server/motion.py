@@ -66,6 +66,7 @@ __all__ = [
     "save_render_options",
     "named_track",
     "smoothed_paths",
+    "ResolvedTargets",
     "resolve_targets",
     "target_label",
     "target_residuals",
@@ -340,9 +341,13 @@ def smoothed_paths(project: Project, motion: SmoothedMotion) -> dict[str, np.nda
     return out
 
 
+ResolvedTargets = tuple[np.ndarray, np.ndarray, np.ndarray]
+"""``(sources[K, T, 2], placements[K, 2], weights[K, T])``: see :func:`resolve_targets`."""
+
+
 def resolve_targets(
     project: Project, target: StabilizationTarget, motion: SmoothedMotion
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+) -> ResolvedTargets | None:
     """Turn the operator's marks into the arrays the plan fits.
 
     Args:
@@ -408,6 +413,8 @@ def target_residuals(
     target: StabilizationTarget,
     frame: int,
     motion: SmoothedMotion | None = None,
+    *,
+    resolved: ResolvedTargets | None = None,
 ) -> list[dict[str, Any]]:
     """Report where each held path actually lands, and how far that misses by.
 
@@ -425,6 +432,10 @@ def target_residuals(
         frame: Which frame to report for.
         motion: The smoothed motion, needed only when a mark holds a smoothed
             path. Without it those rows report no landing rather than guessing.
+        resolved: :func:`resolve_targets` for these marks, when the caller
+            already has it. Resolving loads every held track and, for a
+            smoothed mark, warps every frame of it — the frame stream reports
+            one frame at a time and must not pay that per frame.
 
     Returns:
         One row per mark: its id, the tracks it holds, what it was asked for,
@@ -436,11 +447,8 @@ def target_residuals(
     output_transform = plan.geometry.fit.compose(
         plan.transforms[index] if plan.transforms else plan.geometry.fit
     )
-    resolved = (
-        resolve_targets(project, target, motion)
-        if motion is not None and target.points
-        else None
-    )
+    if resolved is None and motion is not None and target.points:
+        resolved = resolve_targets(project, target, motion)
 
     rows: list[dict[str, Any]] = []
     for k, mark in enumerate(target.points):
@@ -458,16 +466,12 @@ def target_residuals(
             "residual": None,
         }
         source_point = (
-            resolved[0][k][index]
-            if resolved is not None and index < resolved[0].shape[1]
-            else None
+            resolved[0][k][index] if resolved is not None and index < resolved[0].shape[1] else None
         )
         if source_point is not None and np.isfinite(source_point).all():
             landed = output_transform.apply(source_point)
             row["landed"] = [float(landed[0]), float(landed[1])]
-            row["residual"] = float(
-                np.hypot(landed[0] - wanted[0], landed[1] - wanted[1])
-            )
+            row["residual"] = float(np.hypot(landed[0] - wanted[0], landed[1] - wanted[1]))
         rows.append(row)
     return rows
 

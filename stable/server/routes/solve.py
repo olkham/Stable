@@ -42,6 +42,7 @@ from .. import motion as motion_glue
 from ..clip_range import effective_range
 from ..frames import (
     FrameUnavailable,
+    clear_geometry_contexts,
     export_range,
     load_options,
     load_smoothed,
@@ -88,6 +89,7 @@ def recompute_smoothed(
     payload = motion_glue.smoothed_payload(smoothed)
     motion_glue.write_json(smoothing_cache_path(workspace, project_id), payload)
     motion_glue.clear_plan_cache(project_id)
+    clear_geometry_contexts(project_id)
     return payload
 
 

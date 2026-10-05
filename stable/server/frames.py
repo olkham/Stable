@@ -25,11 +25,23 @@ frame cannot be produced without them and :mod:`stable.server.routes.solve`
 would otherwise have to import this module while this module imported it.
 Those four are re-exported from ``routes.solve``, which is where they used to
 live and where the rest of the server still reaches for them.
+
+Per frame, only per-frame work
+------------------------------
+The frame stream asks for geometry on every frame the export tab draws, and
+almost nothing it needs depends on the frame: the project, the plan, the
+options, the smoothed motion, and every target's held path over the whole
+clip. :func:`geometry_context` builds those once per change of the files they
+come from and hands back the same object until then — rebuilding them per frame
+re-read the solve, re-ran the smoothing and re-resolved every target track, all
+O(clip length), for every frame streamed (REVIEW.md P1).
 """
 
 from __future__ import annotations
 
 import hashlib
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +56,7 @@ from ..smoothing.motion import SmoothedMotion
 from ..solver.motion import MotionSolve
 from . import motion as motion_glue
 from .clip_range import CLIP_RANGE_CACHE, export_window
-from .storage import Workspace
+from .storage import PROJECT_FILENAME, Workspace
 
 __all__ = [
     "VARIANTS",
@@ -58,6 +70,9 @@ __all__ = [
     "has_motion",
     "preview_plan",
     "plan_revision",
+    "GeometryContext",
+    "geometry_context",
+    "clear_geometry_contexts",
     "source_frame_jpeg",
     "output_frame_jpeg",
     "frame_geometry",
@@ -170,25 +185,45 @@ def has_motion(workspace: Workspace, project_id: str) -> bool:
     )
 
 
+def _stamp(path: Path) -> tuple[int, int]:
+    """A file's modification time and size, or zeros for a file that is not there."""
+    try:
+        status = path.stat()
+    except OSError:
+        return (0, 0)
+    return (status.st_mtime_ns, status.st_size)
+
+
+def _input_stamps(workspace: Workspace, project_id: str) -> tuple[tuple[int, int], ...]:
+    """Stamp every file an export plan is computed from, without reading any.
+
+    The project file, the solve, the smoothing, the stabilisation options and
+    the In/Out markers. The markers are in here because a crop can be asked to
+    fit the export range (:attr:`~stable.render.options.CropSpec.limit_to_range`)
+    and that range falls back to them. The project file is in here because a
+    target is resolved from the *current* tracks: an edit to a track a target
+    holds changes the plan, and before this was keyed the preview kept the old
+    fit — unlike the export, which plans afresh — until something else changed
+    (REVIEW.md R3).
+    """
+    project_dir = workspace.project_dir(project_id)
+    return (
+        _stamp(project_dir / PROJECT_FILENAME),
+        _stamp(solve_cache_path(workspace, project_id)),
+        _stamp(smoothing_cache_path(workspace, project_id)),
+        _stamp(_options_path(workspace, project_id)),
+        _stamp(project_dir / CLIP_RANGE_CACHE),
+    )
+
+
 def _plan_key(workspace: Workspace, project_id: str, project: Project) -> tuple[Any, ...]:
     """Everything a built plan depends on, as a comparable tuple.
 
-    The mtimes cover the solve, the smoothing, the stabilisation options and the
-    In/Out markers; the border policy and clip size come off the project file,
-    which the caches do not carry.
-
-    The markers are in here because a crop can be asked to fit the export range
-    (:attr:`~stable.render.options.CropSpec.limit_to_range`), and that range
-    falls back to them — so moving an In point changes the plan, and a key that
-    did not say so would keep serving the crop from where the marker used to be.
+    The stamps of the files it is computed from (:func:`_input_stamps`), plus
+    the border policy and clip size, which come off the project file itself.
     """
-    options_file = _options_path(workspace, project_id)
-    range_file = workspace.project_dir(project_id) / CLIP_RANGE_CACHE
     return (
-        solve_cache_path(workspace, project_id).stat().st_mtime_ns,
-        smoothing_cache_path(workspace, project_id).stat().st_mtime_ns,
-        options_file.stat().st_mtime_ns if options_file.is_file() else 0,
-        range_file.stat().st_mtime_ns if range_file.is_file() else 0,
+        *_input_stamps(workspace, project_id),
         project.render.border,
         project.video.w,
         project.video.h,
@@ -248,6 +283,89 @@ def plan_revision(workspace: Workspace, project_id: str, project: Project) -> st
     key = repr(_plan_key(workspace, project_id, project)).encode()
     digest = hashlib.blake2b(key, digest_size=8)
     return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class GeometryContext:
+    """What every frame's export geometry is computed from, built once per change.
+
+    Args:
+        project: The project the rest was built from.
+        plan: Its memoised render plan.
+        options: Its stabilisation options.
+        motion: Its smoothed motion.
+        targets: Every target's held path over the whole clip, as
+            :func:`stable.server.motion.resolve_targets` returns them, or
+            ``None`` when there are no targets.
+        revision: :func:`plan_revision` for all of the above.
+    """
+
+    project: Project
+    plan: StabilizationPlan
+    options: RenderOptions
+    motion: SmoothedMotion
+    targets: motion_glue.ResolvedTargets | None
+    revision: str
+
+
+_CONTEXTS: dict[str, tuple[tuple[Any, ...], GeometryContext]] = {}
+_CONTEXTS_LOCK = threading.Lock()
+_CONTEXTS_LIMIT = 8
+
+
+def geometry_context(workspace: Workspace, project_id: str) -> GeometryContext | None:
+    """Return everything per-frame geometry needs, rebuilt only when it changed.
+
+    Keyed on the stamps of the files it is built from (:func:`_input_stamps`),
+    so a call that finds nothing changed costs five ``stat``s and reads nothing.
+
+    Returns:
+        The context, or ``None`` if the project has not been solved and
+        smoothed — there is no geometry before that.
+
+    Raises:
+        stable.core.errors.StableError: If the options cannot be planned.
+    """
+    stamps = _input_stamps(workspace, project_id)
+    _project, solve, smoothing, _options, _range = stamps
+    if solve == (0, 0) or smoothing == (0, 0):
+        return None
+    with _CONTEXTS_LOCK:
+        hit = _CONTEXTS.get(project_id)
+        if hit is not None and hit[0] == stamps:
+            return hit[1]
+    project = workspace.load_project(project_id)
+    motion = load_smoothed(workspace, project_id, project)
+    if motion is None:
+        return None
+    options = load_options(workspace, project_id, project)
+    context = GeometryContext(
+        project=project,
+        plan=preview_plan(workspace, project_id, project, motion),
+        options=options,
+        motion=motion,
+        targets=motion_glue.resolve_targets(project, options.target, motion),
+        revision=plan_revision(workspace, project_id, project),
+    )
+    with _CONTEXTS_LOCK:
+        if len(_CONTEXTS) >= _CONTEXTS_LIMIT and project_id not in _CONTEXTS:
+            _CONTEXTS.pop(next(iter(_CONTEXTS)), None)
+        _CONTEXTS[project_id] = (stamps, context)
+    return context
+
+
+def clear_geometry_contexts(project_id: str | None = None) -> None:
+    """Drop cached geometry contexts — for one project, or all of them.
+
+    The stamps catch every change on their own; this is for the writers that
+    already clear the plan cache explicitly, so the two are never out of step
+    even when a rewrite lands within one tick of the file clock.
+    """
+    with _CONTEXTS_LOCK:
+        if project_id is None:
+            _CONTEXTS.clear()
+        else:
+            _CONTEXTS.pop(project_id, None)
 
 
 # -- the pixels -----------------------------------------------------------------
@@ -380,8 +498,14 @@ def frame_geometry(
     options: RenderOptions,
     index: int,
     motion: SmoothedMotion | None = None,
+    *,
+    targets: motion_glue.ResolvedTargets | None = None,
 ) -> dict[str, Any]:
     """Describe one frame's export geometry, without touching a pixel.
+
+    ``targets`` is every target's held path, already resolved
+    (:attr:`GeometryContext.targets`). Without it they are resolved here, from
+    the tracks on disk, which is a whole-clip computation for one frame's rows.
 
     Returns:
         ``rect``, the output rectangle mapped back into **source** pixels so the
@@ -441,5 +565,7 @@ def frame_geometry(
         # Two or more marks is what turns a translation into a mapping that can
         # rotate and scale; the screen says which the operator has asked for.
         "uses_rotation_and_scale": bool(options.target.uses_rotation_and_scale),
-        "targets": motion_glue.target_residuals(project, plan, options.target, idx, motion),
+        "targets": motion_glue.target_residuals(
+            project, plan, options.target, idx, motion, resolved=targets
+        ),
     }

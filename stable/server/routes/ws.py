@@ -52,12 +52,8 @@ from ..frames import (
     VARIANTS,
     FrameUnavailable,
     frame_geometry,
-    has_motion,
-    load_options,
-    load_smoothed,
+    geometry_context,
     output_frame_jpeg,
-    plan_revision,
-    preview_plan,
     source_frame_jpeg,
 )
 from ..jobs import MODELS_JOB_SCOPE, JobManager, get_job_manager
@@ -199,7 +195,15 @@ def _frame_payload(
     """Produce one picture of one frame. Blocking: always called in a thread."""
     if variant == "source":
         return source_frame_jpeg(workspace, project_id, frame, tier)
-    return output_frame_jpeg(workspace, project_id, frame, tier)
+    # The project as the cached context already holds it, rather than read and
+    # parsed again for every output frame. Without a context the render path
+    # loads it itself and reports whatever is wrong in its own words.
+    try:
+        context = geometry_context(workspace, project_id)
+    except Exception:  # noqa: BLE001 - the output path states the failure
+        context = None
+    project = context.project if context is not None else None
+    return output_frame_jpeg(workspace, project_id, frame, tier, project=project)
 
 
 def _geometry_payload(
@@ -214,20 +218,27 @@ def _geometry_payload(
     The stamp is the *plan's*, not the proxy tier's, because geometry moves when
     the smoothing or the render options move and the proxy frames do not. A
     client caching geometry by frame keys it on this.
+
+    Everything but the frame's own rows comes from the cached
+    :func:`~stable.server.frames.geometry_context`: this runs for every frame
+    the export tab draws, and rebuilding the plan's inputs here — the solve,
+    the smoothing, every target's held path — cost O(clip length) per frame.
     """
-    if not has_motion(workspace, project_id):
-        return None, ""
     try:
-        project = workspace.load_project(project_id)
-        plan = preview_plan(workspace, project_id, project)
-        revision = plan_revision(workspace, project_id, project)
-        # The smoothed motion is what turns a track into the dashed trail, so a
-        # target holding one cannot be reported on without it.
-        motion = load_smoothed(workspace, project_id, project)
-        options = load_options(workspace, project_id, project)
+        context = geometry_context(workspace, project_id)
     except Exception:  # noqa: BLE001 - an unplannable project still gets its pixels
         return None, ""
-    return frame_geometry(project, plan, options, frame, motion), revision
+    if context is None:
+        return None, ""
+    geometry = frame_geometry(
+        context.project,
+        context.plan,
+        context.options,
+        frame,
+        context.motion,
+        targets=context.targets,
+    )
+    return geometry, context.revision
 
 
 def _pack(header: dict[str, Any], payload: bytes) -> bytes:
