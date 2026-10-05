@@ -1,8 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
+import { fitCanvas } from "../canvas";
 import { confidenceColor } from "../colors";
 import { keyBelongsToControl } from "../keyboard";
 import { applyWarp, unapplyWarp, useExportContext } from "../state/ExportContext";
+import {
+  CONFIDENCE_LEVEL_COLORS,
+  confidencePaths,
+  polylinePath,
+  strokeInView,
+  type SourceToCanvas,
+} from "../trackPaths";
 import type { FrameGeometry } from "../api/frameStream";
 import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
@@ -36,6 +44,17 @@ export const OVERLAY_LABELS: [keyof Overlays, string, string][] = [
 
 /** How close (in canvas CSS pixels) a mousedown has to be to grab a point. */
 const GRAB_RADIUS = 12;
+
+/**
+ * The points drawn when overlays are off. One constant rather than a fresh
+ * `[]` per redraw, so it does not read as a change and redraw the trail layer.
+ */
+const NO_POINTS: PointSummary[] = [];
+
+/** Whether two lists of render inputs are the same values, by identity. */
+function sameInputs(a: readonly unknown[], b: readonly unknown[]): boolean {
+  return a.length === b.length && a.every((value, index) => Object.is(value, b[index]));
+}
 
 /** Why a click on the frame did not edit the selected track: it is hidden. */
 function hiddenTrackRefusal(pointId: string): string {
@@ -382,6 +401,9 @@ export function Viewer() {
   const frames = useFrameStream();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Every track's trails, already drawn, and what they were drawn from — see
+  // the comment where the main canvas paints it.
+  const pathLayerRef = useRef<{ inputs: unknown[]; canvas: HTMLCanvasElement } | null>(null);
   const outputCanvasRef = useRef<HTMLCanvasElement>(null);
   // The output canvas's fit, written by the effect that draws it and read by the
   // handlers that hit-test it — one set of numbers, so a crosshair is grabbed
@@ -491,13 +513,18 @@ export function Viewer() {
     const dispW = wrap.clientWidth || 1;
     const dispH = wrap.clientHeight || 1;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.floor(dispW * dpr));
-    canvas.height = Math.max(1, Math.floor(dispH * dpr));
-    canvas.style.width = `${dispW}px`;
-    canvas.style.height = `${dispH}px`;
+    // Only when the size changed: assigning a canvas's size, even the same one,
+    // throws its backing store away and makes a new one, and this runs on every
+    // frame of playback.
+    fitCanvas(canvas, dispW, dispH, dpr);
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    // The context keeps its state from one redraw to the next now that the
+    // canvas is not re-created for each, so every redraw starts from scratch.
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
     ctx.clearRect(0, 0, dispW, dispH);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, dispW, dispH);
@@ -505,6 +532,12 @@ export function Viewer() {
     const t = computeTransform(dispW, dispH, videoW, videoH, zoom, pan);
     const toCanvasX = (sx: number) => (sx - videoW / 2) * t.scale + t.originX;
     const toCanvasY = (sy: number) => (sy - videoH / 2) * t.scale + t.originY;
+    // The same map, in the form the cached source-pixel paths are stroked with.
+    const view: SourceToCanvas = {
+      scale: t.scale,
+      offsetX: t.originX - (videoW / 2) * t.scale,
+      offsetY: t.originY - (videoH / 2) * t.scale,
+    };
     const frameLeft = toCanvasX(0);
     const frameTop = toCanvasY(0);
     const frameW = videoW * t.scale;
@@ -519,7 +552,107 @@ export function Viewer() {
     // position would point at the wrong pixel. The master switch is the other
     // reason to draw no track overlay — the export's own overlay below is
     // governed by neither, since it is not per track.
-    const overlayPoints = overlayValid && overlaysEnabled ? project.points : [];
+    const overlayPoints = overlayValid && overlaysEnabled ? project.points : NO_POINTS;
+
+    /**
+     * Every track's trails — the whole clip each — into `target`.
+     *
+     * Three per track, in this order. A run in flight (todos 4, 16): the path
+     * found so far, dashed in the point's own colour over the stale one, so
+     * scrubbing back over covered frames shows the tracker's answer before the
+     * job has finished. The trail itself (todo 5, second round), coloured one
+     * of two ways: `confidence` shades each segment green-to-red — the better
+     * answer to "is this track any good" and the worse one to "which of these
+     * trails is p3" — and `track` uses the point's own colour. And what the
+     * smoothing did to it (todo 3, fourth round): the same path through the
+     * stabilisation warp, dashed in the point's colour, so the gap between the
+     * two *is* the correction the export will apply; with no smoothing enabled
+     * the warp is the identity and the two coincide.
+     *
+     * The before/after "ghost" of the raw path was drawn here too until todo
+     * 2, ninth round; the server still sends `raw_x` / `raw_y`.
+     */
+    const drawTrails = (target: CanvasRenderingContext2D) => {
+      for (const point of overlayPoints) {
+        const isSelected = point.id === selectedPointId;
+        const color = colorFor(point.id);
+        const { paths: showPaths, smoothed: showSmoothed } = overlaysFor(point.id);
+        const live = liveTracking[point.id];
+        if (live?.x && live.y && showPaths) {
+          target.strokeStyle = color;
+          strokeInView(target, polylinePath(live.x, live.y), view, dpr, isSelected ? 3 : 2, [6, 3]);
+        }
+        const track = tracks[point.id];
+        if (!track) continue;
+        if (showPaths) {
+          const width = isSelected ? 2.5 : 1.5;
+          if (pathColor === "track") {
+            target.strokeStyle = color;
+            strokeInView(target, polylinePath(track.x, track.y), view, dpr, width);
+          } else {
+            confidencePaths(track.x, track.y, track.confidence).forEach((shade, level) => {
+              if (!shade) return;
+              target.strokeStyle = CONFIDENCE_LEVEL_COLORS[level];
+              strokeInView(target, shade, view, dpr, width);
+            });
+          }
+        }
+        const stabilized = smoothedTracks[point.id];
+        if (showSmoothed && stabilized) {
+          target.strokeStyle = color;
+          const width = isSelected ? 2 : 1.25;
+          strokeInView(target, polylinePath(stabilized.x, stabilized.y), view, dpr, width, [7, 3]);
+        }
+      }
+    };
+
+    // The trails are drawn once into a layer of their own and that layer is
+    // what gets copied here (REVIEW.md P2). This effect runs on every frame of
+    // playback, and the trails — tens of thousands of segments on a long clip —
+    // are the same on every one of those frames: stroking them per redraw cost
+    // either the main thread (a stroke per segment) or the GPU (a few very long
+    // strokes) for identical pixels. The layer is redrawn only when something
+    // it is drawn from changes: the view, the tracks or their smoothing, the
+    // selection (it is drawn wider), the colouring, the overlay switches, or a
+    // running job's partial path. The paths themselves come from
+    // `trackPaths.ts`, built once per loaded track, so even a redraw of the
+    // layer walks no frames.
+    const layerInputs: unknown[] = [
+      dispW,
+      dispH,
+      dpr,
+      zoom,
+      pan,
+      overlayPoints,
+      tracks,
+      smoothedTracks,
+      liveTracking,
+      selectedPointId,
+      pathColor,
+      overlaysFor,
+      colorFor,
+    ];
+    let layer = pathLayerRef.current;
+    if (!layer || !sameInputs(layer.inputs, layerInputs)) {
+      const layerCanvas = layer?.canvas ?? document.createElement("canvas");
+      fitCanvas(layerCanvas, dispW, dispH, dpr);
+      const layerCtx = layerCanvas.getContext("2d");
+      if (layerCtx) {
+        layerCtx.setTransform(1, 0, 0, 1, 0, 0);
+        layerCtx.clearRect(0, 0, layerCanvas.width, layerCanvas.height);
+        drawTrails(layerCtx);
+      }
+      layer = { inputs: layerInputs, canvas: layerCanvas };
+      pathLayerRef.current = layer;
+    }
+    if (overlayPoints.length > 0) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(layer.canvas, 0, 0);
+      ctx.restore();
+    }
+
+    // Everything that is about *this* frame, over the trails.
     for (const point of overlayPoints) {
       const isSelected = point.id === selectedPointId;
       const track = tracks[point.id];
@@ -535,33 +668,8 @@ export function Viewer() {
         windows: showWindows,
       } = overlaysFor(point.id);
 
-      // A run in flight (todos 4, 16): the path found so far is drawn over the
-      // stale one in the point's own colour, and the frame the tracker is
-      // reading right now gets a ring. Scrubbing back over covered frames shows
-      // the tracker's answer for them before the job has finished.
+      // The frame a running tracker is reading right now gets a ring.
       if (live?.x && live.y && showPaths) {
-        ctx.save();
-        ctx.lineWidth = isSelected ? 3 : 2;
-        ctx.strokeStyle = color;
-        ctx.setLineDash([6, 3]);
-        ctx.beginPath();
-        let started = false;
-        for (let f = 0; f < live.x.length; f++) {
-          const lx = live.x[f];
-          const ly = live.y[f];
-          if (lx == null || ly == null) {
-            started = false;
-            continue;
-          }
-          const px = toCanvasX(lx);
-          const py = toCanvasY(ly);
-          if (started) ctx.lineTo(px, py);
-          else ctx.moveTo(px, py);
-          started = true;
-        }
-        ctx.stroke();
-        ctx.restore();
-
         const hx = live.x[viewFrame];
         const hy = live.y[viewFrame];
         if (showMarkers && hx != null && hy != null) {
@@ -576,101 +684,22 @@ export function Viewer() {
       }
 
       if (track) {
-        // The before/after "ghost" of the raw path used to be drawn here (todo
-        // 2, ninth round). It was a faint dotted trail a pixel or two from the
-        // corrected one, on top of the trail, the smoothed trail and every
-        // other track's — one more line to read for a fact the correction list
-        // states in words. The server still sends `raw_x` / `raw_y`; nothing on
-        // the canvas draws them.
-
-        if (showPaths) {
-          // Path: connect consecutive valid frames, coloured one of two ways
-          // (todo 5, second round). `confidence` shades each short segment by
-          // that frame's confidence — green = trust it, red = check it — which
-          // is the better answer to "is this track any good" and the worse one
-          // to "which of these four trails is p3", since every track is drawn
-          // from the same ramp. `track` uses the point's own colour instead,
-          // and can stroke the whole trail as one path.
-          ctx.lineWidth = isSelected ? 2.5 : 1.5;
-          if (pathColor === "track") {
-            ctx.save();
-            ctx.strokeStyle = color;
-            ctx.beginPath();
-            let started = false;
-            for (let f = 0; f < track.n_frames; f++) {
-              const x = track.x[f];
-              const y = track.y[f];
-              if (x == null || y == null) {
-                started = false;
-                continue;
-              }
-              const px = toCanvasX(x);
-              const py = toCanvasY(y);
-              if (started) ctx.lineTo(px, py);
-              else ctx.moveTo(px, py);
-              started = true;
-            }
-            ctx.stroke();
-            ctx.restore();
-          } else {
-            for (let f = 1; f < track.n_frames; f++) {
-              const x0 = track.x[f - 1];
-              const y0 = track.y[f - 1];
-              const x1 = track.x[f];
-              const y1 = track.y[f];
-              if (x0 == null || y0 == null || x1 == null || y1 == null) continue;
-              ctx.strokeStyle = confidenceColor(
-                (track.confidence[f - 1] + track.confidence[f]) / 2,
-              );
-              ctx.beginPath();
-              ctx.moveTo(toCanvasX(x0), toCanvasY(y0));
-              ctx.lineTo(toCanvasX(x1), toCanvasY(y1));
-              ctx.stroke();
-            }
-          }
-        }
-
-        // What the smoothing did to this track (todo 3, fourth round): the same
-        // path pushed through the stabilisation warp, i.e. where this feature
-        // ends up once the shot is stabilised. Drawn over the source trail in
-        // the point's own colour so the two can be read against each other —
-        // the gap between them *is* the correction the export will apply. With
-        // no smoothing enabled the warp is the identity and the two coincide,
-        // which is a true statement about the project rather than a missing
-        // feature.
+        // Where this point sits on *this* frame after stabilisation, as a
+        // hollow ring on its smoothed trail: "it is here now, and would be
+        // there in the export".
         const stabilized = smoothedTracks[point.id];
         if (showSmoothed && stabilized) {
-          ctx.save();
-          ctx.strokeStyle = color;
-          ctx.lineWidth = isSelected ? 2 : 1.25;
-          ctx.setLineDash([7, 3]);
-          ctx.beginPath();
-          let started = false;
-          for (let f = 0; f < stabilized.x.length; f++) {
-            const sx = stabilized.x[f];
-            const sy = stabilized.y[f];
-            if (sx == null || sy == null) {
-              started = false;
-              continue;
-            }
-            const px = toCanvasX(sx);
-            const py = toCanvasY(sy);
-            if (started) ctx.lineTo(px, py);
-            else ctx.moveTo(px, py);
-            started = true;
-          }
-          ctx.stroke();
-          // Where this point sits on *this* frame after stabilisation, as a
-          // hollow ring: "it is here now, and would be there in the export".
           const hx = stabilized.x[viewFrame];
           const hy = stabilized.y[viewFrame];
           if (hx != null && hy != null) {
-            ctx.setLineDash([]);
+            ctx.save();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = isSelected ? 2 : 1.25;
             ctx.beginPath();
             ctx.arc(toCanvasX(hx), toCanvasY(hy), isSelected ? 7 : 5, 0, Math.PI * 2);
             ctx.stroke();
+            ctx.restore();
           }
-          ctx.restore();
         }
 
         if (showMarkers) {
@@ -943,13 +972,15 @@ export function Viewer() {
     const dispW = wrap.clientWidth || 1;
     const dispH = wrap.clientHeight || 1;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.max(1, Math.floor(dispW * dpr));
-    canvas.height = Math.max(1, Math.floor(dispH * dpr));
-    canvas.style.width = `${dispW}px`;
-    canvas.style.height = `${dispH}px`;
+    // Same as the main canvas: resized only when its box changed, and every
+    // redraw starts from the context's defaults.
+    fitCanvas(canvas, dispW, dispH, dpr);
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
     ctx.clearRect(0, 0, dispW, dispH);
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, dispW, dispH);
