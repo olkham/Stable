@@ -11,14 +11,16 @@ backend that finds the synthetic clip's marker in the pixels it is handed. That
 keeps the suite green on a machine with no GPU, no torch and no checkpoints
 while still exercising everything the *plugin* owns — window planning, frame
 loading, coordinate scaling, re-anchoring, stitching, confidence normalisation
-and timeline assembly. Only the neural network itself is stubbed.
+and timeline assembly. Only the neural network itself is stubbed. Ocean and
+SiamDW do the same through :class:`~conftest.SiameseMarkerBackend`, which finds
+the marker in the template and search crops they cut.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
-from conftest import MarkerBackend, anchor_at
+from conftest import MarkerBackend, SiameseMarkerBackend, anchor_at
 
 from stable.core.errors import TrackerError
 from stable.core.types import Query, TrackResult
@@ -29,10 +31,12 @@ from stable.trackers.kalman import KalmanTracker
 from stable.trackers.klt import KLTTracker
 from stable.trackers.lk import LKTracker
 from stable.trackers.meanshift import MeanShiftTracker
+from stable.trackers.ocean import OceanTracker
 from stable.trackers.particle import ParticleFilterTracker
 from stable.trackers.raft import RaftTracker
 from stable.trackers.registry import available_trackers, describe_trackers, get_tracker
 from stable.trackers.sam3 import Sam3Tracker
+from stable.trackers.siamdw import SiamDWTracker
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.template import TemplateTracker
 
@@ -69,6 +73,10 @@ def make_plugin(name: str):
         return RaftTracker(backend=MarkerBackend(), **DEEP_KWARGS)
     if name == "sam3":
         return Sam3Tracker(backend=MarkerBackend(), **DEEP_KWARGS)
+    if name == "ocean":
+        return OceanTracker(backend=SiameseMarkerBackend("ocean"))
+    if name == "siamdw":
+        return SiamDWTracker(backend=SiameseMarkerBackend("siamdw"))
     raise AssertionError(f"unknown tracker {name!r}")
 
 
@@ -84,7 +92,11 @@ TRACKERS = [
     "tapir",
     "raft",
     "sam3",
+    "ocean",
+    "siamdw",
 ]
+# The windowed plugins; Ocean and SiamDW never cut a run into windows (see
+# stable/trackers/siamese.py), so the chunking criterion below is not theirs.
 DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 
 # The feature matchers are held to the same *registry* contract here, but

@@ -109,7 +109,8 @@ Stable calls too (`stable.core.device.select_device`).
 
 `raft` needs nothing further — its architecture and weights ship inside
 torchvision, which step 3 installed, so it becomes available as soon as CUDA
-PyTorch is in place.
+PyTorch is in place. Nor do `ocean` and `siamdw`: their network code ships with
+Stable itself, and their (pinned, MIT) checkpoints download on first use.
 
 CoTracker3 and TAPIR are different: their model code lives only on GitHub and
 is not Stable's to vendor. The checkpoints download separately (next step);

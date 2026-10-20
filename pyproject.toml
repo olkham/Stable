@@ -80,6 +80,8 @@ cotracker3 = "stable.trackers.cotracker3:CoTracker3Tracker"
 tapir = "stable.trackers.tapir:TapirTracker"
 raft = "stable.trackers.raft:RaftTracker"
 sam3 = "stable.trackers.sam3:Sam3Tracker"
+ocean = "stable.trackers.ocean:OceanTracker"
+siamdw = "stable.trackers.siamdw:SiamDWTracker"
 
 [tool.setuptools.packages.find]
 include = ["stable*"]

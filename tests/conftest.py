@@ -396,6 +396,116 @@ class MarkerBackend:
         self.released = True
 
 
+class SiameseMarkerBackend:
+    """A :class:`~stable.trackers.siamese.SiameseBackend` that "matches" by finding the marker.
+
+    Stands in for Ocean and SiamDW with no torch and no weights, as
+    :class:`MarkerBackend` does for the windowed models. It reads the real crop
+    pixels the plugin cut, so crop geometry, the anchor's own reading and the
+    point riding on it, the decoders' penalties, windows and reach, the scale
+    bookkeeping, holding through a loss and confidence calibration are all
+    exercised — only the network is stubbed. Maps come out in either network's
+    layout:
+
+    * ``kind="ocean"``: classification logits high within two cells (L1) of the
+      marker — Ocean's own training label — box regression for a box centred on
+      it, the size a square target fills of the exemplar (half its side), and a
+      similarity map high near it;
+    * ``kind="siamdw"``: a Gaussian response bump at the marker.
+
+    Where the marker is not visible the maps are flat and low, as a network's
+    are for an absent target.
+
+    Args:
+        kind: ``"ocean"`` or ``"siamdw"``.
+        bias: ``(dx, dy)`` network pixels added to where the target is reported
+            — a stand-in for Ocean's habit of regressing a box beside the patch
+            rather than on it, which the plugin has to ride on rather than trust.
+        oom_on: Match-call indices (1-based) that raise a CUDA-style out-of-memory
+            error while the backend is not on the CPU.
+        fail_on: Match-call indices that raise a plain ``RuntimeError``.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        *,
+        bias: tuple[float, float] = (0.0, 0.0),
+        oom_on: tuple[int, ...] = (),
+        fail_on: tuple[int, ...] = (),
+    ) -> None:
+        """Create a fake backend on the CPU."""
+        self.kind = kind
+        self.bias = (float(bias[0]), float(bias[1]))
+        self.device = "cpu"
+        self.oom_on = set(oom_on)
+        self.fail_on = set(fail_on)
+        self.calls = 0
+        self.embeds = 0
+        self.searches: list[tuple[int, ...]] = []
+        self.released = False
+
+    def embed(self, exemplars: np.ndarray) -> dict[str, object]:
+        """Return a stand-in template, stamped with the device it was built on."""
+        self.embeds += 1
+        return {"device": self.device, "count": int(exemplars.shape[0])}
+
+    def match(self, kernels: dict[str, object], searches: np.ndarray):
+        """Find the marker in every search crop and draw the maps around it."""
+        from stable.trackers.siamese import SiameseMaps
+
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise RuntimeError("simulated backend explosion")
+        if self.calls in self.oom_on and self.device != "cpu":
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        if kernels["device"] != self.device:
+            raise RuntimeError("templates live on another device; rebuild them after a move")
+        self.searches.append(tuple(searches.shape))
+
+        count, scales, side = searches.shape[:3]
+        cells = (side - 127) // 8 + (9 if self.kind == "ocean" else 1)
+        grid = (np.arange(cells) - cells // 2) * 8.0
+        grid_x, grid_y = np.meshgrid(grid, grid)
+        half = 127 / 4.0
+        if self.kind == "ocean":
+            score = np.full((count, scales, cells, cells), -6.0, dtype=np.float32)
+            boxes = np.full((count, scales, 4, cells, cells), half, dtype=np.float32)
+            similarity = np.full((count, scales, cells, cells), 0.05, dtype=np.float32)
+        else:
+            score = np.full((count, scales, cells, cells), 3.0, dtype=np.float32)
+            boxes = similarity = None
+        for i in range(count):
+            for k in range(scales):
+                found = find_marker(searches[i, k])
+                if found is None:
+                    continue
+                mx = found[0] - (side - 1) / 2.0 + self.bias[0]
+                my = found[1] - (side - 1) / 2.0 + self.bias[1]
+                if self.kind == "ocean":
+                    near = (np.abs(grid_x - mx) + np.abs(grid_y - my)) / 8.0 <= 2.0
+                    score[i, k] = np.where(near, 6.0, -6.0)
+                    boxes[i, k] = [
+                        grid_x - (mx - half),
+                        grid_y - (my - half),
+                        (mx + half) - grid_x,
+                        (my + half) - grid_y,
+                    ]
+                    similarity[i, k] = np.where(near, 0.9, 0.05)
+                else:
+                    bump = ((grid_x - mx) ** 2 + (grid_y - my) ** 2) / (2.0 * 8.0**2)
+                    score[i, k] = 3.0 + 7.0 * np.exp(-bump)
+        return SiameseMaps(score=score, boxes=boxes, similarity=similarity)
+
+    def to_device(self, device: str) -> None:
+        """Record a device move (there is nothing to move)."""
+        self.device = device
+
+    def release(self) -> None:
+        """Record that the plugin released this backend."""
+        self.released = True
+
+
 class EchoBackend:
     """A backend that reports every query as motionless, at full confidence.
 

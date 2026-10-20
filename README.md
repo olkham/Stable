@@ -95,9 +95,14 @@ route and troubleshooting. On headless Linux, see the CUDA `Dockerfile` at the
 repo root instead.
 
 `raft` works as soon as PyTorch is in place (its model ships inside
-torchvision). CoTracker3 and TAPIR also need their model *code*, which is not
-ours to vendor — `stable trackers` prints the exact command for whichever is
-missing:
+torchvision), and so do `ocean` and `siamdw`, the two Siamese trackers from
+[TracKit](https://github.com/researchmm/TracKit): their network code is MIT and
+ships with Stable, and their checkpoints download on first use. They are the
+ones to reach for when the feature gets covered — measured on footage with an
+occluder sweeping across the point, `siamdw` came back to it every time and
+`lk` never did — while `lk` stays the more precise on clean, unoccluded motion.
+CoTracker3 and TAPIR also need their model *code*, which is not ours to vendor
+— `stable trackers` prints the exact command for whichever is missing:
 
 ```bash
 pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"          # tapir
@@ -123,6 +128,12 @@ not bugs:
   checkbox, `--accept-noncommercial`, or `STABLE_ACCEPT_NONCOMMERCIAL=1`.
   TAPIR/BootsTAP's weights are Apache-2.0 and need no licence opt-in, just
   the unpinned one above.
+- **Ocean's and SiamDW's checkpoints** (`ocean_offline`, 104 MB;
+  `siamdw_res22w`, 10 MB) are pinned and MIT, so they download with no opt-in
+  at all. Both come from the authors' SOTS model folder, which TracKit's own
+  README now points to; SiamDW's is tensor-for-tensor the one the MIT-licensed
+  SiamDW release links, while the SOTS repository hosting Ocean's has no licence
+  file of its own — CONTRIBUTING.md "Pinning a checkpoint" has the details.
 
 In the browser, click **Models** (top-right in a project, or from the
 project list) to see every checkpoint's cache/licence state and download or
@@ -132,6 +143,7 @@ delete it, with live progress. Headlessly:
 stable models                                              # list, with cache/pin/licence state
 stable models download bootstapir                          # Apache-2.0, no opt-in needed
 stable models download cotracker3_offline --accept-noncommercial
+stable models download siamdw_res22w                        # MIT, pinned: no opt-in
 stable models remove bootstapir                             # free the disk space back
 ```
 
@@ -238,7 +250,11 @@ trackers' model code) — the frontend is already built into the package
 | `stable.trackers.dummy` | A deterministic tracker so everything is testable |
 | `stable.trackers.lk` | Pyramidal Lucas-Kanade with forward-backward confidence |
 | `stable.trackers.template` | NCC template matching with adaptive template update |
-| `stable.trackers.deep` | Chunked inference, GPU→CPU fallback, the model backend seam |
+| `stable.trackers.deep` | The model lifecycle (device, weights, GPU→CPU fallback); chunked inference and its backend seam |
+| `stable.trackers.siamese` | Siamese trackers as point trackers: a fixed anchor template, the point riding on the network's own reading |
+| `stable.trackers.siamese_nets` | The Ocean and SiamDW networks, ported from TracKit to plain PyTorch |
+| `stable.trackers.ocean` | Ocean (TracKit): anchor-free box regression — accurate on object-like features |
+| `stable.trackers.siamdw` | SiamDW (TracKit): CIResNet-22W SiamFC — tracks through occlusion and says so |
 | `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
 | `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
 | `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |

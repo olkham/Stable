@@ -28,6 +28,7 @@ packaged `stable/server/webdist` matches the source).
 5. [Prioritised fix list](#5-prioritised-fix-list)
 6. [Executed in this pass](#6-executed-in-this-pass)
 7. [Carried forward](#7-carried-forward)
+8. [Ocean and SiamDW from TracKit, 2026-10-20](#8-ocean-and-siamdw-from-trackit-2026-10-20)
 
 ---
 
@@ -644,3 +645,80 @@ Everything in §5 not marked executed, plus these older items still open:
 * Rounds 7–10 — the two `test_phase3_acceptance.py` rotation-tolerance
   failures.
 * Round 8 (`todo_7`) — see §3.8 and U4, U11.
+
+---
+
+## 8. Ocean and SiamDW from TracKit, 2026-10-20
+
+Request: implement the two trackers in `github.com/researchmm/TracKit` — Ocean
+(ECCV 2020) and SiamDW (CVPR 2019) — alongside the others. Both are now plugins
+(`ocean`, `siamdw`), available wherever PyTorch and OpenCV are, with pinned MIT
+checkpoints and no extra package to install.
+
+**What was built.**
+
+* `stable/trackers/siamese_nets.py` — both networks ported to plain PyTorch
+  from the authors' code (MIT notice kept), stateless and batched, importable
+  without torch. Verified against the authors' SOTS module definitions on
+  identical inputs: maximum deviation ~1e-5 at search sizes 255/271/287.
+* `stable/trackers/siamese.py` — the shared point-tracking pipeline: a template
+  fixed at the anchor, sub-pixel crops, `search_radius` honoured exactly (the
+  search grows past the trained 255 px and candidates beyond it are masked),
+  batching, holding through a loss, and the CPU fallback (which has to rebuild
+  the templates on the new device).
+* `stable/trackers/ocean.py`, `stable/trackers/siamdw.py` — each network's
+  decoding (TracKit's anchor-free box penalties / SiamFC's three-scale bicubic
+  peak) and its checkpoint.
+* `stable/trackers/deep.py` — the device/weights/fallback half of
+  `DeepTrackerPlugin` became its base class, `ModelTrackerPlugin`, so a
+  frame-at-a-time model reuses it without inheriting windowing. Additive:
+  `DeepTrackerPlugin`'s constructor and behaviour are unchanged, and every
+  existing deep-tracker test passed untouched before anything was built on it.
+
+**What measuring changed.** Each of these was found by running the real
+checkpoints, not by reading the papers:
+
+| Finding | Response |
+|---|---|
+| Handed a patch, Ocean regresses the box of the *object* it thinks the patch belongs to — 3.7 px median off the patch | The point rides on the network's reading of the anchor frame itself (0.9 px); both plugins do this |
+| Ocean's per-axis scale random-walked to its clamps (90th-pct error 19 px on handheld footage) | Isotropic scale, a gate on readings whose box changes shape, `size_lr` 0.3 (90th pct under 10 px) |
+| Ocean's classifier scored 0.86 with the target covered | Confidence is classifier x feature cosine at the found position (AUC 0.98 against >3 px errors) |
+| SiamDW's raw response depends on the template (peaks 7-15) | Confidence is the peak over the anchor frame's own peak |
+| Holding on every weak frame lost Ocean's points in a fast pan | `lost_below`, separate from the confidence floor (defaults to it) |
+| The SiamDW release has 715,493 denormal weights: 3.5 s a CPU frame | Denormals flushed around CPU calls: 46 ms |
+
+**Measured at the shipped defaults** (eight 40-60 frame clips of known motion,
+eight points each, plus six occluder sweeps; `lk`/`template` for contrast):
+
+| Tracker | Median / 90th pct error | Occluder sweeps recovered | Max confidence while covered |
+|---|---|---|---|
+| `siamdw` | 0.65 / 1.8 px | 6 of 6 | 0.00 |
+| `ocean` | 0.74 / 4.9 px | 5 of 6 | 0.02 |
+| `lk` | 0.19 / 1.4 px | 0 of 6 | 1.00 |
+| `template` | 0.70 / 2.6 px | 1 of 6 | 0.92 |
+
+On the bundled sample clip through `stable track` and through a two-anchor
+server job, both tracked to 0.31-0.66 px median. Ocean is accurate on
+object-like features and weaker on smooth natural-image patches (90th pct
+12 px there, SiamDW 2.5 px); both module docstrings say so.
+
+**Checks.** `pytest -m "not integration"`: the new modules (contract suite for
+both plugins, `test_siamese_trackers.py`, `test_siamese_nets.py`) all pass,
+also with PyTorch hidden as on CI (the networks module then skips); the only
+failures are the two §7 rotation-tolerance tests. `ruff check`, `ruff format
+--check` on touched files and `mypy stable` are clean. No frontend change: the
+picker, the pattern/search sliders and the model manager are all driven by
+what the plugins declare.
+
+**Open.**
+
+* `Ocean.pth` is hosted by the authors' SOTS repository, which has no licence
+  file; it is labelled MIT because TracKit's MIT README designates SOTS as its
+  model source. `SiamDW.pth` is verified identical to the MIT SiamDW release.
+* Both checkpoints are Google Drive downloads (`drive.usercontent.google.com`).
+  TracKit's own Drive links have already died once; a pinned digest makes a
+  changed or quota-blocked file fail closed, but a mirror would be sturdier.
+* Ocean's object-aware (deformable-convolution) refinement and its online
+  classifier, and OceanPlus, are not ported. The only Ocean checkpoint still
+  published is the offline model, which has neither branch; both need TracKit's
+  compiled CUDA extensions; and OceanPlus is a segmentation tracker.
