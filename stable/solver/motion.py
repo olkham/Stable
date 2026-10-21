@@ -35,6 +35,9 @@ Real tracks have holes. Every frame lands in one of five states, recorded in
 
 ``SOLVED``
     Two or more usable correspondences; three or more also go through RANSAC.
+    Also one point, when the solve was asked for X and Y alone (rotation and
+    scale switched off): everything requested was measured, and flagging every
+    frame of such a solve would hide the ones that really were not.
 ``TRANSLATION_ONLY``
     Exactly one usable point — X and Y are real, rotation and scale are not
     observable and are held at identity.
@@ -90,8 +93,10 @@ class SolveStatus(IntEnum):
     """How a frame's transform was arrived at.
 
     Attributes:
-        SOLVED: Fitted from two or more usable correspondences.
-        TRANSLATION_ONLY: Fitted from a single point; rotation and scale held.
+        SOLVED: Fitted from two or more usable correspondences, or from one
+            when rotation and scale were not asked for.
+        TRANSLATION_ONLY: Fitted from a single point; rotation and scale held
+            although the solve wanted them.
         INTERPOLATED: No usable point; interpolated between solved neighbours.
         HELD: No usable point and no solved frame on one side; nearest held.
         IDENTITY: Nothing in the clip could be solved at all.
@@ -488,7 +493,12 @@ def _solve_frame(
     if count == 1:
         shift = target[0] - source[0]
         transform = SimilarityTransform(tx=float(shift[0]), ty=float(shift[1]))
-        return FrameSolve(frame, transform, 0.0, 1, 1, SolveStatus.TRANSLATION_ONLY)
+        constraints = config.constraints
+        # One point measures X and Y. If that is all the solve was asked for,
+        # nothing is missing and the frame is not degraded.
+        complete = not (constraints.rotate or constraints.scale)
+        status = SolveStatus.SOLVED if complete else SolveStatus.TRANSLATION_ONLY
+        return FrameSolve(frame, transform, 0.0, 1, 1, status)
 
     result = solve_similarity_ransac(
         source, target, weights, constraints=config.constraints, config=config.ransac

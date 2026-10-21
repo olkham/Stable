@@ -53,13 +53,22 @@ twelve composited 60-frame clips — a face, a logo and a blob texture, each
 zooming 2x, shrinking to 0.45x, stretching from an aspect of 0.8 to 2.75, and
 "breathing" in and out of shape, over a natural background — its box overlapped
 the truth by a mean IoU of 0.92 (10th percentile 0.87), and with an occluder
-crossing the object as well it recovered on eleven of the twelve. Two settings
-differ from a point's, both measured on those clips. The size follows the box at
-TracKit's own ``box_size_lr`` of 0.519: the 0.3 that steadies a patch lagged an
-object changing shape (mean IoU 0.86). And a box is held only below raw evidence
-0.3 (``box_lost_below``): the template is fixed, so a stretching object's
-evidence against it fell under a point's threshold while it was still the best
-match, and the held box was left behind on three of the twelve clips.
+crossing the object as well it recovered on eleven of the twelve. Three settings
+differ from a point's. The size follows the box at TracKit's own
+``box_size_lr`` of 0.519: the 0.3 that steadies a patch lagged an object
+changing shape (mean IoU 0.86). A box is held only below raw evidence 0.3
+(``box_lost_below``): the template is fixed, so a stretching object's evidence
+against it fell under a point's threshold while it was still the best match, and
+the held box was left behind on three of the twelve clips. And a box has its own
+calibration, ``box_confidence_range`` ``(0.3, 0.6)``, which starts where the box
+stops being held. The point calibration zeroed a fifth of a real shot it was
+tracking correctly — a dog running through grass, 860 4K frames at 120 fps, the
+box on the dog throughout, raw evidence median 0.55 and 5th percentile 0.38 —
+and the solver, rightly refusing zero-confidence frames, invented the camera
+motion across all 182 of them. On the composited clips correctly tracked frames
+measured median 0.76 (5th percentile 0.53) and frames with the object covered
+median 0.18 (90th percentile 0.42): from 0.3 up, 0.1% of the dog's frames and
+74% of the covered ones read ``0``.
 
 Confidence
 ----------
@@ -167,10 +176,11 @@ class OceanTracker(SiameseTrackerPlugin):
             further by the penalty and the classifier's certainty each frame.
         box_size_lr: ``size_lr`` for a box the operator drew: TracKit's own
             0.519, since that box *is* the object Ocean was trained to size.
-        box_lost_below: Raw evidence at or below which a box is held; see the
-            module docstring for why it sits below a point's.
         confidence_range: ``(low, high)`` calibration of classifier x feature
             cosine; see the module docstring for the distributions behind it.
+        box_confidence_range: The same for a box, whose bottom is also where a
+            box is held (``box_lost_below``); see the module docstring for why
+            it sits below a point's.
         visible_threshold: Normalised confidence at or above which the point
             counts as visible.
         **kwargs: Forwarded to :class:`~stable.trackers.siamese.SiameseTrackerPlugin`
@@ -195,8 +205,8 @@ class OceanTracker(SiameseTrackerPlugin):
         window_influence: float = 0.2,
         size_lr: float = 0.3,
         box_size_lr: float = 0.519,
-        box_lost_below: float | None = 0.3,
         confidence_range: tuple[float, float] = (0.45, 0.62),
+        box_confidence_range: tuple[float, float] = (0.3, 0.6),
         visible_threshold: float = 0.5,
         **kwargs: Any,
     ) -> None:
@@ -207,7 +217,7 @@ class OceanTracker(SiameseTrackerPlugin):
             window_influence=window_influence,
             confidence_range=confidence_range,
             visible_threshold=visible_threshold,
-            box_lost_below=box_lost_below,
+            box_confidence_range=box_confidence_range,
             **kwargs,
         )
         self.penalty_k = float(penalty_k)

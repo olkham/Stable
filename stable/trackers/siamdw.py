@@ -40,7 +40,13 @@ aspect it was drawn with. On the composited box clips described in
 :mod:`stable.trackers.ocean` its box overlapped the truth by a mean IoU of 0.68:
 close behind Ocean on zooms and shrinks, though lagging a 2x zoom by about 10%,
 and lost on all three clips where the object stretched to over twice its
-aspect. Ocean is the box tracker for anything that changes shape.
+aspect. Ocean is the box tracker for anything that changes shape. A box has its
+own calibration, ``box_confidence_range`` ``(0.4, 0.65)``, whose bottom is also
+where the box is held: the point calibration zeroed — and held still — half the
+frames of a real shot of a dog running through grass (response ratio median
+0.55), while on the composited clips frames with the object covered never
+exceeded 0.44 (90th percentile 0.34) and correctly tracked ones measured median
+0.72 (1st percentile 0.56).
 
 Confidence
 ----------
@@ -149,6 +155,8 @@ class SiamDWTracker(SiameseTrackerPlugin):
             peak is read; ``16`` puts it on a half-network-pixel grid.
         confidence_range: ``(low, high)`` calibration of the response ratio; see
             the module docstring for the distributions behind it.
+        box_confidence_range: The same for a box, whose bottom is also where a
+            box is held; see the module docstring.
         visible_threshold: Normalised confidence at or above which the point
             counts as visible.
         **kwargs: Forwarded to :class:`~stable.trackers.siamese.SiameseTrackerPlugin`
@@ -177,6 +185,7 @@ class SiamDWTracker(SiameseTrackerPlugin):
         window_influence: float = 0.292,
         response_upsample: int = 16,
         confidence_range: tuple[float, float] = (0.55, 0.72),
+        box_confidence_range: tuple[float, float] = (0.4, 0.65),
         visible_threshold: float = 0.5,
         **kwargs: Any,
     ) -> None:
@@ -186,6 +195,7 @@ class SiamDWTracker(SiameseTrackerPlugin):
             search_radius=search_radius,
             window_influence=window_influence,
             confidence_range=confidence_range,
+            box_confidence_range=box_confidence_range,
             visible_threshold=visible_threshold,
             **kwargs,
         )

@@ -861,3 +861,59 @@ rotation-tolerance tests; `ruff check`, `ruff format --check` on touched files,
 * The cursor preview redraws the whole overlay on each pointer move, but only
   while a point is being placed; at several hundred tracks that may want its
   own layer.
+
+## 11. "Y is locked but the trail still jitters", 2026-10-21
+
+Report: a box track (Ocean) on a dog running through grass, solved from that
+one track, Y smoothed with Tripod. The curve panels showed Y held flat; the
+stabilised ("Smoothed") trail on the canvas still jumped on some frames.
+
+**What was wrong.** Both views were right about what they show, and disagreed
+about which frames count. The curves are the *camera*; the trail is the *track*
+pushed through the stabilisation warp. On 182 of the 860 frames Ocean reported
+confidence 0, the solver (correctly) refused those samples and interpolated the
+camera across them, and the track — measured against an interpolated camera —
+wandered up to 129 px from the locked line. Looking at those frames, the box
+was on the dog on every one: the tracking was right and the confidence was
+wrong. The box confidence had been calibrated on feature *patches* (§8); a
+fixed template of a turning, running dog scores lower against itself than a
+patch does while still being the best match. Ocean even kept moving the box on
+181 of them, because its box hold threshold (0.3, §9) sat below that
+calibration's floor (0.45). SiamDW was worse on the same shot: half the frames
+at 0, and held still on all of them.
+
+The disagreement was also invisible. The solver flags every frame that is not
+`solved`, and a one-track X/Y solve is `translation_only` on every frame — so
+all 900 were flagged and the 182 that mattered could not be told apart.
+
+**What changed.**
+
+* `box_confidence_range` on the Siamese plugins, with `box_lost_below`
+  defaulting to its bottom — a frame trusted enough to move the box on is one
+  the solver may use. Ocean `(0.3, 0.6)`, SiamDW `(0.4, 0.65)`. Measured raw
+  evidence: on the dog (box on target every frame) Ocean median 0.55 / 5th pct
+  0.38, SiamDW median 0.55; on the composited clips of §9, correctly tracked
+  Ocean median 0.76 / SiamDW 0.72, object covered Ocean median 0.18 (90th pct
+  0.42) / SiamDW max 0.44. From the new floors 0.1% of the dog's frames and 74%
+  (Ocean) / 90%+ (SiamDW) of covered frames read 0.
+* The solver reports a one-point frame as `solved` when rotation and scale
+  were switched off — everything asked for was measured — so `flagged` means
+  something again on such solves.
+* The curve editor and the smoothing panel shade frames the solve filled in
+  (interpolated, held, identity), and the smoothing panel says how many there
+  are inside the In/Out range and what to do about them.
+
+**Checked** on a scratch copy of the reporting project through the real server
+and UI: re-tracking p1 and solving again went from 678 translation-only + 182
+interpolated frames (smoothed track Y off by > 1 px on 175 frames, worst 129 px)
+to 856 solved + 4 interpolated (4 frames, worst 25 px — frames where Ocean
+genuinely lost confidence and held the box), with flagged frames 900 → 44 (40 of
+them past the Out point). Positions were identical to the stored track to the
+pixel; only confidence changed. The project itself was not touched — its track
+needs re-tracking and a new solve to pick the calibration up.
+
+**Open.**
+
+* A box's centre is the centre of the *object's* extent, not of a feature on
+  it: on the dog it wandered between the face and the chest as the dog ran.
+  Locking a body part rather than the animal wants a point track on it.

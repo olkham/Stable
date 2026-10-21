@@ -209,6 +209,18 @@ def crop_square(
     )
 
 
+def _calibration(name: str, value: tuple[float, float]) -> tuple[float, float]:
+    """Return a ``(low, high)`` evidence calibration as floats.
+
+    Raises:
+        ContractError: Unless ``high > low``.
+    """
+    low, high = float(value[0]), float(value[1])
+    if not high > low:
+        raise ContractError(f"{name} needs high > low, got {value}")
+    return (low, high)
+
+
 def cosine_window(positions: np.ndarray, centre: float, half_span: float) -> np.ndarray:
     """Return a raised-cosine prior over ``positions``, peaking at ``centre``.
 
@@ -584,10 +596,16 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             be the network's best guess of where a fast feature went. Holding on
             every weak frame is how a point falls behind a fast pan and never
             catches up.
+        box_confidence_range: ``confidence_range`` for a query with a box;
+            ``None`` means the same. An object the operator drew changes
+            appearance as it turns or deforms, and a fixed template's evidence
+            falls with it while the tracker is still on it, so a box wants a
+            calibration of its own (see each plugin's module docstring).
         box_lost_below: ``lost_below`` for a query with a box; ``None`` means
-            the same. An object the operator drew changes appearance as it turns
-            or deforms, and a fixed template's evidence falls with it, so a box
-            may want to keep following through weaker frames than a point.
+            the bottom of ``box_confidence_range``. That default is the rule
+            for boxes: a frame the tracker trusts enough to move the box on is a
+            frame the solver should be allowed to use, and one it does not is
+            one the solver should not.
         device: Preferred device; see
             :class:`~stable.trackers.deep.ModelTrackerPlugin`.
         allow_cpu_fallback: See :class:`~stable.trackers.deep.ModelTrackerPlugin`.
@@ -646,6 +664,7 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         confidence_range: tuple[float, float] = (0.2, 0.8),
         visible_threshold: float = 0.5,
         lost_below: float | None = None,
+        box_confidence_range: tuple[float, float] | None = None,
         box_lost_below: float | None = None,
         device: str | None = None,
         allow_cpu_fallback: bool = True,
@@ -668,13 +687,17 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         self.window_influence = float(window_influence)
         if not 0.0 <= self.window_influence < 1.0:
             raise ContractError(f"window_influence must lie in [0, 1), got {self.window_influence}")
-        low, high = float(confidence_range[0]), float(confidence_range[1])
-        if not high > low:
-            raise ContractError(f"confidence_range needs high > low, got {confidence_range}")
-        self.confidence_range = (low, high)
+        self.confidence_range = _calibration("confidence_range", confidence_range)
+        self.box_confidence_range = (
+            self.confidence_range
+            if box_confidence_range is None
+            else _calibration("box_confidence_range", box_confidence_range)
+        )
         self.visible_threshold = float(visible_threshold)
-        self.lost_below = low if lost_below is None else float(lost_below)
-        self.box_lost_below = self.lost_below if box_lost_below is None else float(box_lost_below)
+        self.lost_below = self.confidence_range[0] if lost_below is None else float(lost_below)
+        self.box_lost_below = (
+            self.box_confidence_range[0] if box_lost_below is None else float(box_lost_below)
+        )
 
     @classmethod
     def _implementation_available(cls) -> bool:
@@ -754,16 +777,19 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         """
         return float(step.evidence)
 
-    def normalize_confidence(self, raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def normalize_confidence(
+        self, raw: np.ndarray, *, box: bool = False
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Map raw evidence onto the shared ``[0, 1]`` confidence.
 
         Args:
             raw: Scores from :meth:`raw_confidence`.
+            box: Calibrate with ``box_confidence_range``, for box queries.
 
         Returns:
             ``(confidence float32, visible bool)``, each shaped like ``raw``.
         """
-        low, high = self.confidence_range
+        low, high = self.box_confidence_range if box else self.confidence_range
         confidence = normalize_scores(raw, low=low, high=high)
         return confidence, visibility_from_confidence(confidence, self.visible_threshold)
 
@@ -1035,6 +1061,11 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
                 dtype=np.float64,
             )
             scores, seen = self.normalize_confidence(raw)
+            boxed = np.array([seed.box for seed in anchor.seeds])
+            if boxed.any():
+                box_scores, box_seen = self.normalize_confidence(raw, box=True)
+                scores = np.where(boxed, box_scores, scores)
+                seen = np.where(boxed, box_seen, seen)
             height, width = frame.shape[:2]
             for slot, point in enumerate(members):
                 target, seed = targets[slot], anchor.seeds[slot]

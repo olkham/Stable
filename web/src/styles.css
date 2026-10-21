@@ -1190,6 +1190,19 @@ button:disabled {
   border-top-color: var(--accent);
 }
 
+/* Frames the solve filled in rather than measured: a swatch, not a line. */
+.curve-editor__key--unmeasured {
+  height: 10px;
+  border-top-width: 0;
+  background: rgba(214, 69, 69, 0.35);
+  vertical-align: middle;
+}
+
+.smoothing-panel__unmeasured {
+  border-left: 3px solid rgba(214, 69, 69, 0.75);
+  padding-left: 8px;
+}
+
 /* ---- model checkpoint manager ---- */
 
 .model-list {

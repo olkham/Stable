@@ -421,6 +421,42 @@ def test_the_siamese_plugins_track_boxes(cls):
     assert cls.tracks_boxes
 
 
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_a_box_is_held_where_its_own_calibration_starts(cls):
+    """A frame trusted enough to move the box on is one the solver may use."""
+    plugin = cls()
+    low, high = plugin.box_confidence_range
+    assert low < plugin.confidence_range[0]
+    assert plugin.box_lost_below == low
+    confidence, _ = plugin.normalize_confidence(np.array([low, (low + high) / 2]), box=True)
+    assert confidence.tolist() == pytest.approx([0.0, 0.5])
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_boxes_and_points_in_one_call_are_calibrated_their_own_way(cls, video):
+    """Evidence between the two floors counts for the box and not for the point."""
+    plugin = plugin_for(cls)
+    point_low = plugin.confidence_range[0]
+    box_low, box_high = plugin.box_confidence_range
+    middling = (box_low + point_low) / 2  # above the box floor, below the point's
+
+    def evidence(self, step, reference):
+        return middling
+
+    point, box = anchor_at(video, 0), Query(0, 30.0, 20.0, w=12.0, h=10.0)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cls, "raw_confidence", evidence)
+        result = plugin.track(video, [point, box], (0, 6), "fwd")
+    assert (result.confidence[0, 1:6] == 0.0).all()
+    expected = (middling - box_low) / (box_high - box_low)
+    assert result.confidence[1, 1:6] == pytest.approx(np.full(5, expected), abs=1e-6)
+
+
+def test_a_box_calibration_must_rise():
+    with pytest.raises(ContractError, match="box_confidence_range"):
+        OceanTracker(box_confidence_range=(0.6, 0.3))
+
+
 # -- the decoders ---------------------------------------------------------------
 
 
