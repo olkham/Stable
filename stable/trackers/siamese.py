@@ -34,6 +34,21 @@ From a box to a point
   target at the size the template saw it, so a feature the camera pushes in on
   is still matched like for like.
 
+Box tracks
+----------
+A query that states a box (``Query.w``, ``Query.h`` — an object the operator
+drew around) is tracked the way these networks were trained and benchmarked:
+the exemplar is cut around that box rather than the ``2r + 1`` square, the
+search is the trained 255 px with nothing but the cosine window limiting how far
+it may move, and the box's two sides are tracked separately and reported as
+:attr:`~stable.core.types.TrackResult.sizes`. The position is still the box's
+centre, read relative to the anchor's own reading like a point's, so a network
+that boxes an object a little off where the operator drew it does not move it.
+SiamDW searches scales, not shapes, so its box keeps the aspect it was drawn
+with; Ocean regresses each side and follows an object that changes shape.
+Points and boxes can share a call: they are batched separately, because their
+searches are cut at different sides.
+
 Geometry
 --------
 The exemplar is the box plus context — SiamFC's rule, side
@@ -63,7 +78,10 @@ touched, and the next frame searches around the same spot, which is how a point
 survives an occluder passing over it. The networks keep answering while the
 target is hidden, so "lost" is a decision made here, not something they report —
 and it is a separate threshold from confidence ``0``, because a frame too weak
-to trust can still be the best guess of where a fast feature went.
+to trust can still be the best guess of where a fast feature went. A box has
+its own threshold, ``box_lost_below``: the template is fixed, so an object that
+turns or stretches scores lower and lower against it while still being the best
+match in sight.
 """
 
 from __future__ import annotations
@@ -461,6 +479,37 @@ class TorchSiameseBackend:
         self._network = None
 
 
+@dataclass(frozen=True)
+class _Seed:
+    """One query as its search sees it, fixed at the anchor.
+
+    Attributes:
+        x: Anchor position (the box centre), in source pixels.
+        y: Likewise.
+        width: The target box at the anchor, in source pixels: the query's own
+            box, or the ``2r + 1`` square of a point.
+        height: Likewise.
+        box: Whether the query stated its box. A box's two sides are tracked
+            and reported; a point's scale stays isotropic and is not reported.
+        instance_size: Search crop side, in network pixels.
+        reach: How far a candidate may be from where the target is expected,
+            in network pixels.
+    """
+
+    x: float
+    y: float
+    width: float
+    height: float
+    box: bool
+    instance_size: int
+    reach: float
+
+    @property
+    def anchor_scale(self) -> float:
+        """Network pixels per source pixel in the crops cut at the anchor."""
+        return EXEMPLAR_SIZE / context_side(self.width, self.height)
+
+
 @dataclass
 class _Anchor:
     """What one batch of points learned from its anchor frame.
@@ -471,40 +520,29 @@ class _Anchor:
         kernels: The backend's templates for them.
         references: Each point's self-match — the network's reading of the
             anchor frame — which every later frame is read relative to.
-        positions: The anchors' positions.
+        seeds: The batch's queries.
         fill: Padding colour for crops leaving the frame.
     """
 
     exemplars: np.ndarray
     kernels: Any
     references: list[SiameseStep]
-    positions: list[tuple[float, float]]
+    seeds: list[_Seed]
     fill: np.ndarray
 
 
 @dataclass
 class _Target:
-    """One point between frames: where it is and how much its target has scaled."""
+    """One point between frames: where it is and how much its target has scaled.
+
+    ``scale_x`` and ``scale_y`` are the target box's sides against the anchor's;
+    they differ only for a box query, whose aspect is tracked.
+    """
 
     x: float
     y: float
-    scale: float = 1.0
-
-
-@dataclass(frozen=True)
-class _Geometry:
-    """One ``track()`` call's search geometry, fixed at the anchors.
-
-    Attributes:
-        instance_size: Search crop side, in network pixels.
-        reach: How far a candidate may be from where the target is expected,
-            in network pixels.
-        anchor_scale: Network pixels per source pixel at the anchor.
-    """
-
-    instance_size: int
-    reach: float
-    anchor_scale: float
+    scale_x: float = 1.0
+    scale_y: float = 1.0
 
 
 @dataclass
@@ -514,6 +552,7 @@ class _Sink:
     points: np.ndarray
     confidence: np.ndarray
     visible: np.ndarray
+    sizes: np.ndarray | None
     reporter: RunProgress
 
 
@@ -545,6 +584,10 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             be the network's best guess of where a fast feature went. Holding on
             every weak frame is how a point falls behind a fast pan and never
             catches up.
+        box_lost_below: ``lost_below`` for a query with a box; ``None`` means
+            the same. An object the operator drew changes appearance as it turns
+            or deforms, and a fixed template's evidence falls with it, so a box
+            may want to keep following through weaker frames than a point.
         device: Preferred device; see
             :class:`~stable.trackers.deep.ModelTrackerPlugin`.
         allow_cpu_fallback: See :class:`~stable.trackers.deep.ModelTrackerPlugin`.
@@ -572,13 +615,17 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         scale_gate: A reading whose box differs from the expected one by more
             than this factor — scale and aspect change multiplied, as in
             TracKit's penalty — still moves the point but is not trusted to
-            rescale it. The target's scale is isotropic: a point reports no box,
-            so tracking aspect would only feed back noise. Without either,
-            Ocean's box regression of an arbitrary patch (which flips between
-            shapes from frame to frame) walked the scale to its lower clamp
-            within 60 frames of handheld footage; see :mod:`stable.trackers.ocean`.
+            rescale it. A point's scale is isotropic: it reports no box, so
+            tracking aspect would only feed back noise. Without either, Ocean's
+            box regression of an arbitrary patch (which flips between shapes
+            from frame to frame) walked the scale to its lower clamp within 60
+            frames of handheld footage; see :mod:`stable.trackers.ocean`. A box
+            query's sides are tracked separately, still behind the gate.
+        tracks_boxes: Always ``True``: a query with a box is tracked as that
+            object, and its size reported (see the module docstring).
     """
 
+    tracks_boxes = True
     exemplar_size: int = EXEMPLAR_SIZE
     total_stride: int = TOTAL_STRIDE
     trained_instance_size: int = 255
@@ -599,6 +646,7 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         confidence_range: tuple[float, float] = (0.2, 0.8),
         visible_threshold: float = 0.5,
         lost_below: float | None = None,
+        box_lost_below: float | None = None,
         device: str | None = None,
         allow_cpu_fallback: bool = True,
         backend: SiameseBackend | None = None,
@@ -626,6 +674,7 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         self.confidence_range = (low, high)
         self.visible_threshold = float(visible_threshold)
         self.lost_below = low if lost_below is None else float(lost_below)
+        self.box_lost_below = self.lost_below if box_lost_below is None else float(box_lost_below)
 
     @classmethod
     def _implementation_available(cls) -> bool:
@@ -663,6 +712,8 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         expected_box: tuple[float, float],
         expected_centre: tuple[float, float],
         reach: float,
+        *,
+        box: bool = False,
     ) -> SiameseStep:
         """Read one point's maps: where is the target, how big, how sure?
 
@@ -678,6 +729,8 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
                 Priors (the cosine window) centre here, not on the crop.
             reach: How far from ``expected_centre`` a candidate may be;
                 ``math.inf`` for the anchor's own reading.
+            box: Whether the query is a box the operator drew, rather than a
+                point's patch; a decoder may damp its size differently for one.
 
         Returns:
             What the search found.
@@ -774,14 +827,15 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             video: Clip to read frames from.
             queries: Anchor positions, one per point; each must lie inside
                 ``frame_range``. A position near or past the frame edge is fine:
-                the crops are padded.
+                the crops are padded. A query with a box is tracked as a box.
             frame_range: ``(start, end)`` half-open absolute frame range.
             direction: ``"fwd"``, ``"bwd"`` or ``"bidir"``.
             progress: Progress reporter, called once per frame stepped.
 
         Returns:
             A :class:`~stable.core.types.TrackResult` with ``N = len(queries)``
-            and ``T = video.frame_count``, in query order.
+            and ``T = video.frame_count``, in query order; with ``sizes`` if any
+            query has a box (``NaN`` rows for the points among them).
 
         Raises:
             TrackerError: If the range or direction is invalid, a query lies
@@ -809,20 +863,24 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         if self._backend is None:  # pragma: no cover - prepare() guarantees this
             raise TrackerError(f"{self.name} has no loaded model; call prepare() first")
 
-        instance_size, reach = self.search_geometry()
-        geometry = _Geometry(instance_size, reach, self.anchor_scale)
+        point_geometry = self.search_geometry()
+        seeds = [self._seed(query, point_geometry) for query in queries]
+        boxes = any(seed.box for seed in seeds)
         sink = _Sink(
             points=np.full((len(queries), n_frames, 2), np.nan, dtype=np.float32),
             confidence=np.zeros((len(queries), n_frames), dtype=np.float32),
             visible=np.zeros((len(queries), n_frames), dtype=bool),
+            sizes=np.full((len(queries), n_frames, 2), np.nan, dtype=np.float32) if boxes else None,
             reporter=RunProgress(progress, total=planned_steps(queries, (start, end), direction)),
         )
 
-        groups: OrderedDict[int, list[int]] = OrderedDict()
-        for index, query in enumerate(queries):
-            groups.setdefault(query.frame, []).append(index)
+        # Crops are stacked into one network call, so a batch shares its frame
+        # and its search side; boxes and points search at different sides.
+        groups: OrderedDict[tuple[int, int], list[int]] = OrderedDict()
+        for index, (query, seed) in enumerate(zip(queries, seeds, strict=True)):
+            groups.setdefault((query.frame, seed.instance_size), []).append(index)
 
-        for anchor_frame, members in groups.items():
+        for (anchor_frame, _), members in groups.items():
             frame = self._read(video, anchor_frame)
             fill = frame.reshape(-1, 3).mean(axis=0)
             runs: list[range] = []
@@ -832,21 +890,23 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
                 runs.append(range(anchor_frame - 1, start - 1, -1))
             for first in range(0, len(members), self.max_batch):
                 batch = members[first : first + self.max_batch]
-                anchor = self._read_anchor(
-                    frame, [queries[i].position for i in batch], fill, geometry
-                )
+                anchor = self._read_anchor(frame, [seeds[i] for i in batch], fill)
                 for frames in runs:
-                    self._follow(video, anchor, batch, frames, geometry, sink)
+                    self._follow(video, anchor, batch, frames, sink)
 
         # The anchor is ground truth: never let a model's own reading of its
-        # query frame override the position the operator placed there.
+        # query frame override the position (or box) the operator placed there.
         for index, query in enumerate(queries):
             sink.points[index, query.frame] = query.position
             sink.confidence[index, query.frame] = 1.0
             sink.visible[index, query.frame] = True
+            if sink.sizes is not None and query.size is not None:
+                sink.sizes[index, query.frame] = query.size
 
         progress(1.0, "done")
-        return TrackResult(points=sink.points, confidence=sink.confidence, visible=sink.visible)
+        return TrackResult(
+            points=sink.points, confidence=sink.confidence, visible=sink.visible, sizes=sink.sizes
+        )
 
     # -- internals --------------------------------------------------------------
 
@@ -863,55 +923,80 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             raise TrackerError(f"video frames must be [H, W, 3] RGB, got {frame.shape}")
         return frame
 
-    def _search_side(self, target: _Target, geometry: _Geometry) -> float:
-        """Return the reference search crop's side, in source pixels, at ``target``'s scale."""
-        side = self.box_side * target.scale
-        return context_side(side, side) * geometry.instance_size / self.exemplar_size
+    def _seed(self, query: Query, point_geometry: tuple[int, float]) -> _Seed:
+        """Return how ``query`` is searched for.
 
-    def _searches(
-        self, frame: np.ndarray, targets: list[_Target], fill: np.ndarray, geometry: _Geometry
-    ) -> np.ndarray:
+        A point is the ``2r + 1`` box searched as ``search_radius`` asks (see
+        :meth:`search_geometry`). A box is searched the way the networks were
+        trained and benchmarked: the trained search side, around the box the
+        operator drew, with nothing beyond the cosine window to limit how far it
+        may move — ``search_radius`` describes a point's patch, not an object.
+        """
+        if query.size is None:
+            side = float(self.box_side)
+            instance_size, reach = point_geometry
+            return _Seed(query.x, query.y, side, side, False, instance_size, reach)
+        width, height = query.size
+        return _Seed(query.x, query.y, width, height, True, self.trained_instance_size, math.inf)
+
+    def _search_side(self, target: _Target, seed: _Seed) -> float:
+        """Return the reference search crop's side, in source pixels, at ``target``'s scale."""
+        side = context_side(seed.width * target.scale_x, seed.height * target.scale_y)
+        return side * seed.instance_size / self.exemplar_size
+
+    def _searches(self, frame: np.ndarray, targets: list[_Target], anchor: _Anchor) -> np.ndarray:
         """Cut every target's search crops: ``[N, S, X, X, 3]``."""
-        size = geometry.instance_size
         return np.stack(
             [
                 np.stack(
                     [
                         crop_square(
-                            frame, (t.x, t.y), self._search_side(t, geometry) * k, size, fill
+                            frame,
+                            (t.x, t.y),
+                            self._search_side(t, seed) * k,
+                            seed.instance_size,
+                            anchor.fill,
                         )
                         for k in self.search_scales
                     ]
                 )
-                for t in targets
+                for t, seed in zip(targets, anchor.seeds, strict=True)
             ]
         )
 
-    def _read_anchor(
-        self,
-        frame: np.ndarray,
-        positions: list[tuple[float, float]],
-        fill: np.ndarray,
-        geometry: _Geometry,
-    ) -> _Anchor:
+    def _read_anchor(self, frame: np.ndarray, seeds: list[_Seed], fill: np.ndarray) -> _Anchor:
         """Cut the templates and take the network's reading of the anchor frame."""
-        side = context_side(self.box_side, self.box_side)
         exemplars = np.stack(
-            [crop_square(frame, position, side, self.exemplar_size, fill) for position in positions]
+            [
+                crop_square(
+                    frame,
+                    (seed.x, seed.y),
+                    context_side(seed.width, seed.height),
+                    self.exemplar_size,
+                    fill,
+                )
+                for seed in seeds
+            ]
         )
         anchor = _Anchor(
             exemplars=exemplars,
             kernels=self._embed(exemplars),
             references=[],
-            positions=list(positions),
+            seeds=list(seeds),
             fill=fill,
         )
-        targets = [_Target(*position) for position in positions]
-        maps = self._match(anchor, self._searches(frame, targets, fill, geometry))
-        box = self.box_side * geometry.anchor_scale
+        targets = [_Target(seed.x, seed.y) for seed in seeds]
+        maps = self._match(anchor, self._searches(frame, targets, anchor))
         anchor.references = [
-            self._decode(maps, slot, (box, box), (0.0, 0.0), math.inf)
-            for slot in range(len(positions))
+            self._decode(
+                maps,
+                slot,
+                (seed.width * seed.anchor_scale, seed.height * seed.anchor_scale),
+                (0.0, 0.0),
+                math.inf,
+                box=seed.box,
+            )
+            for slot, seed in enumerate(seeds)
         ]
         return anchor
 
@@ -921,25 +1006,28 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         anchor: _Anchor,
         members: list[int],
         frames: range,
-        geometry: _Geometry,
         sink: _Sink,
     ) -> None:
         """Track one batch through ``frames``, in order, from its anchor."""
-        targets = [_Target(*position) for position in anchor.positions]
+        targets = [_Target(seed.x, seed.y) for seed in anchor.seeds]
         for index in frames:
             frame = self._read(video, index)
-            maps = self._match(anchor, self._searches(frame, targets, anchor.fill, geometry))
-            scales = [geometry.instance_size / self._search_side(t, geometry) for t in targets]
+            maps = self._match(anchor, self._searches(frame, targets, anchor))
+            scales = [
+                seed.instance_size / self._search_side(t, seed)
+                for t, seed in zip(targets, anchor.seeds, strict=True)
+            ]
             steps = [
                 self._decode(
                     maps,
                     slot,
-                    self._expected(reference, target, scale, geometry, box=True),
-                    self._expected(reference, target, scale, geometry, box=False),
-                    geometry.reach,
+                    self._expected(reference, target, scale, seed, box=True),
+                    self._expected(reference, target, scale, seed, box=False),
+                    seed.reach,
+                    box=seed.box,
                 )
-                for slot, (target, reference, scale) in enumerate(
-                    zip(targets, anchor.references, scales, strict=True)
+                for slot, (target, reference, scale, seed) in enumerate(
+                    zip(targets, anchor.references, scales, anchor.seeds, strict=True)
                 )
             ]
             raw = np.array(
@@ -949,16 +1037,19 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             scores, seen = self.normalize_confidence(raw)
             height, width = frame.shape[:2]
             for slot, point in enumerate(members):
-                target = targets[slot]
-                if raw[slot] > self.lost_below:
-                    self._advance(
-                        target, steps[slot], anchor.references[slot], scales[slot], geometry
-                    )
+                target, seed = targets[slot], anchor.seeds[slot]
+                if raw[slot] > (self.box_lost_below if seed.box else self.lost_below):
+                    self._advance(target, steps[slot], anchor.references[slot], scales[slot], seed)
                     target.x = min(max(target.x, 0.0), width - 1.0)
                     target.y = min(max(target.y, 0.0), height - 1.0)
                 sink.points[point, index] = (target.x, target.y)
                 sink.confidence[point, index] = scores[slot]
                 sink.visible[point, index] = bool(seen[slot])
+                if seed.box and sink.sizes is not None:
+                    sink.sizes[point, index] = (
+                        seed.width * target.scale_x,
+                        seed.height * target.scale_y,
+                    )
             sink.reporter.step(len(members))
 
     @staticmethod
@@ -966,7 +1057,7 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         reference: SiameseStep,
         target: _Target,
         scale: float,
-        geometry: _Geometry,
+        seed: _Seed,
         *,
         box: bool,
     ) -> tuple[float, float]:
@@ -976,10 +1067,11 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         target's scale and converted to this crop's pixels. With no motion and no
         scale change, this is exactly what the network should answer again.
         """
-        factor = target.scale * scale / geometry.anchor_scale
+        factor_x = target.scale_x * scale / seed.anchor_scale
+        factor_y = target.scale_y * scale / seed.anchor_scale
         if box:
-            return (reference.width * factor, reference.height * factor)
-        return (reference.dx * factor, reference.dy * factor)
+            return (reference.width * factor_x, reference.height * factor_y)
+        return (reference.dx * factor_x, reference.dy * factor_y)
 
     def _advance(
         self,
@@ -987,31 +1079,35 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         step: SiameseStep,
         reference: SiameseStep,
         scale: float,
-        geometry: _Geometry,
+        seed: _Seed,
     ) -> None:
         """Move ``target`` by what ``step`` says changed since the reference reading.
 
         The tracked thing's size, against the reference reading's at the target's
         current scale, updates that scale (damped by ``step.rate``, and not at
-        all past :attr:`scale_gate`); the tracked thing's centre is converted to
-        source pixels; and the point is put back at the reference offset from
+        all past :attr:`scale_gate`) — each side on its own for a box, both by
+        their geometric mean for a point; the tracked thing's centre is converted
+        to source pixels; and the point is put back at the reference offset from
         that centre, grown or shrunk with the target — the "riding" the module
         docstring describes.
         """
-        expected_w, expected_h = self._expected(reference, target, scale, geometry, box=True)
+        expected_w, expected_h = self._expected(reference, target, scale, seed, box=True)
         expected_w, expected_h = max(expected_w, 1e-6), max(expected_h, 1e-6)
         width, height = max(step.width, 1e-6), max(step.height, 1e-6)
-        measured = math.sqrt((width * height) / (expected_w * expected_h))
-        aspect = (width / height) / (expected_w / expected_h)
+        along_x, along_y = width / expected_w, height / expected_h
+        measured = math.sqrt(along_x * along_y)
+        aspect = along_x / along_y
         change = max(measured, 1.0 / measured) * max(aspect, 1.0 / aspect)
         rate = min(max(float(step.rate), 0.0), 1.0) if change <= self.scale_gate else 0.0
+        if not seed.box:
+            along_x = along_y = measured
         low, high = self.scale_bounds
-        target.scale = min(max(target.scale * (1.0 - rate + rate * measured), low), high)
+        target.scale_x = min(max(target.scale_x * (1.0 - rate + rate * along_x), low), high)
+        target.scale_y = min(max(target.scale_y * (1.0 - rate + rate * along_y), low), high)
         centre_x = target.x + step.dx / scale
         centre_y = target.y + step.dy / scale
-        offset = target.scale / geometry.anchor_scale
-        target.x = centre_x - reference.dx * offset
-        target.y = centre_y - reference.dy * offset
+        target.x = centre_x - reference.dx * target.scale_x / seed.anchor_scale
+        target.y = centre_y - reference.dy * target.scale_y / seed.anchor_scale
 
     def _embed(self, exemplars: np.ndarray) -> Any:
         """Build templates, absorbing a GPU out-of-memory failure."""

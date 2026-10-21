@@ -37,7 +37,7 @@ from stable.trackers.siamese import (
     SiameseMaps,
     SiameseStep,
     SiameseTrackerPlugin,
-    _Geometry,
+    _Seed,
     _Target,
     context_side,
     cosine_window,
@@ -164,46 +164,47 @@ def test_the_point_rides_on_the_network_rather_than_trusting_its_centre(cls):
 def _plugin_with_reference(width=60.0, height=60.0, dx=0.0, dy=0.0):
     plugin = OceanTracker(backend=SiameseMarkerBackend("ocean"))
     reference = SiameseStep(dx=dx, dy=dy, width=width, height=height, rate=0.0, evidence=1.0)
-    geometry = _Geometry(instance_size=255, reach=100.0, anchor_scale=plugin.anchor_scale)
-    return plugin, reference, geometry
+    side = float(plugin.box_side)
+    seed = _Seed(100.0, 100.0, side, side, box=False, instance_size=255, reach=100.0)
+    return plugin, reference, seed
 
 
 def test_a_larger_box_grows_the_target_by_the_damped_rate():
-    plugin, reference, geometry = _plugin_with_reference()
+    plugin, reference, seed = _plugin_with_reference()
     target = _Target(100.0, 100.0)
     step = SiameseStep(dx=0.0, dy=0.0, width=66.0, height=66.0, rate=0.5, evidence=1.0)
-    plugin._advance(target, step, reference, geometry.anchor_scale, geometry)
-    assert target.scale == pytest.approx(1.05)
+    plugin._advance(target, step, reference, seed.anchor_scale, seed)
+    assert (target.scale_x, target.scale_y) == pytest.approx((1.05, 1.05))
     assert (target.x, target.y) == pytest.approx((100.0, 100.0))
 
 
 def test_a_box_of_another_shape_moves_the_point_but_not_its_scale():
     """Ocean flips between boxes of a patch; that must not walk the scale away."""
-    plugin, reference, geometry = _plugin_with_reference()
+    plugin, reference, seed = _plugin_with_reference()
     target = _Target(100.0, 100.0)
     step = SiameseStep(dx=8.0, dy=0.0, width=120.0, height=30.0, rate=1.0, evidence=1.0)
-    plugin._advance(target, step, reference, geometry.anchor_scale, geometry)
-    assert target.scale == pytest.approx(1.0)
-    assert target.x == pytest.approx(100.0 + 8.0 / geometry.anchor_scale)
+    plugin._advance(target, step, reference, seed.anchor_scale, seed)
+    assert (target.scale_x, target.scale_y) == pytest.approx((1.0, 1.0))
+    assert target.x == pytest.approx(100.0 + 8.0 / seed.anchor_scale)
 
 
 def test_the_scale_is_clamped():
-    plugin, reference, geometry = _plugin_with_reference()
-    target = _Target(100.0, 100.0, scale=4.9)
+    plugin, reference, seed = _plugin_with_reference()
+    target = _Target(100.0, 100.0, scale_x=4.9, scale_y=4.9)
     # A target 4.9x its anchor size is searched in a crop 4.9x as wide.
-    crop_scale = geometry.anchor_scale / 4.9
+    crop_scale = seed.anchor_scale / 4.9
     step = SiameseStep(dx=0.0, dy=0.0, width=72.0, height=72.0, rate=1.0, evidence=1.0)
-    plugin._advance(target, step, reference, crop_scale, geometry)
-    assert target.scale == pytest.approx(plugin.scale_bounds[1])
+    plugin._advance(target, step, reference, crop_scale, seed)
+    assert target.scale_x == target.scale_y == pytest.approx(plugin.scale_bounds[1])
 
 
 def test_the_point_keeps_its_offset_from_what_the_network_tracks():
     """The reference reading sits 10 network px right of the point: it stays there."""
-    plugin, reference, geometry = _plugin_with_reference(dx=10.0)
+    plugin, reference, seed = _plugin_with_reference(dx=10.0)
     target = _Target(100.0, 100.0)
     step = SiameseStep(dx=14.0, dy=0.0, width=60.0, height=60.0, rate=0.0, evidence=1.0)
-    plugin._advance(target, step, reference, geometry.anchor_scale, geometry)
-    assert target.x == pytest.approx(100.0 + 4.0 / geometry.anchor_scale)
+    plugin._advance(target, step, reference, seed.anchor_scale, seed)
+    assert target.x == pytest.approx(100.0 + 4.0 / seed.anchor_scale)
 
 
 @pytest.mark.parametrize("cls", PLUGINS)
@@ -274,6 +275,150 @@ def test_large_batches_are_split(cls, video, monkeypatch):
     result = cls(backend=backend).track(video, queries, (0, 6), "fwd")
     assert max(shape[0] for shape in backend.searches) == 2
     assert result.n_points == 5
+
+
+# -- box tracks -------------------------------------------------------------------
+
+
+class ShapeShiftingBox(SyntheticVideoSource):
+    """A white rectangle that drifts right while it widens and flattens.
+
+    ``hidden`` frames show only the background, as an occluder would leave it.
+    """
+
+    def __init__(self, *, hidden: tuple[int, int] = (0, 0)) -> None:
+        super().__init__(frame_count=30, width=200, height=140)
+        self.hidden = hidden
+
+    def true_box(self, frame: int) -> tuple[float, float, float, float]:
+        """``(cx, cy, w, h)`` of the rectangle at ``frame``, in pixel-edge units."""
+        return (70.0 + 1.5 * frame, 70.0, 24.0 + 0.6 * frame, 24.0 - 0.3 * frame)
+
+    def get_frame(self, index: int) -> np.ndarray:
+        ys, xs = np.mgrid[0 : self.height, 0 : self.width]
+        base = ((xs + ys) % 256).astype(np.uint8)
+        frame = np.stack([base, np.roll(base, 7, axis=1), np.roll(base, 13, axis=0)], axis=-1)
+        if self.hidden[0] <= index < self.hidden[1]:
+            return frame
+        cx, cy, w, h = self.true_box(index)
+        inside = (np.abs(xs - cx) <= w / 2.0 - 0.5) & (np.abs(ys - cy) <= h / 2.0 - 0.5)
+        frame[inside] = 255
+        return frame
+
+    def query(self, frame: int) -> Query:
+        cx, cy, w, h = self.true_box(frame)
+        return Query(frame, cx, cy, w=w, h=h)
+
+
+class BoxMarkerBackend(SiameseMarkerBackend):
+    """Ocean's maps for whatever rectangle the crop shows: its real box, not a fixed one."""
+
+    def match(self, kernels, searches):
+        maps = super().match(kernels, searches)
+        side = searches.shape[2]
+        cells = maps.score.shape[-1]
+        grid = (np.arange(cells) - cells // 2) * 8.0
+        grid_x, grid_y = np.meshgrid(grid, grid)
+        boxes = maps.boxes.copy()
+        for i in range(searches.shape[0]):
+            for k in range(searches.shape[1]):
+                ys, xs = np.nonzero(searches[i, k].min(axis=2) >= 250)
+                if not len(xs):
+                    continue
+                centre = (side - 1) / 2.0
+                left, right = xs.min() - 0.5 - centre, xs.max() + 0.5 - centre
+                top, bottom = ys.min() - 0.5 - centre, ys.max() + 0.5 - centre
+                boxes[i, k] = [grid_x - left, grid_y - top, right - grid_x, bottom - grid_y]
+        return SiameseMaps(score=maps.score, boxes=boxes, similarity=maps.similarity)
+
+
+def _box_error(video, result, frame):
+    cx, cy, w, h = video.true_box(frame)
+    (x, y), (rw, rh) = result.points[0, frame], result.sizes[0, frame]
+    return math.hypot(x - cx, y - cy), rw / w, rh / h
+
+
+def test_ocean_follows_a_box_that_changes_size_and_shape():
+    video = ShapeShiftingBox()
+    result = OceanTracker(backend=BoxMarkerBackend("ocean")).track(video, [video.query(0)], (0, 30))
+    assert result.has_boxes
+    for frame in range(30):
+        moved, along_w, along_h = _box_error(video, result, frame)
+        assert moved < 1.5, f"frame {frame}"
+        assert 0.92 < along_w < 1.08 and 0.92 < along_h < 1.08, f"frame {frame}"
+    final_w, final_h = result.sizes[0, -1]
+    assert final_w / final_h > 2.0  # it started square
+
+
+def test_siamdw_follows_a_box_and_keeps_the_aspect_it_was_drawn_with():
+    """SiamFC searches scales, not shapes: the box moves and keeps its aspect."""
+    video = ShapeShiftingBox()
+    result = SiamDWTracker(backend=SiameseMarkerBackend("siamdw")).track(
+        video, [video.query(10)], (0, 30)
+    )
+    _, _, w, h = video.true_box(10)
+    for frame in range(30):
+        moved, _, _ = _box_error(video, result, frame)
+        assert moved < 1.5, f"frame {frame}"
+    sizes = result.sizes[0]
+    assert np.allclose(sizes[:, 0] / sizes[:, 1], w / h, rtol=1e-4)
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_the_drawn_box_is_ground_truth_on_its_anchor_frame(cls):
+    video = ShapeShiftingBox()
+    query = video.query(12)
+    result = plugin_for(cls).track(video, [query], (0, 30))
+    assert tuple(result.points[0, 12]) == pytest.approx(query.position)
+    assert tuple(result.sizes[0, 12]) == pytest.approx(query.size)
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_a_point_tracked_beside_a_box_is_tracked_as_it_would_be_alone(cls, video):
+    point = anchor_at(video, 0)
+    box = Query(0, 30.0, 20.0, w=12.0, h=8.0)
+    alone = plugin_for(cls).track(video, [point], (0, video.frame_count))
+    together = plugin_for(cls).track(video, [box, point], (0, video.frame_count))
+    assert np.array_equal(together.points[1], alone.points[0])
+    assert np.isnan(together.sizes[1]).all()
+    assert np.isfinite(together.sizes[0]).all()
+    assert alone.sizes is None
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_a_box_is_searched_as_trained_whatever_the_search_radius(cls):
+    """search_radius sizes a point's search; a box gets the trained 255 px one."""
+    video = ShapeShiftingBox()
+    backend = SiameseMarkerBackend("ocean" if cls is OceanTracker else "siamdw")
+    cls(backend=backend, search_radius=120).track(video, [video.query(0)], (0, 4), "fwd")
+    assert {shape[2] for shape in backend.searches} == {255}
+
+
+def test_a_lost_box_holds_its_place_and_its_size():
+    video = ShapeShiftingBox(hidden=(14, 18))
+    result = OceanTracker(backend=BoxMarkerBackend("ocean")).track(
+        video, [video.query(0)], (0, 30), "fwd"
+    )
+    assert np.allclose(result.sizes[0, 14:18], result.sizes[0, 13])
+    assert np.allclose(result.points[0, 14:18], result.points[0, 13])
+    assert (result.confidence[0, 14:18] == 0.0).all()
+
+
+def test_a_box_scales_each_side_on_its_own_and_a_point_both_together():
+    plugin, reference, point = _plugin_with_reference()
+    box = _Seed(100.0, 100.0, point.width, point.height, box=True, instance_size=255, reach=1e9)
+    # 10% wider and 10% flatter: a change of 1.0 in area, 1.22 in aspect — within the gate.
+    step = SiameseStep(dx=0.0, dy=0.0, width=66.0, height=54.0, rate=1.0, evidence=1.0)
+    as_box, as_point = _Target(100.0, 100.0), _Target(100.0, 100.0)
+    plugin._advance(as_box, step, reference, box.anchor_scale, box)
+    plugin._advance(as_point, step, reference, point.anchor_scale, point)
+    assert (as_box.scale_x, as_box.scale_y) == pytest.approx((1.1, 0.9))
+    assert as_point.scale_x == as_point.scale_y == pytest.approx(math.sqrt(1.1 * 0.9))
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_the_siamese_plugins_track_boxes(cls):
+    assert cls.tracks_boxes
 
 
 # -- the decoders ---------------------------------------------------------------

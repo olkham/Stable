@@ -35,6 +35,13 @@ reliable of the two Siamese plugins on arbitrary features. ``lk`` remains the
 more precise on clean, unoccluded motion (0.19 px median on the same clips) and
 came through none of the sweeps — the trade these trackers exist for.
 
+It tracks boxes too, as SiamFC does: it searches scales, so a box keeps the
+aspect it was drawn with. On the composited box clips described in
+:mod:`stable.trackers.ocean` its box overlapped the truth by a mean IoU of 0.68:
+close behind Ocean on zooms and shrinks, though lagging a 2x zoom by about 10%,
+and lost on all three clips where the object stretched to over twice its
+aspect. Ocean is the box tracker for anything that changes shape.
+
 Confidence
 ----------
 SiamFC's response is a similarity, not a probability, and its scale depends on
@@ -231,6 +238,8 @@ class SiamDWTracker(SiameseTrackerPlugin):
         expected_box: tuple[float, float],
         expected_centre: tuple[float, float],
         reach: float,
+        *,
+        box: bool = False,
     ) -> SiameseStep:
         """Pick the best scale and its peak, SiamFC-style.
 
@@ -242,6 +251,7 @@ class SiamDWTracker(SiameseTrackerPlugin):
             expected_centre: Where the reference peak would be; the window and
                 the reach are centred on it.
             reach: How far from ``expected_centre`` the peak may be.
+            box: Unused: SiamFC's scale search is the same for a box and a point.
 
         Returns:
             The peak, in the reference crop's pixels, the winning scale's box,

@@ -722,3 +722,142 @@ what the plugins declare.
   classifier, and OceanPlus, are not ported. The only Ocean checkpoint still
   published is the offline model, which has neither branch; both need TracKit's
   compiled CUDA extensions; and OceanPlus is a segmentation tracker.
+
+## 9. Box tracks, 2026-10-21
+
+Request: Ocean and SiamDW are designed to start from a detector's bounding box
+and report the box, so they can follow an object's changing size and aspect;
+let the operator define tracks with a box-drawing tool, for the trackers that
+support it.
+
+**The model.** A box track is a track whose anchors state a box. Its position is
+the box **centre** everywhere, so the solver, smoothing, the curve editor and
+the AE export are untouched; the size rides alongside as optional data.
+
+* Core (`stable/core`): `Query` gains optional `w`/`h` (both or neither,
+  positive); `TrackResult`/`PointTrack` gain optional `sizes` (`[N, T, 2]`,
+  NaN unknown), carried through `point`/`select`/`from_tracks`/npz;
+  `PointSpec.is_box`. Every addition is omitted when absent, so point-track
+  project files and npz files are byte-identical to before (schema v1 needed
+  no migration).
+* Corrections: replace/retrack may carry a box; gap fill interpolates sizes,
+  delete clears them, offset and smooth leave them, a retrack splices them, and
+  promoted ground-truth anchors keep their boxes. Merge blends sizes with the
+  same weights as positions and holds an anchor's box exactly, like its
+  position.
+* Contract: `TrackerPlugin.tracks_boxes` (default `False`), reported by
+  `stable trackers` and `/api/trackers`. Only box trackers are offered for, or
+  will run, a box track.
+* Siamese plugins: a box query is tracked as TracKit tracks one — exemplar cut
+  around the drawn box, the trained 255 px search with no `search_radius`
+  limit, each side tracked separately behind the existing shape gate — and its
+  size reported. Points keep their isotropic scale; points and boxes in one
+  call are batched apart.
+* Server: `w`/`h` on point and anchor creation (a box with no tracker named
+  gets Ocean, else SiamDW); anchors added without a size keep the track's;
+  resizing an anchor marks the track stale; retracks and offset promotions
+  carry the size; `get_track` returns per-frame `w`/`h`; CSV/JSON exports
+  always have `w`/`h` columns (empty for points). CLI: `stable track --box
+  left,top,w,h@frame`.
+* UI: an Add box tool (⬚, `B`, disabled with no box tracker installed) — drag a
+  rectangle to start a box track; each box track's box drawn per frame; the
+  selected track's anchor box has corner handles (resize keeps the opposite
+  corner) and a draggable body; the anchor tool draws a box on box tracks; the
+  tracker picker lists only box trackers; the patch strip shows each box at
+  its tracked size, and the point-only pattern/search overlay is not drawn.
+
+**What measuring changed.** Real checkpoints, twelve composited 60-frame clips
+(a face, a logo and a blob texture, each zooming 2x, shrinking to 0.45x,
+stretching from aspect 0.8 to 2.75, and breathing in and out of shape), each
+also with an occluder crossing the object:
+
+| Ocean setting for boxes | Mean IoU | Recovered (last 10 frames IoU > 0.5) | With occluder |
+|---|---|---|---|
+| point defaults (`size_lr` 0.3, hold below 0.45) | 0.86 | 9 of 12 | 9 of 12 |
+| TracKit's `size_lr` 0.519 | 0.90 | 9 of 12 | 9 of 12 |
+| 0.519 and hold below 0.3 — **shipped** (`box_size_lr`, `box_lost_below`) | 0.92 | 12 of 12 | 11 of 12 |
+
+The fixed template is why the hold threshold had to come down: a stretching
+object's evidence fell below a point's threshold while it was still the best
+match, and a held box was left behind. Covered frames still report confidence
+0 at the median. SiamDW at its defaults: mean IoU 0.68, lost on all three
+stretching clips (SiamFC searches scales, not shapes — its box keeps the
+aspect drawn) and lagging a 2x zoom by ~10%; both module docstrings say so.
+
+**Checked end to end.** In Chromium against the real server and weights: a box
+dragged with the tool became an Ocean track 0.6 px from the true box; tracked
+through the zoom it ended at 185x197 against 180x198; a corner drag resized the
+anchor with the opposite corner fixed (resize cursor shown); a box drawn with
+the anchor tool on frame 40 landed within 0.5 px; re-tracking with both anchors
+merged them (and the deliberately off-centre resized anchor was flagged by the
+anchor-agreement check, as it should be). `stable track --box` on the same clip
+ended at 186x199.
+
+**Checks.** `pytest -m "not integration"`: new tests for the core model, the
+corrections and merge, the Siamese box mode (a fake backend that reports the
+real rectangle in each crop), the server routes and the CLI all pass, none of
+them needing PyTorch; the only failures are the two §7 rotation-tolerance
+tests, which fail identically on a clean checkout of the previous commit.
+`ruff check`, `ruff format --check` on touched files, `mypy stable` and `tsc`
+are clean, and the packaged frontend is rebuilt.
+
+**Open.**
+
+* Patch thumbnails in the per-track panel use one radius for the whole grid
+  (the largest anchor box), so a much smaller anchor box shows with margin; the
+  strip above uses each frame's own box size.
+* The template is fixed at each anchor, so an object that changes appearance a
+  lot over a shot wants a box anchor where it has changed — the same answer as
+  for points, now with a tool that draws one.
+
+## 10. Tracker-first track setup, 2026-10-21
+
+Request: adding a track put the operator straight into the point tool and only
+afterwards let them choose the tracker — and with it the window, the search
+area or a box. Trackers start from different inputs, so the order should be:
+choose the tracker; see its settings and the tools for the inputs it takes;
+then mark the video with that input. Anchors and runs are unchanged.
+
+**What was built.**
+
+* Contract: every `/api/trackers` row says what a track can be started from,
+  preferred first (`inputs`: `["point"]`, or `["box", "point"]` for a tracker
+  that tracks boxes — `stable.trackers.registry.tracker_inputs`).
+* `GET /api/trackers/{name}/settings?{attribute}={value}`: a tracker's settings
+  before any point exists, for candidate values — the same rows the patch panel
+  draws, plus the pattern and search regions they describe. Point creation
+  takes `options`, stored exactly as the patch panel's PUT stores them; a box
+  track refuses them (its pattern is its box). One check
+  (`tracker_options.check_tracker_options`) now guards all three, so the card,
+  creation and the per-track sliders can never disagree about what a tracker
+  accepts.
+* UI: **New track** (`N`, `B`, or the ✚ / ⬚ tools) opens a card at the top of
+  either Tracks panel. Choosing the tracker arms its preferred input — a box
+  tracker arms the box tool — with a Point/Box toggle where it takes both, and
+  that input's settings as sliders. While a point is being placed the viewer
+  draws the pattern and search boxes under the cursor at the chosen sizes.
+  Marking the video creates the track with that tracker and those settings and
+  closes the card; the next card starts from the last tracker, input and
+  per-tracker settings. Escape, Cancel or another tool abandons it.
+
+**Checked in Chromium** against the real server: Template set to pattern 24 /
+search 60 and clicked → a Template track with exactly those settings; switching
+the card to Ocean armed Box with no sliders, and the dragged box became an
+Ocean box track; Ocean switched to Point showed its pattern/search sliders; LK
+showed "takes a point only" and its window/pyramid sliders; `B` and `N` opened
+and switched the card; Escape closed it; SiamDW from a point with custom sizes
+was created the same way from the classic panel. The card was first measured
+overflowing the panel (the longest tracker name set its width) and now fits at
+1100 and 1600 px.
+
+**Checks.** New server tests (`tests/server/test_new_track_setup.py`) cover
+`inputs`, the settings description and its refusals, and creation with, and
+refusal of, settings. `pytest -m "not integration"` fails only the two §7
+rotation-tolerance tests; `ruff check`, `ruff format --check` on touched files,
+`mypy stable` and `tsc` are clean, and the packaged frontend is rebuilt.
+
+**Open.**
+
+* The cursor preview redraws the whole overlay on each pointer move, but only
+  while a point is being placed; at several hundred tracks that may want its
+  own layer.

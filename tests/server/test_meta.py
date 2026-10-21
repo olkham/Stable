@@ -48,6 +48,8 @@ def test_trackers_lists_builtins(client: TestClient) -> None:
             "display_name",
             "requires_gpu",
             "license",
+            "tracks_boxes",
+            "inputs",
             "available",
             "unavailable_reason",
         }

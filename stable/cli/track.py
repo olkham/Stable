@@ -3,6 +3,7 @@
 Headless entry point for::
 
     stable track clip.mp4 --point 120.5,80@0 --tracker lk --out tracks.json
+    stable track clip.mp4 --box 100,60,40,30@0 --tracker ocean --out boxes.json
 
 Every tracked point is independent (one query each) — this command calls a
 :class:`~stable.trackers.base.TrackerPlugin` directly rather than going through
@@ -32,6 +33,7 @@ __all__ = [
     "track_result_to_json_dict",
     "track_result_from_json_dict",
     "parse_point_spec",
+    "parse_box_spec",
 ]
 
 
@@ -54,6 +56,42 @@ def parse_point_spec(spec: str) -> Query:
     except (ValueError, ContractError) as exc:
         raise argparse.ArgumentTypeError(
             f"invalid --point {spec!r}: expected 'x,y@frame', e.g. '120.5,80@0' ({exc})"
+        ) from exc
+
+
+def parse_box_spec(spec: str) -> Query:
+    """Parse a ``--box`` argument of the form ``x,y,w,h@frame``.
+
+    ``x, y`` is the box's **top-left corner**, which is what detection tools
+    emit, and ``w, h`` its size. The returned anchor is stored the way the rest
+    of the tool holds a box: ``x, y`` is the **centre**, so ``--box 100,60,40,30@0``
+    is a box centred on ``(120, 75)``.
+
+    Args:
+        spec: e.g. ``"100,60,40,30@0"`` — left, top, width, height and the
+            anchor frame.
+
+    Returns:
+        A box :class:`~stable.core.types.Query` positioned at the box centre.
+
+    Raises:
+        argparse.ArgumentTypeError: If ``spec`` is not in the expected form, or
+            the size is not positive.
+    """
+    try:
+        coords, frame_text = spec.split("@", 1)
+        left, top, width, height = (float(part) for part in coords.split(",", 3))
+        return Query(
+            frame=int(frame_text),
+            x=left + width / 2.0,
+            y=top + height / 2.0,
+            w=width,
+            h=height,
+        )
+    except (ValueError, ContractError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --box {spec!r}: expected 'x,y,w,h@frame' with x,y the top-left corner, "
+            f"e.g. '100,60,40,30@0' ({exc})"
         ) from exc
 
 
@@ -87,10 +125,20 @@ def add_track_parser(subparsers: Any) -> argparse.ArgumentParser:
         "--point",
         dest="points",
         action="append",
-        required=True,
         type=parse_point_spec,
         metavar="x,y@frame",
         help="a point to track, as 'x,y@frame'; repeat for multiple points",
+    )
+    parser.add_argument(
+        "--box",
+        dest="points",
+        action="append",
+        type=parse_box_spec,
+        metavar="x,y,w,h@frame",
+        help="a box to track, as 'x,y,w,h@frame' where x,y is the box's TOP-LEFT corner (as "
+        "detection tools emit it), converted to the centre the tracker follows; needs a "
+        "tracker that tracks boxes, e.g. ocean or siamdw. Repeatable, and mixes with --point "
+        "(results follow the order given)",
     )
     parser.add_argument(
         "--tracker", default="lk", help="tracker plugin name to use (default: %(default)s)"
@@ -134,6 +182,9 @@ def add_track_parser(subparsers: Any) -> argparse.ArgumentParser:
         "--device", default=None, help="compute device ('cpu', 'cuda', ...); default: automatic"
     )
     parser.add_argument("--quiet", action="store_true", help="suppress the progress line")
+    # So `run_track` can refuse "no --point and no --box" with argparse's own
+    # usage error: neither option is required on its own, only one of them is.
+    parser.set_defaults(track_parser=parser)
     return parser
 
 
@@ -226,16 +277,25 @@ def track_result_to_json_dict(
         "frame_count": result.n_frames,
         "frame_range": list(frame_range),
         "direction": direction,
-        "points": [
-            {
-                "query": query.to_dict(),
-                "points": _points_row_to_json(result.points[i]),
-                "confidence": result.confidence[i].tolist(),
-                "visible": result.visible[i].tolist(),
-            }
-            for i, query in enumerate(queries)
-        ],
+        "points": [_point_entry(result, i, query) for i, query in enumerate(queries)],
     }
+
+
+def _point_entry(result: TrackResult, index: int, query: Query) -> dict[str, Any]:
+    """Return one point's JSON entry; ``sizes`` appears only for a box run.
+
+    ``sizes`` is ``[w, h]`` per frame (``null`` where unknown), parallel to
+    ``points``, so a point-only run's file is unchanged from before boxes existed.
+    """
+    entry: dict[str, Any] = {
+        "query": query.to_dict(),
+        "points": _points_row_to_json(result.points[index]),
+        "confidence": result.confidence[index].tolist(),
+        "visible": result.visible[index].tolist(),
+    }
+    if result.sizes is not None:
+        entry["sizes"] = _points_row_to_json(result.sizes[index])
+    return entry
 
 
 def track_result_from_json_dict(data: dict[str, Any]) -> TrackResult:
@@ -254,10 +314,22 @@ def track_result_from_json_dict(data: dict[str, Any]) -> TrackResult:
     points_entries = data["points"]
     if not points_entries:
         return TrackResult.empty(0, int(data["frame_count"]))
+    sizes = None
+    if any("sizes" in entry for entry in points_entries):
+        # A point without a box among boxed ones reads back as unknown sizes.
+        sizes = np.asarray(
+            [
+                _points_row_from_json(entry["sizes"])
+                if "sizes" in entry
+                else [[math.nan, math.nan]] * len(entry["points"])
+                for entry in points_entries
+            ]
+        )
     return TrackResult(
         points=np.asarray([_points_row_from_json(entry["points"]) for entry in points_entries]),
         confidence=np.asarray([entry["confidence"] for entry in points_entries]),
         visible=np.asarray([entry["visible"] for entry in points_entries]),
+        sizes=sizes,
     )
 
 
@@ -284,6 +356,13 @@ def run_track(args: argparse.Namespace) -> int:
     Returns:
         Process exit code: ``0`` on success, ``1`` on a recognised failure.
     """
+    if not args.points:
+        parser = getattr(args, "track_parser", None)
+        if parser is not None:
+            parser.error("give at least one --point x,y@frame or --box x,y,w,h@frame")
+        print("error: give at least one --point or --box", file=sys.stderr)
+        return 1
+
     try:
         video = PyAVVideoSource(args.video)
     except StableError as exc:
@@ -297,6 +376,18 @@ def run_track(args: argparse.Namespace) -> int:
             f"error: no tracker named {args.tracker!r}; available: {registry.discover()}",
             file=sys.stderr,
         )
+        return 1
+
+    if any(query.has_box for query in args.points) and not getattr(
+        registry.get(args.tracker), "tracks_boxes", False
+    ):
+        boxed = [row["name"] for row in registry.describe() if row["tracks_boxes"]]
+        print(
+            f"error: tracker {args.tracker!r} does not track boxes, so --box cannot be used "
+            f"with it; box trackers: {boxed or 'none installed'}",
+            file=sys.stderr,
+        )
+        video.close()
         return 1
 
     tracker = None

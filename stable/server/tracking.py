@@ -84,7 +84,7 @@ from ..trackers.merge import (
     merge_anchor_runs,
     plan_anchor_runs,
 )
-from ..trackers.registry import create_tracker
+from ..trackers.registry import create_tracker, describe_trackers, registry
 from .clip_range import effective_range
 from .storage import Workspace
 from .tracker_options import point_options
@@ -94,6 +94,10 @@ __all__ = [
     "run_point_retrack",
     "effective_anchors",
     "anchors_changed",
+    "tracker_tracks_boxes",
+    "box_tracker_names",
+    "default_box_tracker",
+    "resolve_box_size",
     "bounded_frame_range",
     "report_path_for",
     "retrack_path_for",
@@ -228,6 +232,91 @@ def effective_anchors(point: PointSpec) -> list[Query]:
     return [by_frame[frame] for frame in sorted(by_frame)]
 
 
+def tracker_tracks_boxes(name: str) -> bool:
+    """Whether the plugin registered as ``name`` follows boxes, not just centres.
+
+    A name nobody registered is "no": it cannot be a box tracker, and whoever
+    asks is about to refuse it for that reason rather than for being unknown.
+    """
+    try:
+        return bool(getattr(registry.get(name), "tracks_boxes", False))
+    except StableError:
+        return False
+
+
+def box_tracker_names() -> list[str]:
+    """Return the installed trackers that follow boxes, whether or not runnable."""
+    return [row["name"] for row in describe_trackers() if row.get("tracks_boxes")]
+
+
+def default_box_tracker() -> str:
+    """Return the tracker a new box track should use when none was named.
+
+    Ocean, then SiamDW (the two box trackers that ship), when they can run;
+    failing that any available plugin that declares ``tracks_boxes``, so a
+    third-party box tracker is picked up without a code change here.
+
+    Raises:
+        ProjectError: If no installed, runnable tracker follows boxes.
+    """
+    rows = {row["name"]: row for row in describe_trackers()}
+    for name in ("ocean", "siamdw"):
+        row = rows.get(name)
+        if row is not None and row.get("available") and row.get("tracks_boxes"):
+            return name
+    for name, row in rows.items():
+        if row.get("available") and row.get("tracks_boxes"):
+            return name
+    raise ProjectError("no installed tracker tracks boxes; install a box tracker such as Ocean")
+
+
+def _require_box_tracker(point: PointSpec, tracker_name: str) -> None:
+    """Refuse to run a box track on a plugin that would drop its boxes.
+
+    The routes already refuse to *choose* such a pairing, so this is for a
+    project edited by hand: the failure should name the cause rather than
+    surface as a track with no sizes.
+    """
+    if not tracker_tracks_boxes(tracker_name):
+        names = box_tracker_names()
+        raise ProjectError(
+            f"point {point.id!r} is a box track but tracker {tracker_name!r} does not track "
+            f"boxes; use one of {names if names else 'none installed'}"
+        )
+
+
+def resolve_box_size(
+    project: Project, point: PointSpec, frame: int, *, anchor_first: bool = False
+) -> tuple[float, float] | None:
+    """Return the box a box track should have at ``frame``, or ``None``.
+
+    The answer is the first of: the stated anchor on that frame (only when
+    ``anchor_first``, which is how a retrack resolves its start, like its
+    position), the displayed track's size there, and the size of the nearest
+    anchor by frame distance. The last is what keeps "add an anchor here" from
+    needing the client to know the box.
+
+    Args:
+        project: The point's project, for finding its track.
+        point: The box track.
+        frame: The frame whose size is wanted.
+        anchor_first: Let an anchor on exactly ``frame`` win over the track.
+    """
+    boxed = [q for q in effective_anchors(point) if q.has_box]
+    if anchor_first:
+        for query in boxed:
+            if int(query.frame) == int(frame):
+                return query.size
+    track = load_display_track(project, point)
+    if track is not None and 0 <= frame < track.n_frames:
+        size = track.size_at(frame)
+        if size is not None:
+            return size
+    if not boxed:
+        return None
+    return min(boxed, key=lambda q: abs(int(q.frame) - int(frame))).size
+
+
 def bounded_frame_range(
     direction: str,
     frame: int,
@@ -358,7 +447,11 @@ def anchors_changed(point: PointSpec, report: dict[str, Any] | None) -> bool:
     except StableError:  # pragma: no cover - corrupt sidecar
         return False
     now = point.sorted_queries()
-    return [(q.frame, q.x, q.y) for q in now] != [(q.frame, q.x, q.y) for q in was]
+    # The box is an input like the position: resizing an anchor changes what a
+    # box tracker follows, so it has to read as a change too.
+    return [(q.frame, q.x, q.y, q.w, q.h) for q in now] != [
+        (q.frame, q.x, q.y, q.w, q.h) for q in was
+    ]
 
 
 def load_report(path: Path) -> dict[str, Any] | None:
@@ -431,6 +524,8 @@ def run_point_tracking(
 
     run_specs = plan_anchor_runs(anchors, frame_range)
     tracker_name = tracker or point.tracker
+    if point.is_box or any(q.has_box for q in anchors):
+        _require_box_tracker(point, tracker_name)
 
     options = point_options(workspace.project_dir(project_id), point_id)
     plugin = create_tracker(tracker_name, device=device, options=options)
@@ -588,7 +683,19 @@ def run_point_retrack(
 
     anchors = effective_anchors(point)
     position = _resolve_start_position(project, point, frame, x, y)
-    query = Query(frame=frame, x=position[0], y=position[1])
+    # A box track starts its run from a box, resolved the way the position is.
+    size = (
+        resolve_box_size(project, point, frame, anchor_first=True)
+        if point.is_box or any(q.has_box for q in anchors)
+        else None
+    )
+    query = Query(
+        frame=frame,
+        x=position[0],
+        y=position[1],
+        w=None if size is None else size[0],
+        h=None if size is None else size[1],
+    )
     run_range = bounded_frame_range(
         direction,
         frame,
@@ -599,8 +706,16 @@ def run_point_retrack(
     )
 
     plugin_name = tracker or point.tracker
+    if query.has_box:
+        _require_box_tracker(point, plugin_name)
     correction = RetrackCorrection(
-        frame=frame, x=query.x, y=query.y, direction=direction, tracker=plugin_name
+        frame=frame,
+        x=query.x,
+        y=query.y,
+        direction=direction,
+        tracker=plugin_name,
+        w=query.w,
+        h=query.h,
     )
     options = point_options(workspace.project_dir(project_id), point_id)
     plugin = create_tracker(plugin_name, device=device, options=options)
@@ -662,6 +777,8 @@ def run_point_retrack(
                 direction=direction,
                 tracker=correction.tracker,
                 source=proj.relative_path(str(npz_path)),
+                w=query.w,
+                h=query.h,
             ),
         ]
 
@@ -775,7 +892,17 @@ def _combine_halves(forward: PointTrack, backward: PointTrack, frame: int) -> Po
     points[take] = backward.points[take]
     confidence[take] = backward.confidence[take]
     visible[take] = backward.visible[take]
-    return PointTrack(points=points, confidence=confidence, visible=visible)
+    sizes = None
+    if forward.sizes is not None or backward.sizes is not None:
+        # Spliced exactly like the positions, so a frame never pairs one half's
+        # centre with the other's box. A half without sizes leaves NaN there.
+        sizes = (
+            forward.sizes.copy()
+            if forward.sizes is not None
+            else np.full((forward.n_frames, 2), np.nan, dtype=np.float32)
+        )
+        sizes[take] = backward.sizes[take] if backward.sizes is not None else np.nan
+    return PointTrack(points=points, confidence=confidence, visible=visible, sizes=sizes)
 
 
 def retrack_resolver(project: Project) -> RetrackResolver:

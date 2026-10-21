@@ -120,7 +120,7 @@ def test_export_tracks_csv_and_json(client: TestClient, tracked_project) -> None
     assert as_csv.status_code == 200
     rows = list(csv.DictReader(io.StringIO(as_csv.text)))
     assert len(rows) == 2 * source.frame_count
-    assert set(rows[0]) == {"point_id", "frame", "x", "y", "confidence", "visible"}
+    assert set(rows[0]) == {"point_id", "frame", "x", "y", "w", "h", "confidence", "visible"}
 
 
 def test_export_tracks_as_after_effects_keyframes(client: TestClient, tracked_project) -> None:

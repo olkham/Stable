@@ -159,6 +159,8 @@ def test_describe_is_ui_ready(reg):
         "display_name",
         "requires_gpu",
         "license",
+        "tracks_boxes",
+        "inputs",
         "available",
         "unavailable_reason",
     }

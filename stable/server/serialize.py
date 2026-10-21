@@ -7,16 +7,28 @@ other.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
 from ..core.errors import StableError
 from ..core.project import PointSpec, Project
 from .storage import Workspace
-from .tracker_options import load_tracker_options, tracker_search, tracker_window
-from .tracking import anchors_changed, load_display_track, load_report, report_path_for
+from .tracker_options import (
+    TEMPLATE_RADIUS_RANGE,
+    load_tracker_options,
+    tracker_search,
+    tracker_window,
+)
+from .tracking import (
+    anchors_changed,
+    effective_anchors,
+    load_display_track,
+    load_report,
+    report_path_for,
+)
 
-__all__ = ["point_summary", "project_detail"]
+__all__ = ["box_patch_radius", "point_summary", "project_detail"]
 
 _EMPTY_STATS: dict[str, Any] = {
     "has_track": False,
@@ -73,6 +85,24 @@ def _load_track_stats(project: Project, point: PointSpec) -> dict[str, Any]:
     }
 
 
+def box_patch_radius(point: PointSpec) -> int | None:
+    """Return the half-size a box track's patch needs, or ``None`` for a point track.
+
+    A box track's pattern *is* its box, so the patch is sized from the box
+    rather than from a tracker setting: half of the longest side of the largest
+    anchor box, rounded up, so every anchor's thumbnail shows its whole box in
+    the one square the response can describe. Clamped to the sizes a patch can
+    be rendered at (:data:`~stable.server.tracker_options.TEMPLATE_RADIUS_RANGE`),
+    since the image route refuses anything outside them.
+    """
+    sizes = [q.size for q in effective_anchors(point) if q.size is not None]
+    if not sizes:
+        return None
+    half = math.ceil(max(max(w, h) for w, h in sizes) / 2)
+    low, high = TEMPLATE_RADIUS_RANGE
+    return max(low, min(high, half))
+
+
 def point_summary(
     project: Project, point: PointSpec, options: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -91,9 +121,17 @@ def point_summary(
         options = load_tracker_options(Path(project.directory)).get(point.id, {})
     radius, radius_source = tracker_window(point.tracker, options)
     search_radius, search_source, _note = tracker_search(point.tracker, options)
+    if point.is_box:
+        # A box track's pattern is its box and its search scales with it, so
+        # the tracker's point settings describe nothing it does.
+        radius, radius_source = box_patch_radius(point) or radius, "box"
+        search_radius, search_source = None, None
     return {
         "id": point.id,
         "queries": [q.to_dict() for q in point.sorted_queries()],
+        # Whether the anchors are boxes: a box track needs a box-capable tracker
+        # and carries a per-frame size, so the panel draws it differently.
+        "box": point.is_box,
         "tracker": point.tracker,
         "enabled_for_solve": point.enabled_for_solve,
         # The colour the operator chose for this track, or null to let the UI

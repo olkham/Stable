@@ -5,6 +5,7 @@ import { useProjectContext } from "../state/ProjectContext";
 import type { Query, TrackerInfo } from "../types";
 import { CompositeSources, DeriveTrackPanel } from "./DeriveTrack";
 import { JobProgress } from "./JobProgress";
+import { NewTrack } from "./NewTrack";
 import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 import { TrackEdits } from "./TrackEdits";
@@ -86,6 +87,9 @@ export function TracksPanel({
     setCurrentFrame,
     tool,
     setTool,
+    newTrack,
+    startNewTrack,
+    cancelNewTrack,
     addAnchorHere,
     deleteAnchorAt,
     runFrom,
@@ -161,15 +165,21 @@ export function TracksPanel({
         <h3>Tracks</h3>
         <PanelSwitch variant={variant} onChange={onVariantChange} />
         <button
-          className={tool === "add-point" ? "button--active" : ""}
-          onClick={() => setTool(tool === "add-point" ? "move" : "add-point")}
+          className={newTrack ? "button--active" : ""}
+          onClick={() => (newTrack ? cancelNewTrack() : startNewTrack())}
+          title="Choose a tracker and its settings, then mark what it should follow on the video (N for a point, B for a box)"
         >
-          {tool === "add-point" ? "Click video to place…" : "+ Add track"}
+          + New track
         </button>
       </div>
 
+      <NewTrack />
+
       {project.points.length === 0 && (
-        <p className="panel__empty">No tracks yet. Click "Add track" then click on the video.</p>
+        <p className="panel__empty">
+          No tracks yet. Click "New track", choose a tracker, then mark what it should follow on the
+          video.
+        </p>
       )}
 
       {/* Every point's patch on this frame, so "which one has drifted" is one
@@ -251,7 +261,11 @@ export function TracksPanel({
                       onChange={(e) => handleTrackerChange(point.id, e.target.value)}
                       style={isOpen ? undefined : { display: "none" }}
                     >
-                      {trackers.map((t) => (
+                      {/* A box track is initialised from a box, which only some
+                          trackers take; the server refuses any other (400). */}
+                      {trackers
+                        .filter((t) => !point.box || t.tracks_boxes || t.name === point.tracker)
+                        .map((t) => (
                         <option
                           key={t.name}
                           value={t.name}
@@ -266,6 +280,15 @@ export function TracksPanel({
                         </option>
                       ))}
                     </select>
+                    {point.box && (
+                      <span
+                        className="points-list__composite"
+                        style={isOpen ? undefined : { display: "none" }}
+                        title="Drawn as a bounding box: the position is the box centre, with a per-frame size"
+                      >
+                        box
+                      </span>
+                    )}
                     {unavailableReason(trackers, point.tracker) && (
                       <span
                         className="points-list__warning"

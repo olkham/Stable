@@ -48,33 +48,36 @@ from ..schemas import (
     TemplateOptionsUpdate,
     TrackRequest,
 )
-from ..serialize import point_summary
+from ..serialize import box_patch_radius, point_summary
 from ..storage import PROJECT_FILENAME, Workspace, get_workspace
 from ..tracker_options import (
     SEARCH_RADIUS_RANGE,
     TEMPLATE_RADIUS_RANGE,
     TRACKER_OPTIONS_CACHE,
-    constructor_parameters,
+    check_tracker_options,
     forget_point,
     load_tracker_options,
     patch_bounds,
     point_options,
     proxy_patch,
     save_point_options,
-    setting_for,
     template_patch,
     tracker_search,
     tracker_settings,
     tracker_window,
 )
 from ..tracking import (
+    box_tracker_names,
+    default_box_tracker,
     effective_anchors,
     load_anchor_violations,
     load_display_track,
     load_raw_track,
     load_report,
     report_path_for,
+    resolve_box_size,
     run_point_tracking,
+    tracker_tracks_boxes,
 )
 from .edits import history_for
 
@@ -111,20 +114,46 @@ def create_point(
 ) -> dict[str, Any]:
     """Place a new point: its first anchor.
 
+    With ``w``/``h`` the point is a **box track**: the anchor is a bounding box
+    centred on ``x, y``. Its tracker must follow boxes, so an unnamed one is
+    chosen here (:func:`~stable.server.tracking.default_box_tracker`) instead of
+    the point default ``lk``, which would quietly track only the centre.
+
     Raises:
-        HTTPException: 400 if the anchor is invalid (e.g. past the end of the clip).
+        HTTPException: 400 if the anchor is invalid (e.g. past the end of the
+            clip), if a box is given with a tracker that does not follow boxes,
+            or if a box is given and no installed tracker follows them.
     """
     try:
         project = workspace.load_project(project_id)
         point_id = project.new_point_id()
+        if body.w is not None:
+            tracker = body.tracker or default_box_tracker()
+            if not tracker_tracks_boxes(tracker):
+                raise ProjectError(
+                    f"tracker {tracker!r} does not track boxes; "
+                    f"box trackers: {box_tracker_names() or 'none installed'}"
+                )
+        else:
+            tracker = body.tracker or "lk"
+        options: dict[str, Any] = {}
+        if body.options:
+            if body.w is not None:
+                raise ProjectError(
+                    "a box track's pattern is its box: it takes no pattern or search settings"
+                )
+            # Checked before the point exists, so a refused setting leaves nothing behind.
+            options = check_tracker_options(tracker, body.options)
         spec = PointSpec(
             id=point_id,
-            queries=[Query(frame=body.frame, x=body.x, y=body.y)],
-            tracker=body.tracker or "lk",
+            queries=[Query(frame=body.frame, x=body.x, y=body.y, w=body.w, h=body.h)],
+            tracker=tracker,
         )
         project.points.append(spec)
         project.validate()
         workspace.save_project(project_id, project)
+        if options:
+            save_point_options(workspace.project_dir(project_id), point_id, options)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Render its patch now rather than when the panel first asks for it (todo 3,
@@ -268,10 +297,27 @@ def update_point(
     ``color`` is ``#rrggbb``; the empty string clears it back to the UI's
     palette, since ``null`` on this body already means "leave it alone".
 
+    A box track cannot be switched to a tracker that does not follow boxes: it
+    would silently drop the sizes. The other way round is fine, a point track
+    on a box tracker is just tracked as a point.
+
     Raises:
         HTTPException: 404 if there is no such point, 400 if the colour is not
-            a form the UI can draw.
+            a form the UI can draw or the tracker would lose a box track's boxes.
     """
+    if body.tracker is not None and not tracker_tracks_boxes(body.tracker):
+        try:
+            current = workspace.load_project(project_id).point(point_id)
+        except StableError:
+            current = None  # the mutation below reports the missing point as a 404
+        if current is not None and current.is_box:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{point_id!r} is a box track, and tracker {body.tracker!r} does not "
+                    f"track boxes; box trackers: {box_tracker_names() or 'none installed'}"
+                ),
+            )
     # Checked here, before anything is mutated, and checked by *the schema* —
     # the rule about what a colour is belongs with the file that has to stay
     # readable, so this borrows the dataclass's own validation rather than
@@ -363,14 +409,36 @@ def add_anchor(
     Recorded as an undo step, like removing one: an anchor is an input to
     tracking, and losing one to a stray click should cost a Ctrl+Z rather than
     the memory of where it was.
+
+    On a box track the new anchor is a box too. Omit ``w``/``h`` and it takes
+    the track's size at that frame (else the nearest anchor's), which is what a
+    drag of the box's centre sends. Boxes on a point track are a 400.
     """
     history = history_for(workspace, project_id)
 
     def _mutate(project: Project) -> None:
         history.record(project, f"anchor {point_id} @ {body.frame}")
         spec = project.point(point_id)
+        size = None if body.w is None or body.h is None else (body.w, body.h)
+        if spec.is_box:
+            if size is None:
+                size = resolve_box_size(project, spec, body.frame)
+            if size is None:  # pragma: no cover - a box track always has a boxed anchor
+                raise ProjectError(f"no box size known for point {point_id!r} at {body.frame}")
+        elif size is not None:
+            raise ProjectError(
+                f"point {point_id!r} is a point track; it cannot take a box (w/h). "
+                "Create a new box track instead"
+            )
+        anchor = Query(
+            frame=body.frame,
+            x=body.x,
+            y=body.y,
+            w=None if size is None else size[0],
+            h=None if size is None else size[1],
+        )
         spec.queries = [q for q in spec.queries if q.frame != body.frame]
-        spec.queries.append(Query(frame=body.frame, x=body.x, y=body.y))
+        spec.queries.append(anchor)
 
     try:
         project = workspace.update_project(project_id, _mutate)
@@ -554,7 +622,15 @@ def get_track(
         "gaps": _gaps(track),
         "raw_x": None,
         "raw_y": None,
+        # A box track's per-frame box, null where unknown; null throughout for
+        # a point track, so `box` is the thing to branch on rather than `w`.
+        "box": point.is_box,
+        "w": None,
+        "h": None,
     }
+    if track.sizes is not None:
+        payload["w"] = _nan_to_none(track.sizes[:, 0].tolist())
+        payload["h"] = _nan_to_none(track.sizes[:, 1].tolist())
     if any(c.enabled for c in point.corrections):
         raw = load_raw_track(project, point)
         if raw is not None:
@@ -642,6 +718,15 @@ def get_point_patches(
     settings = tracker_settings(point.tracker, stored)
     search_radius, search_attribute, search_note = tracker_search(point.tracker, stored)
     default_radius, default_search = _template_defaults()
+    box_radius = box_patch_radius(point) if point.is_box else None
+    if box_radius is not None:
+        # The patch is the box, so there is no window to size: nothing for the
+        # panel to offer, and the radius is a property of the anchors. Nor is
+        # there a search radius: a box is searched the way its tracker was
+        # trained, over a region that scales with the box.
+        radius, source_attribute, settings = box_radius, "box", []
+        search_radius, search_attribute = None, None
+        search_note = "Searched each frame around the box's last position, scaled to its size."
 
     video = workspace.get_video_source(project_id)
 
@@ -662,6 +747,7 @@ def get_point_patches(
             current = entry(found[0], frame, found[1])
 
     window_setting = next((s for s in settings if s["role"] == "window"), None)
+    adjustable = window_setting is not None
     # The grid this describes is about to ask for one image per anchor, and on
     # a cold cache each of those is a seek into the clip. Rendering them now, in
     # the background, is what makes the panel appear filled rather than filling
@@ -681,7 +767,7 @@ def get_point_patches(
         # True when this tracker's window is the operator's to set — which is
         # every classic-CV plugin, each under its own argument name, not only
         # the template matcher's `template_radius`.
-        "adjustable": window_setting is not None,
+        "adjustable": adjustable,
         # One row per control the panel should draw, in order. The panel is
         # deliberately ignorant of which tracker is selected; this is why.
         "settings": settings,
@@ -692,7 +778,7 @@ def get_point_patches(
             "radius": radius,
             "size_px": radius * 2 + 1,
             "attribute": source_attribute,
-            "adjustable": window_setting is not None,
+            "adjustable": adjustable,
         },
         "search": {
             "radius": search_radius,
@@ -710,11 +796,6 @@ def get_point_patches(
         "patches": patches,
         "current": current,
     }
-
-
-def point_options_schema(tracker_name: str) -> set[str]:
-    """Return the constructor arguments ``tracker_name`` accepts."""
-    return set(constructor_parameters(tracker_name))
 
 
 @router.put("/{point_id}/patches")
@@ -741,16 +822,8 @@ def set_point_patch_options(
     point = _point_or_404(project, point_id)
 
     payload = body.model_dump(exclude_unset=True)
-    accepted = point_options_schema(point.tracker)
-    for key in payload:
-        if setting_for(key) is None:
-            raise HTTPException(status_code=400, detail=f"{key!r} is not a settable tracker option")
-        if key not in accepted:
-            raise HTTPException(
-                status_code=400,
-                detail=f"tracker {point.tracker!r} has no {key!r} setting",
-            )
     try:
+        check_tracker_options(point.tracker, payload)
         save_point_options(workspace.project_dir(project_id), point_id, payload)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -885,8 +958,11 @@ def warm_patches(
     """
     try:
         project = workspace.load_project(project_id)
+        point = project.point(point_id)
         stored = point_options(workspace.project_dir(project_id), point_id)
-        radius, source_attribute = tracker_window(project.point(point_id).tracker, stored)
+        radius, source_attribute = tracker_window(point.tracker, stored)
+        if point.is_box:
+            radius, source_attribute = box_patch_radius(point) or radius, "box"
     except StableError:
         return
     if source_attribute is None:
@@ -973,6 +1049,8 @@ def get_point_patch_image(
 
     stored = point_options(workspace.project_dir(project_id), point_id)
     effective, _source = tracker_window(point.tracker, stored)
+    if point.is_box:
+        effective = box_patch_radius(point) or effective
     size = int(radius if radius is not None else effective)
     low, high = TEMPLATE_RADIUS_RANGE
     if not low <= size <= high:

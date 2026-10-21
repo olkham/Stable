@@ -67,10 +67,33 @@ const ANCHOR_HOVER = " anchor-marker";
 /** Sentinel `hoverPointId` for "the pointer is on an export target crosshair". */
 const TARGET_HOVER = " export-target";
 
+/** Sentinel `hoverPointId` prefix for "the pointer is on the selected box anchor": a corner or the body. */
+const BOX_HOVER = " box-";
+
+/** Smallest box side, in source pixels, worth tracking; a smaller drag is a click. */
+const BOX_MIN = 4;
+/** Side of a box anchor's square corner handle, in canvas pixels. */
+const HANDLE_SIZE = 8;
+/** Accent colour of the canvas, for the box being drawn (canvas cannot read the CSS variable). */
+const BOX_DRAW_COLOR = "#5b9bd5";
+
+type BoxCorner = "nw" | "ne" | "sw" | "se";
+
 /** The tool palette: id, label, shortcut, and what a click does in it. */
 const TOOLS: { id: Tool; label: string; key: string; help: string }[] = [
   ["move", "✥", "V", "Move: click a track to select it, drag or click to correct the selected one"],
-  ["add-point", "✚", "N", "Add track: the next click on the frame starts a new one"],
+  [
+    "add-point",
+    "✚",
+    "N",
+    "New track from a point: choose the tracker and its settings, then click the feature",
+  ],
+  [
+    "add-box",
+    "⬚",
+    "B",
+    "New track from a box: choose the tracker, then drag a rectangle around the object — its centre is the position, its size follows the object",
+  ],
   [
     "add-anchor",
     "◆",
@@ -115,6 +138,17 @@ interface AnchorDrag {
   pointId: string;
   frame: number;
   /** Where the pointer has dragged it to, in source-video pixels. */
+  toX: number;
+  toY: number;
+  /** A box anchor's size while it is moved or resized; absent for a point anchor. */
+  w?: number;
+  h?: number;
+}
+
+/** A rectangle being dragged out on the frame, in source-video pixels. */
+interface BoxDraw {
+  fromX: number;
+  fromY: number;
   toX: number;
   toY: number;
 }
@@ -365,6 +399,10 @@ export function Viewer() {
     setSelectedPointId,
     tool,
     setTool,
+    newTrack,
+    startNewTrack,
+    finishNewTrack,
+    newTrackPreview,
     addAnchorAt,
     afterEdit,
     invalidateTrack,
@@ -390,6 +428,7 @@ export function Viewer() {
     setFalloff,
     applyCorrection,
     liveTracking,
+    trackers,
   } = useProjectContext();
   // The export's overlay is drawn here rather than on a canvas of its own
   // (todo 1, fourth round), so the output rectangle and the stabilisation
@@ -418,6 +457,10 @@ export function Viewer() {
   const [sizeTick, setSizeTick] = useState(0);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [anchorDrag, setAnchorDrag] = useState<AnchorDrag | null>(null);
+  const [boxDraw, setBoxDraw] = useState<BoxDraw | null>(null);
+  // Where the pointer is, in source pixels, while a new point track is being
+  // placed: the centre of the window preview drawn under it. Null off the canvas.
+  const [placeHover, setPlaceHover] = useState<{ x: number; y: number } | null>(null);
   // What the pointer is over: a point id, `TARGET_HOVER` for an export
   // crosshair, or null for bare picture. Drives the cursor (todo 4).
   const [hoverPointId, setHoverPointId] = useState<string | null>(null);
@@ -732,6 +775,23 @@ export function Viewer() {
             ctx.strokeStyle = dragging ? "#ffd166" : "#fff";
             ctx.stroke();
           }
+          // A box track's box on this frame, centred on its position: the size
+          // is what the tracker reported, so the box is the track's own answer
+          // to "how big is it now", not something the operator set.
+          const bw = track.w?.[viewFrame];
+          const bh = track.h?.[viewFrame];
+          if (track.box && cx != null && cy != null && bw != null && bh != null) {
+            ctx.save();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = isSelected ? 1.5 : 1;
+            ctx.strokeRect(
+              toCanvasX(cx - bw / 2),
+              toCanvasY(cy - bh / 2),
+              bw * t.scale,
+              bh * t.scale,
+            );
+            ctx.restore();
+          }
         }
       }
 
@@ -768,6 +828,36 @@ export function Viewer() {
           ctx.fillRect(-size / 2, -size / 2, size, size);
           ctx.strokeRect(-size / 2, -size / 2, size, size);
           ctx.restore();
+
+          // A box anchor states a size too: draw the box it states, with a
+          // square handle on each corner on the selected track so there is
+          // something visibly there to grab.
+          const qw = moving?.w ?? q.w;
+          const qh = moving?.h ?? q.h;
+          if (point.box && qw && qh && q.frame === viewFrame) {
+            const left = toCanvasX((moving ? moving.toX : q.x) - qw / 2);
+            const top = toCanvasY((moving ? moving.toY : q.y) - qh / 2);
+            const width = qw * t.scale;
+            const height = qh * t.scale;
+            ctx.save();
+            ctx.strokeStyle = moving ? "#ffd166" : color;
+            ctx.lineWidth = 1.5;
+            ctx.strokeRect(left, top, width, height);
+            if (isSelected) {
+              ctx.fillStyle = "#fff";
+              ctx.lineWidth = 1;
+              for (const [hx, hy] of [
+                [left, top],
+                [left + width, top],
+                [left, top + height],
+                [left + width, top + height],
+              ]) {
+                ctx.fillRect(hx - HANDLE_SIZE / 2, hy - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE);
+                ctx.strokeRect(hx - HANDLE_SIZE / 2, hy - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE);
+              }
+            }
+            ctx.restore();
+          }
         }
       }
 
@@ -776,8 +866,9 @@ export function Viewer() {
       // for this feature, and does it move further than that between frames?"
       // by looking rather than by guessing. Selected point only: at eight
       // points this would be a mesh, and the size being judged is the one
-      // whose sliders are open in the panel below.
-      if (showWindows && isSelected) {
+      // whose sliders are open in the panel below. A box track has neither:
+      // its pattern is the box already drawn, and its search scales with it.
+      if (showWindows && isSelected && !point.box) {
         const at = markerPosition(point, track, viewFrame);
         if (at) {
           const box = (radius: number, dashed: boolean, stroke: string) => {
@@ -799,6 +890,44 @@ export function Viewer() {
           if (point.window?.radius) box(point.window.radius, false, color);
         }
       }
+    }
+
+    // The window a new point track would match, centred on the pointer: the
+    // reason the tracker and its sizes are chosen *before* the click. Same two
+    // boxes the selected point gets below, so the preview and the result match.
+    const preview = newTrackPreview;
+    if (tool === "add-point" && placeHover && preview && preview.tracker === newTrack?.tracker) {
+      const draw = (radius: number, dashed: boolean, stroke: string) => {
+        const side = (radius * 2 + 1) * t.scale;
+        ctx.save();
+        ctx.setLineDash(dashed ? [5, 4] : []);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = stroke;
+        ctx.strokeRect(
+          toCanvasX(placeHover.x - radius) - 0.5,
+          toCanvasY(placeHover.y - radius) - 0.5,
+          side,
+          side,
+        );
+        ctx.restore();
+      };
+      if (preview.search.radius !== null) draw(preview.search.radius, true, "rgba(255,255,255,0.55)");
+      if (preview.window.radius) draw(preview.window.radius, false, BOX_DRAW_COLOR);
+    }
+
+    // The rectangle being dragged out for a new box track or box anchor.
+    if (boxDraw) {
+      ctx.save();
+      ctx.strokeStyle = BOX_DRAW_COLOR;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(
+        toCanvasX(Math.min(boxDraw.fromX, boxDraw.toX)),
+        toCanvasY(Math.min(boxDraw.fromY, boxDraw.toY)),
+        Math.abs(boxDraw.toX - boxDraw.fromX) * t.scale,
+        Math.abs(boxDraw.toY - boxDraw.fromY) * t.scale,
+      );
+      ctx.restore();
     }
 
     // -- the export overlay (todo 1, fourth round) ------------------------------
@@ -929,6 +1058,11 @@ export function Viewer() {
     liveTracking,
     drag,
     anchorDrag,
+    boxDraw,
+    tool,
+    placeHover,
+    newTrack?.tracker,
+    newTrackPreview,
     overlayValid,
     sizeTick,
     zoom,
@@ -1183,6 +1317,50 @@ export function Viewer() {
   );
 
   /**
+   * The selected box track's anchor box under the pointer on this frame: one of
+   * its four corners, or its body ("move").
+   *
+   * Only the selected track's: a box is large, so with several on screen the
+   * body of an unselected one would swallow clicks meant for what is behind it.
+   * Corners win over the body, and the nearest corner wins over the others.
+   */
+  const boxHitTest = useCallback(
+    (
+      canvasX: number,
+      canvasY: number,
+    ): { pointId: string; query: PointSummary["queries"][number]; part: BoxCorner | "move" } | null => {
+      const canvas = canvasRef.current;
+      const point = project.points.find((p) => p.id === selectedPointId);
+      if (!canvas || !point || !point.box) return null;
+      if (!overlaysFor(point.id).anchors || isTrackHidden(point.id)) return null;
+      const bounds = canvas.getBoundingClientRect();
+      const t = computeTransform(bounds.width, bounds.height, videoW, videoH, zoom, pan);
+      for (const query of point.queries) {
+        if (query.frame !== viewFrame || !query.w || !query.h) continue;
+        const nw = sourceToCanvas(query.x - query.w / 2, query.y - query.h / 2, t, videoW, videoH);
+        const se = sourceToCanvas(query.x + query.w / 2, query.y + query.h / 2, t, videoW, videoH);
+        const corners: [BoxCorner, number, number][] = [
+          ["nw", nw.x, nw.y],
+          ["ne", se.x, nw.y],
+          ["sw", nw.x, se.y],
+          ["se", se.x, se.y],
+        ];
+        let best: { part: BoxCorner; distance: number } | null = null;
+        for (const [part, cx, cy] of corners) {
+          const distance = Math.max(Math.abs(cx - canvasX), Math.abs(cy - canvasY));
+          if (distance <= HANDLE_SIZE && (!best || distance < best.distance)) best = { part, distance };
+        }
+        if (best) return { pointId: point.id, query, part: best.part };
+        if (canvasX >= nw.x && canvasX <= se.x && canvasY >= nw.y && canvasY <= se.y) {
+          return { pointId: point.id, query, part: "move" };
+        }
+      }
+      return null;
+    },
+    [project.points, selectedPointId, overlaysFor, isTrackHidden, viewFrame, videoW, videoH, zoom, pan],
+  );
+
+  /**
    * Apply the correction a move to (toX, toY) implies for `pointId`, shared by
    * both drag-release and click-to-move (todo 8) so the two input paths can
    * never disagree about what a "move" means.
@@ -1299,11 +1477,27 @@ export function Viewer() {
     if (!canvasRef.current || !proxyReady) return;
     const { x, y, canvasX, canvasY } = toSource(evt);
 
-    if (tool === "add-point") {
-      const point = await api.createPoint(project.id, viewFrame, x, y);
-      setTool("move");
-      setSelectedPointId(point.id);
-      await refresh();
+    // A box is made by dragging (see `startBoxDraw`); the click that follows it
+    // has nothing left to do.
+    if (tool === "add-box") return;
+    if (tool === "add-point" && newTrack) {
+      try {
+        const point = await api.createPoint(
+          project.id,
+          viewFrame,
+          x,
+          y,
+          newTrack.tracker,
+          undefined,
+          newTrack.options,
+        );
+        finishNewTrack();
+        setSelectedPointId(point.id);
+        await refresh();
+      } catch (err) {
+        // The draft stays open so the click can be retried with other settings.
+        setRefusal(err instanceof Error ? err.message : String(err));
+      }
       return;
     }
     if (tool === "add-anchor" && selectedPointId) {
@@ -1629,6 +1823,69 @@ export function Viewer() {
     window.addEventListener("mouseup", up);
   }
 
+  /** Make a box track from a rectangle dragged on the frame; its centre is the position. */
+  async function createBoxTrack(cx: number, cy: number, w: number, h: number) {
+    try {
+      const point = await api.createPoint(project.id, viewFrame, cx, cy, newTrack?.tracker, {
+        w,
+        h,
+      });
+      finishNewTrack();
+      setSelectedPointId(point.id);
+      await refresh();
+    } catch (err) {
+      // The server says why (no box tracker installed, say); the hint line is
+      // where the canvas already reports a click that did nothing.
+      setRefusal(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /**
+   * Drag out a rectangle: a new box track (add-box), or a box anchor on the
+   * selected box track (add-anchor). An add-anchor drag under BOX_MIN is left
+   * to the click that follows it, which anchors at that spot and lets the
+   * server keep the track's size.
+   */
+  function startBoxDraw(evt: React.MouseEvent<HTMLCanvasElement>) {
+    evt.preventDefault();
+    const anchorFor = tool === "add-anchor" ? selectedPointId : null;
+    // Kept inside the frame: a box hanging off the picture has no pixels to match.
+    const clamp = (ev: { clientX: number; clientY: number }) => {
+      const p = toSource(ev);
+      return { x: Math.max(0, Math.min(videoW, p.x)), y: Math.max(0, Math.min(videoH, p.y)) };
+    };
+    const from = clamp(evt);
+    setBoxDraw({ fromX: from.x, fromY: from.y, toX: from.x, toY: from.y });
+    const move = (ev: MouseEvent) => {
+      const p = clamp(ev);
+      setBoxDraw((prev) => (prev ? { ...prev, toX: p.x, toY: p.y } : prev));
+    };
+    const up = (ev: MouseEvent) => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      setBoxDraw(null);
+      const to = clamp(ev);
+      const w = Math.abs(to.x - from.x);
+      const h = Math.abs(to.y - from.y);
+      const big = w >= BOX_MIN && h >= BOX_MIN;
+      const cx = (from.x + to.x) / 2;
+      const cy = (from.y + to.y) / 2;
+      if (anchorFor) {
+        if (!big) return;
+        suppressClickRef.current = true;
+        void addAnchorAt(anchorFor, viewFrame, cx, cy, { w, h });
+        return;
+      }
+      if (!big) {
+        setRefusal(`Box too small — drag at least ${BOX_MIN} px each way`);
+        return;
+      }
+      void createBoxTrack(cx, cy, w, h);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  }
+
   function handleMouseDown(evt: React.MouseEvent<HTMLCanvasElement>) {
     if (!proxyReady) return;
 
@@ -1652,6 +1909,14 @@ export function Viewer() {
     // whichever is grabbed has to be decided rather than left to draw order.
     if (exportState.active && grabTarget(evt)) return;
 
+    if (tool === "add-box") {
+      startBoxDraw(evt);
+      return;
+    }
+    if (tool === "add-anchor" && selectedPointId && !selectedHidden) {
+      if (project.points.find((p) => p.id === selectedPointId)?.box) startBoxDraw(evt);
+      return;
+    }
     if (tool !== "move") return;
     const { canvasX, canvasY } = toSource(evt);
 
@@ -1660,29 +1925,80 @@ export function Viewer() {
     // means has to be decided here rather than left to draw order — and an
     // anchor is the more deliberate thing to have aimed at.
     const pin = anchorHitTest(canvasX, canvasY);
-    if (pin) {
+    // A box anchor's corners come first (they are the finer target), but its
+    // body only when the diamond at its centre is not what was aimed at.
+    const boxHit = boxHitTest(canvasX, canvasY);
+    const grab =
+      boxHit && (boxHit.part !== "move" || !pin)
+        ? boxHit
+        : pin
+          ? { pointId: pin.pointId, query: pin.query, part: "move" as const }
+          : null;
+    if (grab) {
       evt.preventDefault();
-      suppressClickRef.current = true;
-      setSelectedPointId(pin.pointId);
-      setAnchorDrag({
-        pointId: pin.pointId,
-        frame: pin.query.frame,
-        toX: pin.query.x,
-        toY: pin.query.y,
-      });
-      const movePin = (ev: MouseEvent) => {
+      // Dragging the body is also where a click-to-move lands on a box track,
+      // so the click is only swallowed once the pointer has really moved.
+      const bodyOnly = grab.part === "move" && !pin;
+      suppressClickRef.current = !bodyOnly;
+      setSelectedPointId(grab.pointId);
+      const q = grab.query;
+      const isBox = Boolean(q.w && q.h);
+      const start = toSource(evt);
+      // Where the grab was on the box, so it moves by the pointer's travel and
+      // is not re-centred under it. The diamond keeps its snap-to-pointer.
+      const offX = isBox && bodyOnly ? start.x - q.x : 0;
+      const offY = isBox && bodyOnly ? start.y - q.y : 0;
+      // The anchor as the pointer at `ev` would leave it. A corner keeps the
+      // opposite one fixed; anything else keeps the size.
+      const place = (ev: { clientX: number; clientY: number }) => {
         const p = toSource(ev);
-        setAnchorDrag((prev) => (prev ? { ...prev, toX: p.x, toY: p.y } : prev));
+        if (!isBox || grab.part === "move") {
+          return { x: p.x - offX, y: p.y - offY, w: q.w, h: q.h };
+        }
+        const fixedX = q.x + (grab.part.endsWith("w") ? 1 : -1) * (q.w! / 2);
+        const fixedY = q.y + (grab.part.startsWith("n") ? 1 : -1) * (q.h! / 2);
+        const px = Math.max(0, Math.min(videoW, p.x));
+        const py = Math.max(0, Math.min(videoH, p.y));
+        const w = Math.max(BOX_MIN, Math.abs(px - fixedX));
+        const h = Math.max(BOX_MIN, Math.abs(py - fixedY));
+        return {
+          x: fixedX + (px >= fixedX ? w : -w) / 2,
+          y: fixedY + (py >= fixedY ? h : -h) / 2,
+          w,
+          h,
+        };
+      };
+      setAnchorDrag({ pointId: grab.pointId, frame: q.frame, toX: q.x, toY: q.y, w: q.w, h: q.h });
+      const movePin = (ev: MouseEvent) => {
+        if (bodyOnly && Math.hypot(ev.clientX - evt.clientX, ev.clientY - evt.clientY) > 3) {
+          suppressClickRef.current = true;
+        }
+        const a = place(ev);
+        setAnchorDrag((prev) => (prev ? { ...prev, toX: a.x, toY: a.y, w: a.w, h: a.h } : prev));
       };
       const dropPin = (ev: MouseEvent) => {
         window.removeEventListener("mousemove", movePin);
         window.removeEventListener("mouseup", dropPin);
         setAnchorDrag(null);
-        const p = toSource(ev);
+        const a = place(ev);
         // An anchor dropped where it already was is not an edit, and re-storing
         // it would re-run every tracking decision that depends on it for nothing.
-        if (Math.hypot(p.x - pin.query.x, p.y - pin.query.y) < 0.5) return;
-        void addAnchorAt(pin.pointId, pin.query.frame, p.x, p.y);
+        if (
+          Math.hypot(a.x - q.x, a.y - q.y) < 0.5 &&
+          Math.abs((a.w ?? 0) - (q.w ?? 0)) < 0.5 &&
+          Math.abs((a.h ?? 0) - (q.h ?? 0)) < 0.5
+        ) {
+          return;
+        }
+        // The size goes along with the position, or a box track's anchor would
+        // lose it on every move.
+        void addAnchorAt(
+          grab.pointId,
+          q.frame,
+          a.x,
+          a.y,
+          a.w && a.h ? { w: a.w, h: a.h } : undefined,
+        );
       };
       window.addEventListener("mousemove", movePin);
       window.addEventListener("mouseup", dropPin);
@@ -1728,7 +2044,8 @@ export function Viewer() {
    */
   function handleMouseMove(evt: React.MouseEvent<HTMLCanvasElement>) {
     if (!proxyReady) return;
-    const { canvasX, canvasY } = toSource(evt);
+    const { x, y, canvasX, canvasY } = toSource(evt);
+    if (tool === "add-point") setPlaceHover({ x, y });
     const geometry = exportState.frameGeometry;
     if (exportState.active && geometry && overlayValid) {
       const canvas = canvasRef.current;
@@ -1748,9 +2065,18 @@ export function Viewer() {
     }
     // Same precedence as the mousedown: the anchor wins over the marker under
     // it, so the cursor promises what the click will actually do.
-    if (overlayValid && tool === "move" && anchorHitTest(canvasX, canvasY)) {
-      setHoverPointId((prev) => (prev === ANCHOR_HOVER ? prev : ANCHOR_HOVER));
-      return;
+    if (overlayValid && tool === "move") {
+      const boxHit = boxHitTest(canvasX, canvasY);
+      const pin = anchorHitTest(canvasX, canvasY);
+      if (boxHit && (boxHit.part !== "move" || !pin)) {
+        const sentinel = BOX_HOVER + boxHit.part;
+        setHoverPointId((prev) => (prev === sentinel ? prev : sentinel));
+        return;
+      }
+      if (pin) {
+        setHoverPointId((prev) => (prev === ANCHOR_HOVER ? prev : ANCHOR_HOVER));
+        return;
+      }
     }
     const found = overlayValid ? hitTest(canvasX, canvasY) : null;
     setHoverPointId((prev) => (prev === found ? prev : found));
@@ -1759,17 +2085,34 @@ export function Viewer() {
   // A hidden selected track cannot be edited from the frame (see `handleClick`),
   // so neither the cursor nor the hint may offer it.
   const selectedHidden = selectedPointId !== null && isTrackHidden(selectedPointId);
+  const selectedBox = Boolean(project.points.find((p) => p.id === selectedPointId)?.box);
+  // Drawing a box needs a tracker that takes one; without it the tool would
+  // only ever fail on the server.
+  const boxCapable = trackers.some((t) => t.available && t.tracks_boxes);
 
   // The cursor is the answer to "what does a click here do?" (todo 4).
   const cursorClass = (() => {
-    if (drag || anchorDrag || panning) return "viewer__canvas-wrap--dragging";
+    if (drag || anchorDrag || boxDraw || panning) return "viewer__canvas-wrap--dragging";
     if (tool === "pan") return "viewer__canvas-wrap--grab";
     if (tool === "add-anchor" && selectedHidden) return "viewer__canvas-wrap--inert";
-    if (tool === "add-point" || tool === "add-anchor") return "viewer__canvas-wrap--placing";
+    if (tool === "add-point" || tool === "add-box" || tool === "add-anchor") {
+      return "viewer__canvas-wrap--placing";
+    }
     if (tool === "delete") {
       return hoverPointId ? "viewer__canvas-wrap--delete" : "viewer__canvas-wrap--inert";
     }
-    if (hoverPointId === TARGET_HOVER || hoverPointId === ANCHOR_HOVER) {
+    // The corner handles say which way they resize; the body is a plain grab.
+    if (hoverPointId === BOX_HOVER + "nw" || hoverPointId === BOX_HOVER + "se") {
+      return "viewer__canvas-wrap--resize-nwse";
+    }
+    if (hoverPointId === BOX_HOVER + "ne" || hoverPointId === BOX_HOVER + "sw") {
+      return "viewer__canvas-wrap--resize-nesw";
+    }
+    if (
+      hoverPointId === TARGET_HOVER ||
+      hoverPointId === ANCHOR_HOVER ||
+      hoverPointId === BOX_HOVER + "move"
+    ) {
       return "viewer__canvas-wrap--grab";
     }
     if (hoverPointId) {
@@ -1786,13 +2129,23 @@ export function Viewer() {
 
   // One line saying what the frame is currently for. It is the same question
   // the cursor answers, in words, and only one of these can be true at a time.
+  const trackerName =
+    trackers.find((t) => t.name === newTrack?.tracker)?.display_name ?? "the chosen tracker";
   const hint = (() => {
     if (!overlayValid) return "Turn the stabilized preview off to edit points on the frame";
     if (refusal) return refusal;
-    if (tool === "add-point") return "Click on the video to place a new track";
+    if (tool === "add-point") {
+      return `Click the feature to follow with ${trackerName} — the boxes show the pattern window and the search area (Esc cancels)`;
+    }
+    if (tool === "add-box") {
+      return `Drag a rectangle around the object for ${trackerName} to follow (Esc cancels)`;
+    }
     if (tool === "add-anchor") {
       if (!selectedPointId) return "Select a track first — an anchor belongs to one";
       if (selectedHidden) return hiddenTrackRefusal(selectedPointId);
+      if (selectedBox) {
+        return `Drag a box to anchor ${selectedPointId} at frame ${viewFrame} with that size, or click to anchor it there and keep its size (Esc when done)`;
+      }
       return `Click on the video to anchor ${selectedPointId} at frame ${viewFrame} — the tool stays on, so scrub and click again for the next one (Esc when done)`;
     }
     if (tool === "delete") {
@@ -1807,6 +2160,9 @@ export function Viewer() {
         : "The dimmed area is what the export throws away. Pick a stabilisation target in the panel to compose the shot.";
     }
     if (anchorDrag) return `Moving ${anchorDrag.pointId}'s anchor at frame ${anchorDrag.frame}`;
+    if (hoverPointId?.startsWith(BOX_HOVER)) {
+      return "Drag a corner to resize this anchor's box (the opposite corner stays put), or its body to move it";
+    }
     if (hoverPointId === ANCHOR_HOVER) {
       return "Drag this anchor to move it, or use the delete tool to remove it";
     }
@@ -1844,8 +2200,21 @@ export function Viewer() {
               key={id}
               className={tool === id ? "button--active" : ""}
               aria-pressed={tool === id}
-              title={`${help} (${key})`}
-              onClick={() => setTool(id)}
+              title={
+                id === "add-box" && !boxCapable
+                  ? "Add box needs a tracker that takes a bounding box (Ocean or SiamDW), and none is installed"
+                  : `${help} (${key})`
+              }
+              disabled={id === "add-box" && !boxCapable}
+              onClick={() =>
+                // The placing tools open the new-track card; pressing the armed
+                // one again abandons it, as Esc does.
+                id === "add-point" || id === "add-box"
+                  ? tool === id
+                    ? setTool("move")
+                    : startNewTrack(id === "add-box" ? "box" : "point")
+                  : setTool(id)
+              }
             >
               {label}
             </button>
@@ -1984,7 +2353,10 @@ export function Viewer() {
               onClick={handleClick}
               onMouseDown={handleMouseDown}
               onMouseMove={handleMouseMove}
-              onMouseLeave={() => setHoverPointId(null)}
+              onMouseLeave={() => {
+                setHoverPointId(null);
+                setPlaceHover(null);
+              }}
             />
           ) : (
             <div className="viewer__placeholder">Generating proxy frames…</div>

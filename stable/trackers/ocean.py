@@ -48,6 +48,19 @@ of an occluder across a point:
 * It came through five of the six occluder sweeps, reporting confidence of at
   most 0.02 while covered (``lk`` came through none, reporting 1.0).
 
+Boxes are what it was built for (see :mod:`stable.trackers.siamese`). Over
+twelve composited 60-frame clips — a face, a logo and a blob texture, each
+zooming 2x, shrinking to 0.45x, stretching from an aspect of 0.8 to 2.75, and
+"breathing" in and out of shape, over a natural background — its box overlapped
+the truth by a mean IoU of 0.92 (10th percentile 0.87), and with an occluder
+crossing the object as well it recovered on eleven of the twelve. Two settings
+differ from a point's, both measured on those clips. The size follows the box at
+TracKit's own ``box_size_lr`` of 0.519: the 0.3 that steadies a patch lagged an
+object changing shape (mean IoU 0.86). And a box is held only below raw evidence
+0.3 (``box_lost_below``): the template is fixed, so a stretching object's
+evidence against it fell under a point's threshold while it was still the best
+match, and the held box was left behind on three of the twelve clips.
+
 Confidence
 ----------
 Ocean's classifier on its own is not a usable confidence. It was only ever
@@ -152,6 +165,10 @@ class OceanTracker(SiameseTrackerPlugin):
         window_influence: Weight of the cosine prior favouring small motion.
         size_lr: How fast the tracked size follows the regressed box, scaled
             further by the penalty and the classifier's certainty each frame.
+        box_size_lr: ``size_lr`` for a box the operator drew: TracKit's own
+            0.519, since that box *is* the object Ocean was trained to size.
+        box_lost_below: Raw evidence at or below which a box is held; see the
+            module docstring for why it sits below a point's.
         confidence_range: ``(low, high)`` calibration of classifier x feature
             cosine; see the module docstring for the distributions behind it.
         visible_threshold: Normalised confidence at or above which the point
@@ -177,6 +194,8 @@ class OceanTracker(SiameseTrackerPlugin):
         penalty_k: float = 0.109,
         window_influence: float = 0.2,
         size_lr: float = 0.3,
+        box_size_lr: float = 0.519,
+        box_lost_below: float | None = 0.3,
         confidence_range: tuple[float, float] = (0.45, 0.62),
         visible_threshold: float = 0.5,
         **kwargs: Any,
@@ -188,10 +207,12 @@ class OceanTracker(SiameseTrackerPlugin):
             window_influence=window_influence,
             confidence_range=confidence_range,
             visible_threshold=visible_threshold,
+            box_lost_below=box_lost_below,
             **kwargs,
         )
         self.penalty_k = float(penalty_k)
         self.size_lr = float(size_lr)
+        self.box_size_lr = float(box_size_lr)
 
     def score_size(self, instance_size: int) -> int:
         """Return Ocean's score-map side for a search crop of ``instance_size``.
@@ -224,6 +245,8 @@ class OceanTracker(SiameseTrackerPlugin):
         expected_box: tuple[float, float],
         expected_centre: tuple[float, float],
         reach: float,
+        *,
+        box: bool = False,
     ) -> SiameseStep:
         """Pick Ocean's box for one point: penalised, windowed, within reach.
 
@@ -236,6 +259,7 @@ class OceanTracker(SiameseTrackerPlugin):
             expected_centre: Where the reference box would be; the window and
                 the reach are centred on it.
             reach: How far from ``expected_centre`` a cell may be chosen.
+            box: Whether this is a drawn box, damped by ``box_size_lr``.
 
         Returns:
             The chosen cell's box, its damped size rate, and classifier x
@@ -290,6 +314,8 @@ class OceanTracker(SiameseTrackerPlugin):
             dy=found_y,
             width=float(width[row, col]),
             height=float(height[row, col]),
-            rate=float(penalty[row, col] * cls[row, col] * self.size_lr),
+            rate=float(
+                penalty[row, col] * cls[row, col] * (self.box_size_lr if box else self.size_lr)
+            ),
             evidence=evidence,
         )

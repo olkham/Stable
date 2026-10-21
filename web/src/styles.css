@@ -294,6 +294,14 @@ button:disabled {
   cursor: grab;
 }
 
+.viewer__canvas-wrap--resize-nwse canvas {
+  cursor: nwse-resize;
+}
+
+.viewer__canvas-wrap--resize-nesw canvas {
+  cursor: nesw-resize;
+}
+
 .viewer__canvas-wrap--select canvas {
   cursor: pointer;
 }
@@ -2052,4 +2060,70 @@ button:disabled {
 
 .patch-thumb__delete:disabled {
   opacity: 0.35;
+}
+
+/* -- new-track card: tracker, marking tool and options, before the click -- */
+
+.new-track {
+  display: grid;
+  /* One column no wider than the panel: left to `auto`, the longest tracker
+     name in the select and the slider readouts pushed the card off its edge. */
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 0.8rem;
+}
+
+.new-track__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.new-track__label {
+  min-width: 5.5rem;
+  color: var(--text-dim);
+}
+
+.new-track__row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.new-track__note {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.new-track__segmented {
+  display: inline-flex;
+}
+
+.new-track__segmented button {
+  border-radius: 0;
+  padding: 2px 12px;
+}
+
+.new-track__segmented button:first-child {
+  border-radius: 4px 0 0 4px;
+}
+
+.new-track__segmented button:last-child {
+  border-radius: 0 4px 4px 0;
+  margin-left: -1px;
+}
+
+.new-track__prompt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--text);
 }

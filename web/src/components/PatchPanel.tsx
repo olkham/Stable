@@ -3,7 +3,8 @@ import * as api from "../api/client";
 import { keyBelongsToControl } from "../keyboard";
 import { useFrameStream } from "../state/FrameStreamContext";
 import { useProjectContext } from "../state/ProjectContext";
-import type { PointPatches, TrackerSetting } from "../types";
+import { SettingSlider, radiusOf } from "./SettingSlider";
+import type { PointPatches, TrackData, TrackerSetting } from "../types";
 
 /** Largest a thumbnail is drawn, whatever the patch's own pixel size. */
 const THUMB_PX = 72;
@@ -258,29 +259,28 @@ export function PatchPanel({ pointId }: { pointId: string }) {
     <div className="patch-panel" onClick={(e) => e.stopPropagation()}>
       <div className="patch-panel__settings">
         {settings.map((setting) => (
-          <label key={setting.attribute} className="patch-setting" title={setting.help}>
-            <span className="patch-setting__label">{setting.label}</span>
-            <input
-              type="range"
-              min={setting.minimum}
-              max={setting.maximum}
-              step={setting.step}
-              value={value(setting)}
-              disabled={busy}
-              onChange={(e) =>
-                setDraft((prev) => ({ ...prev, [setting.attribute]: Number(e.target.value) }))
-              }
-            />
-            <span className="patch-setting__value">
-              {describeSetting(setting, value(setting))}
-              {value(setting) !== setting.value && (
+          <SettingSlider
+            key={setting.attribute}
+            setting={setting}
+            value={value(setting)}
+            disabled={busy}
+            onChange={(next) => setDraft((prev) => ({ ...prev, [setting.attribute]: next }))}
+            extra={
+              value(setting) !== setting.value && (
                 <span className="patch-panel__pending"> (preview)</span>
-              )}
-            </span>
-          </label>
+              )
+            }
+          />
         ))}
 
-        {settings.length === 0 && hasWindow && (
+        {/* A box track's pattern is the box that was drawn, so there is no
+            slider to offer and an empty settings area would read as broken. */}
+        {info.radius_source === "box" && (
+          <span className="patch-panel__note">
+            Box track — the pattern is the box you drew; resize it on an anchor frame to change it.
+          </span>
+        )}
+        {settings.length === 0 && hasWindow && info.radius_source !== "box" && (
           <span className="patch-panel__size" title={patchSizeExplanation(info)}>
             {info.patch_size}px window · {info.tracker}
           </span>
@@ -444,7 +444,10 @@ export function AllPatchesStrip() {
               picture={picture}
               x={tracks[point.id]?.x[viewFrame] ?? null}
               y={tracks[point.id]?.y[viewFrame] ?? null}
-              radius={point.window?.radius || DEFAULT_PREVIEW_RADIUS}
+              radius={
+                boxRadiusAt(tracks[point.id], viewFrame) ??
+                (point.window?.radius || DEFAULT_PREVIEW_RADIUS)
+              }
               scale={scale}
             />
             <figcaption style={{ color: colorFor(point.id) }}>{point.id}</figcaption>
@@ -457,6 +460,20 @@ export function AllPatchesStrip() {
 
 /** Fallback pattern radius, matching the server's for a tracker with no window. */
 const DEFAULT_PREVIEW_RADIUS = 16;
+
+/**
+ * Half the longer side of a box track's box on `frame`, or null.
+ *
+ * A box track's pattern is its box, and the box changes size as the tracker
+ * follows it; one radius for the whole track would show a zoomed-in object as
+ * a crop of its middle.
+ */
+function boxRadiusAt(track: TrackData | undefined, frame: number): number | null {
+  const w = track?.w?.[frame];
+  const h = track?.h?.[frame];
+  if (w == null || h == null) return null;
+  return Math.ceil(Math.max(w, h) / 2);
+}
 
 /**
  * One point's patch, cut out of the decoded frame.
@@ -522,27 +539,4 @@ function patchSizeExplanation(info: PointPatches): string {
     return `The region ${info.tracker} matches, from its own ${info.radius_source}.`;
   }
   return `${info.tracker} has no local search window — it sees whole frames — so this is a preview size only.`;
-}
-
-/** The radius in source pixels a setting's value corresponds to. */
-function radiusOf(setting: TrackerSetting, value: number): number {
-  if (setting.unit === "side") return Math.floor(value / 2);
-  if (setting.unit === "radius") return value;
-  return setting.radius; // not a length (pyramid depth); its own radius stands
-}
-
-/**
- * How a value reads to the operator: in pixels they can measure on the frame.
- *
- * A pattern is stated as the square it covers, because that is the box drawn on
- * the canvas; a search area as the distance the point may travel from where it
- * was, because that is the question being answered ("does it move more than
- * this between frames?"). A pyramid depth is neither, so it is stated as
- * itself.
- */
-function describeSetting(setting: TrackerSetting, value: number): string {
-  if (setting.unit === "count") return `${value} levels`;
-  if (setting.role === "search") return `±${radiusOf(setting, value)}px`;
-  const side = setting.unit === "side" ? value : value * 2 + 1;
-  return `${side}px square`;
 }

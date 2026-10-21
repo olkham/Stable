@@ -10,7 +10,11 @@ always ``apply_corrections(raw, corrections)``, so:
 * the project file stays small and human-readable.
 
 Corrections apply **in list order**; each one is a pure function of the track it
-receives. The six types cover the editing vocabulary:
+receives. On a *box track* (see :attr:`stable.core.types.PointTrack.sizes`) the corrections
+carry the box too: a replace or retrack may state a ``(w, h)``, a gap fill
+interpolates the size, a delete clears it, and an offset or smooth leaves it
+alone (they move the centre, not the box). The six types cover the editing
+vocabulary:
 
 ===================== ===============================================================
 :class:`OffsetCorrection`      nudge a point, blended out over a falloff range
@@ -93,6 +97,23 @@ does not care. The server always passes the real one — see
 :func:`stable.server.tracking.load_display_track` — so this is the value a bare
 library caller gets, stated rather than hidden.
 """
+
+
+def _check_box(owner: str, w: float | None, h: float | None) -> None:
+    """Validate an optional ``(w, h)`` pair: both or neither, finite and positive."""
+    if (w is None) != (h is None):
+        raise ContractError(f"{owner}.w and {owner}.h must be given together or not at all")
+    if w is not None and h is not None:
+        if not (np.isfinite(w) and np.isfinite(h) and w > 0 and h > 0):
+            raise ContractError(f"{owner} box size must be finite and > 0, got ({w}, {h})")
+
+
+def _without_empty_box(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``w``/``h`` when unset, so point-track project files do not change."""
+    if data.get("w") is None and data.get("h") is None:
+        data.pop("w", None)
+        data.pop("h", None)
+    return data
 
 
 def _new_id() -> str:
@@ -200,9 +221,12 @@ class ReplaceCorrection(Correction):
         frame: Absolute frame index.
         x: Corrected horizontal position in pixels.
         y: Corrected vertical position in pixels.
+        w: Optional box width at that frame, with ``h``; ``x, y`` is its centre.
+        h: Optional box height at that frame.
 
     Raises:
-        ContractError: If ``frame`` is negative.
+        ContractError: If ``frame`` is negative, or ``w``/``h`` are not both
+            given or not finite and positive.
     """
 
     kind: ClassVar[str] = "replace"
@@ -210,11 +234,18 @@ class ReplaceCorrection(Correction):
     frame: int
     x: float
     y: float
+    w: float | None = None
+    h: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the replacement (dataclass hook)."""
         if self.frame < 0:
             raise ContractError(f"ReplaceCorrection.frame must be >= 0, got {self.frame}")
+        _check_box("ReplaceCorrection", self.w, self.h)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the project-file dict, omitting an unset box."""
+        return _without_empty_box(super().to_dict())
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -303,9 +334,12 @@ class RetrackCorrection(Correction):
         direction: One of :data:`DIRECTIONS`.
         tracker: Tracker name to use; ``None`` means the point's own tracker.
         source: Optional path (relative to the project file) of the cached run.
+        w: Optional box width at ``frame``, with ``h``; ``x, y`` is its centre.
+        h: Optional box height at ``frame``.
 
     Raises:
-        ContractError: If the frame is negative or the direction is unknown.
+        ContractError: If the frame is negative, the direction is unknown, or
+            ``w``/``h`` are not both given or not finite and positive.
     """
 
     kind: ClassVar[str] = "retrack"
@@ -316,6 +350,8 @@ class RetrackCorrection(Correction):
     direction: str = "fwd"
     tracker: str | None = None
     source: str | None = None
+    w: float | None = None
+    h: float | None = None
 
     def __post_init__(self) -> None:
         """Validate the retrack request (dataclass hook)."""
@@ -323,6 +359,11 @@ class RetrackCorrection(Correction):
             raise ContractError(f"RetrackCorrection.frame must be >= 0, got {self.frame}")
         if self.direction not in DIRECTIONS:
             raise ContractError(f"unknown direction {self.direction!r}; expected {DIRECTIONS}")
+        _check_box("RetrackCorrection", self.w, self.h)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the project-file dict, omitting an unset box."""
+        return _without_empty_box(super().to_dict())
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -474,7 +515,8 @@ def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
     Returns:
         One :class:`~stable.core.types.Query` per frame, sorted by frame. Where
         several corrections land on the same frame the last one wins, matching
-        the order :func:`apply_corrections` applies them in.
+        the order :func:`apply_corrections` applies them in. A correction that
+        states a box promotes to a box anchor.
     """
     by_frame: dict[int, Query] = {}
     for correction in corrections:
@@ -483,7 +525,13 @@ def ground_truth_anchors(corrections: Sequence[Correction]) -> list[Query]:
         if not isinstance(correction, ReplaceCorrection | RetrackCorrection):
             continue  # pragma: no cover - a third-party subclass reusing the kind
         frame = int(correction.frame)
-        by_frame[frame] = Query(frame=frame, x=float(correction.x), y=float(correction.y))
+        by_frame[frame] = Query(
+            frame=frame,
+            x=float(correction.x),
+            y=float(correction.y),
+            w=correction.w,
+            h=correction.h,
+        )
     return [by_frame[frame] for frame in sorted(by_frame)]
 
 
@@ -615,7 +663,11 @@ def _retrack_span(correction: RetrackCorrection, n_frames: int) -> np.ndarray:
 
 
 class _Editable:
-    """Mutable working copy of a track's three arrays, applied one edit at a time."""
+    """Mutable working copy of a track's arrays, applied one edit at a time.
+
+    ``sizes`` is ``None`` for a point track and stays so until an edit introduces
+    a box, at which point :meth:`ensure_sizes` creates an all-``NaN`` array.
+    """
 
     def __init__(self, track: PointTrack) -> None:
         """Take a writable copy of ``track``; the original is never touched."""
@@ -623,18 +675,36 @@ class _Editable:
         self.confidence = np.array(track.confidence, dtype=np.float64, copy=True)
         self.visible = np.array(track.visible, dtype=bool, copy=True)
         self.n_frames = int(self.points.shape[0])
+        self.sizes: np.ndarray | None = (
+            None if track.sizes is None else np.array(track.sizes, dtype=np.float64, copy=True)
+        )
+
+    def ensure_sizes(self) -> np.ndarray:
+        """Return the working ``[T, 2]`` sizes, creating an all-``NaN`` array on demand."""
+        if self.sizes is None:
+            self.sizes = np.full((self.n_frames, 2), np.nan, dtype=np.float64)
+        return self.sizes
 
     def valid(self) -> np.ndarray:
         """Return the ``[T]`` mask of frames whose position is currently finite."""
         return np.asarray(np.isfinite(self.points).all(axis=1), dtype=bool)
 
-    def set_position(self, frame: int, x: float, y: float, confidence: float) -> None:
-        """Hard-set one frame's position, confidence and visibility."""
+    def set_position(
+        self,
+        frame: int,
+        x: float,
+        y: float,
+        confidence: float,
+        size: tuple[float, float] | None = None,
+    ) -> None:
+        """Hard-set one frame's position, confidence, visibility and (if given) box."""
         if not 0 <= frame < self.n_frames:
             return
         self.points[frame] = (float(x), float(y))
         self.confidence[frame] = float(confidence)
         self.visible[frame] = True
+        if size is not None:
+            self.ensure_sizes()[frame] = (float(size[0]), float(size[1]))
 
     def finish(self) -> PointTrack:
         """Return the edited arrays as a fresh, frozen :class:`PointTrack`."""
@@ -642,6 +712,7 @@ class _Editable:
             points=self.points.astype(np.float32),
             confidence=np.clip(self.confidence, 0.0, 1.0).astype(np.float32),
             visible=self.visible,
+            sizes=None if self.sizes is None else self.sizes.astype(np.float32),
         )
 
 
@@ -675,14 +746,39 @@ def _apply_gap_fill(state: _Editable, correction: GapFillCorrection) -> None:
     state.points[rows] = filled[usable]
     state.confidence[rows] = correction.confidence
     state.visible[rows] = True
+    if state.sizes is not None:
+        # Same method and gap as the position; knots are wherever a size is known
+        # outside the gap. Only rows whose position was filled are written, so a
+        # box never appears on a frame that still has no centre.
+        size_knots_mask = np.isfinite(state.sizes).all(axis=1) & ~gap
+        size_knots = np.nonzero(size_knots_mask)[0].astype(np.float64)
+        sized = np.stack(
+            [
+                _interpolate(
+                    size_knots, state.sizes[size_knots_mask, axis], targets, correction.method
+                )
+                for axis in (0, 1)
+            ],
+            axis=1,
+        )
+        state.sizes[rows] = sized[usable]
 
 
 def _apply_delete_range(state: _Editable, correction: DeleteRangeCorrection) -> None:
     """Mark a range unusable: no position, no confidence, not visible."""
     dead = _range_mask(correction.start, correction.end, state.n_frames)
     state.points[dead] = np.nan
+    if state.sizes is not None:
+        state.sizes[dead] = np.nan
     state.confidence[dead] = 0.0
     state.visible[dead] = False
+
+
+def _box_of(correction: ReplaceCorrection | RetrackCorrection) -> tuple[float, float] | None:
+    """Return the correction's stated ``(w, h)``, or ``None`` for a point edit."""
+    if correction.w is None or correction.h is None:
+        return None
+    return (correction.w, correction.h)
 
 
 def _apply_retrack(
@@ -701,9 +797,11 @@ def _apply_retrack(
         state.points[rows] = resolved.points[rows]
         state.confidence[rows] = resolved.confidence[rows]
         state.visible[rows] = resolved.visible[rows]
-    # The user's position is ground truth and outranks whatever the run said,
-    # so it is re-asserted after the splice rather than before it.
-    state.set_position(correction.frame, correction.x, correction.y, 1.0)
+        if resolved.sizes is not None:
+            state.ensure_sizes()[rows] = resolved.sizes[rows]
+    # The user's position (and box, if they stated one) is ground truth and
+    # outranks whatever the run said, so it is re-asserted after the splice.
+    state.set_position(correction.frame, correction.x, correction.y, 1.0, _box_of(correction))
 
 
 def _apply_smooth(state: _Editable, correction: SmoothCorrection, fps: float) -> None:
@@ -764,17 +862,20 @@ def apply_corrections(
       falloff weight, only where a position already exists (a nudge cannot
       invent a sample).
     * :class:`ReplaceCorrection` — hard-set one frame; confidence becomes
-      ``1.0`` and the point becomes visible.
+      ``1.0`` and the point becomes visible. If it states a box, the size at
+      that frame is set too (introducing sizes on a track that had none).
     * :class:`GapFillCorrection` — interpolate the range from the valid samples
       outside it (``spline`` is a Catmull-Rom through them, ``linear`` a plain
-      lerp); filled frames take the correction's own confidence.
+      lerp); filled frames take the correction's own confidence. Sizes, where
+      the track has them, are interpolated the same way on the filled frames.
     * :class:`DeleteRangeCorrection` — ``NaN`` position, zero confidence, not
-      visible.
-    * :class:`RetrackCorrection` — splice ``resolve_retrack``'s cached run over
-      the direction's frame span, then re-assert the corrected position.
+      visible, ``NaN`` size.
+    * :class:`RetrackCorrection` — splice ``resolve_retrack``'s cached run (and
+      its sizes, if it has them) over the direction's frame span, then
+      re-assert the corrected position and, if stated, box.
     * :class:`SmoothCorrection` — filter ``x`` and ``y`` over the range and
       cross-fade back to the unfiltered path at its edges, writing only where a
-      position already existed.
+      position already existed. Offset and smooth never touch sizes.
 
     Args:
         track: The immutable raw track (or the output of an earlier stage).
@@ -806,7 +907,9 @@ def apply_corrections(
         if isinstance(correction, OffsetCorrection):
             _apply_offset(state, correction)
         elif isinstance(correction, ReplaceCorrection):
-            state.set_position(correction.frame, correction.x, correction.y, 1.0)
+            state.set_position(
+                correction.frame, correction.x, correction.y, 1.0, _box_of(correction)
+            )
         elif isinstance(correction, GapFillCorrection):
             _apply_gap_fill(state, correction)
         elif isinstance(correction, DeleteRangeCorrection):

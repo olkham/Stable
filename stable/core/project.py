@@ -263,6 +263,15 @@ class PointSpec:
         self.color = color
 
     @property
+    def is_box(self) -> bool:
+        """Whether this is a **box track**: one whose anchors state boxes.
+
+        Position is still the box centre; the box adds a per-frame size to the
+        track and needs a tracker with ``tracks_boxes``.
+        """
+        return any(q.has_box for q in self.queries)
+
+    @property
     def is_composite(self) -> bool:
         """Whether this point's path was averaged from other tracks."""
         return bool(self.derived_from)

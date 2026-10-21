@@ -66,6 +66,15 @@ merge layer and the UI all assume them, and the shared test suite checks them:
 5. **Report progress.** Call `progress(fraction, message)` often enough for a
    progress bar, and never assume it does something.
 
+A tracker that follows *boxes* — one initialised from a detection, like Ocean
+and SiamDW — also sets `tracks_boxes = True`. A query may then carry a box
+(`Query.w`, `Query.h`, with `x, y` its **centre**), and `track()` returns
+`TrackResult.sizes`: `[N, T, 2]` widths and heights, `NaN` where unknown and on
+any plain-point query in the same call. Position stays the centre, so the
+solver never sees a box. The app offers only box-tracking plugins for box
+tracks; a plugin that leaves `tracks_boxes` unset and is handed a box anyway
+tracks its centre and returns no sizes.
+
 Raise `stable.core.errors.TrackerError` for anything you refuse to do.
 
 ### Publishing it

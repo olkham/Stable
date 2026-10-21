@@ -39,6 +39,7 @@ __all__ = [
     "create_tracker",
     "available_trackers",
     "describe_trackers",
+    "tracker_inputs",
 ]
 
 logger = logging.getLogger(__name__)
@@ -297,11 +298,14 @@ class TrackerRegistry:
 
         Returns:
             One dict per tracker with keys ``name``, ``display_name``,
-            ``requires_gpu``, ``license``, ``available`` and
-            ``unavailable_reason`` — the last being ``None`` when the tracker
-            can run, and otherwise what to do about it. A plugin that raises
-            while answering either question is reported as unavailable rather
-            than being allowed to break the whole list.
+            ``requires_gpu``, ``license``, ``tracks_boxes``, ``inputs``,
+            ``available`` and ``unavailable_reason`` — the last being ``None`` when the tracker
+            can run, and otherwise what to do about it. ``inputs`` is what a
+            track can be started from, preferred first: every tracker takes a
+            point, and one that tracks boxes would rather be given a box, which
+            is what it was built to follow. A plugin that raises while answering
+            either availability question is reported as unavailable rather than
+            being allowed to break the whole list.
         """
         self.discover()
         rows: list[dict[str, Any]] = []
@@ -318,6 +322,8 @@ class TrackerRegistry:
                     "display_name": plugin.display_name or plugin.name,
                     "requires_gpu": bool(plugin.requires_gpu),
                     "license": plugin.license,
+                    "tracks_boxes": bool(getattr(plugin, "tracks_boxes", False)),
+                    "inputs": tracker_inputs(plugin),
                     "available": available,
                     "unavailable_reason": reason,
                 }
@@ -365,6 +371,16 @@ def create_tracker(
 def available_trackers() -> list[str]:
     """Return every discoverable tracker name, sorted."""
     return registry.discover()
+
+
+def tracker_inputs(plugin: type[TrackerPlugin]) -> list[str]:
+    """Return what a track on ``plugin`` can be started from, preferred first.
+
+    Every tracker takes a point — that is the plugin contract. One that tracks
+    boxes would rather be given one: a box is what it was built to follow, and
+    the only way its size is ever reported.
+    """
+    return ["box", "point"] if getattr(plugin, "tracks_boxes", False) else ["point"]
 
 
 def describe_trackers() -> list[dict[str, Any]]:

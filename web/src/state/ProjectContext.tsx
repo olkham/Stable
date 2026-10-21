@@ -25,6 +25,8 @@ import type {
   SmoothingResponse,
   TrackData,
   TrackerInfo,
+  TrackerSettingsPreview,
+  TrackInput,
 } from "../types";
 
 /**
@@ -44,6 +46,10 @@ import type {
  *     The next click starts a new track there.
  * `add-anchor`
  *     The next click anchors the selected track at that position on this frame.
+ * `add-box`
+ *     Drag a rectangle on the frame to start a box track (Ocean, SiamDW):
+ *     its centre is the position, its size the per-frame box. Offered only
+ *     when an available tracker takes boxes.
  * `delete`
  *     Click an anchor to remove it, or a track's marker to remove the whole
  *     track (confirmed, since that one is not an undoable correction).
@@ -51,7 +57,52 @@ import type {
  *     Left-drag pans the view. Middle-drag does this in every tool; the tool
  *     exists for trackpads and tablets with no middle button.
  */
-export type Tool = "move" | "add-point" | "add-anchor" | "delete" | "pan";
+export type Tool = "move" | "add-point" | "add-box" | "add-anchor" | "delete" | "pan";
+
+/**
+ * A track being set up before it exists: which tracker, marked how, with which
+ * options. `add-point` and `add-box` are only ever armed while one is open, so
+ * a click on the frame always knows what to create. `options` is keyed by the
+ * plugin's own argument names and only meaningful for `input: "point"`.
+ */
+export interface NewTrackDraft {
+  tracker: string;
+  input: TrackInput;
+  options: Record<string, number>;
+}
+
+/** localStorage key for what the last created track used. */
+const NEW_TRACK_KEY = "stable.newTrack";
+
+/** What the last track was created with; options are remembered per tracker. */
+interface RememberedTrack {
+  tracker: string;
+  input: TrackInput;
+  options: Record<string, Record<string, number>>;
+}
+
+function readRemembered(): RememberedTrack | null {
+  try {
+    const raw = localStorage.getItem(NEW_TRACK_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.tracker !== "string") return null;
+    return {
+      tracker: parsed.tracker,
+      input: parsed.input === "box" ? "box" : "point",
+      options: parsed.options && typeof parsed.options === "object" ? parsed.options : {},
+    };
+  } catch {
+    // Private window, blocked storage or a damaged value: start from defaults.
+    return null;
+  }
+}
+
+/** Box trackers in the order a box should default to. */
+const BOX_PREFERENCE = ["ocean", "siamdw"];
+
+/** How long the options have to stop changing before the preview is re-read. */
+const PREVIEW_DEBOUNCE_MS = 150;
 
 /**
  * Which overlay elements are drawn for a track.
@@ -206,7 +257,28 @@ interface ProjectContextValue {
 
   /** What a left-click on the frame does; see :type:`Tool`. */
   tool: Tool;
+  /**
+   * Choose a tool. Anything but the two placing tools closes the new-track
+   * draft; choosing a placing tool opens it (as `startNewTrack` does).
+   */
   setTool: (tool: Tool) => void;
+  /** The track being set up, or null when none is. */
+  newTrack: NewTrackDraft | null;
+  /**
+   * Open the draft (arming the matching tool) from the remembered tracker, or
+   * switch an open one to `input` when its tracker takes it.
+   */
+  startNewTrack: (input?: TrackInput) => void;
+  /** Change the draft's tracker, input and/or options. */
+  updateNewTrack: (patch: Partial<NewTrackDraft>) => void;
+  /** Close the draft and put the tool back to move. */
+  cancelNewTrack: () => void;
+  /** Remember what a track was just created with, close the draft, and return to move. */
+  finishNewTrack: () => void;
+  /** The draft's tracker settings for its current options; null until read or on error. */
+  newTrackPreview: TrackerSettingsPreview | null;
+  /** Why the preview could not be read, when it could not. */
+  newTrackPreviewError: string | null;
   /**
    * Anchor a point where it already is on the current frame (the `A` shortcut
    * and the panel's "+ anchor" both go through this).
@@ -217,7 +289,13 @@ interface ProjectContextValue {
    */
   addAnchorHere: (pointId?: string | null) => Promise<boolean>;
   /** Add an anchor at an explicit position, e.g. from a click on the frame. */
-  addAnchorAt: (pointId: string, frame: number, x: number, y: number) => Promise<void>;
+  addAnchorAt: (
+    pointId: string,
+    frame: number,
+    x: number,
+    y: number,
+    box?: { w: number; h: number },
+  ) => Promise<void>;
   /**
    * Remove the anchor on a frame, and whatever was tracked from it.
    *
@@ -395,7 +473,138 @@ export function ProjectProvider({
     setCurrentFrameState(frame);
   }, []);
   const [selectedPointId, setSelectedPointId] = useState<string | null>(null);
-  const [tool, setTool] = useState<Tool>("move");
+  const [tool, setToolRaw] = useState<Tool>("move");
+  const [newTrack, setNewTrack] = useState<NewTrackDraft | null>(null);
+  const [newTrackPreview, setNewTrackPreview] = useState<TrackerSettingsPreview | null>(null);
+  const [newTrackPreviewError, setNewTrackPreviewError] = useState<string | null>(null);
+
+  /**
+   * Resolve a tracker and an input for a draft: the input asked for if the
+   * tracker takes it, else the tracker's first. Options come from what was
+   * remembered for that tracker, so switching back does not lose them.
+   */
+  const draftFor = useCallback(
+    (name: string, wanted: TrackInput, remembered: RememberedTrack | null): NewTrackDraft => {
+      const inputs = trackers.find((t) => t.name === name)?.inputs ?? [];
+      const input = inputs.includes(wanted) ? wanted : (inputs[0] ?? wanted);
+      return { tracker: name, input, options: remembered?.options[name] ?? {} };
+    },
+    [trackers],
+  );
+
+  const startNewTrack = useCallback(
+    (wanted?: TrackInput) => {
+      const available = trackers.filter((t) => t.available);
+      if (available.length === 0) return;
+      const remembered = readRemembered();
+      const input = wanted ?? newTrack?.input ?? remembered?.input ?? "point";
+      // An open draft keeps its tracker and options; only the input changes.
+      let name = newTrack?.tracker ?? remembered?.tracker;
+      if (!name || !available.some((t) => t.name === name)) {
+        name = (available.find((t) => t.name === "lk") ?? available[0]).name;
+      }
+      if (wanted === "box" && !available.find((t) => t.name === name)?.inputs.includes("box")) {
+        const boxy = available.filter((t) => t.inputs.includes("box"));
+        const pick =
+          BOX_PREFERENCE.map((n) => boxy.find((t) => t.name === n)).find(Boolean) ?? boxy[0];
+        // No available tracker takes a box: leave things as they were.
+        if (!pick) return;
+        name = pick.name;
+      }
+      const base = draftFor(name, input, remembered);
+      const next = newTrack && newTrack.tracker === name ? { ...newTrack, input: base.input } : base;
+      setNewTrack(next);
+      setToolRaw(next.input === "box" ? "add-box" : "add-point");
+    },
+    [trackers, newTrack, draftFor],
+  );
+
+  const updateNewTrack = useCallback(
+    (patch: Partial<NewTrackDraft>) => {
+      if (!newTrack) return;
+      // A different tracker starts from that tracker's remembered options, not
+      // from the previous tracker's, whose argument names it may not share —
+      // and from the input it prefers: choosing a box tracker is choosing to
+      // draw a box, even though it would also take the point already armed.
+      const preferred = trackers.find((t) => t.name === patch.tracker)?.inputs[0];
+      const next =
+        patch.tracker !== undefined && patch.tracker !== newTrack.tracker
+          ? draftFor(patch.tracker, patch.input ?? preferred ?? newTrack.input, readRemembered())
+          : { ...newTrack, ...patch };
+      setNewTrack(next);
+      setToolRaw(next.input === "box" ? "add-box" : "add-point");
+    },
+    [newTrack, draftFor, trackers],
+  );
+
+  const cancelNewTrack = useCallback(() => {
+    setNewTrack(null);
+    setToolRaw("move");
+  }, []);
+
+  const finishNewTrack = useCallback(() => {
+    if (newTrack) {
+      try {
+        const options = { ...(readRemembered()?.options ?? {}) };
+        // A box track takes no options, so it must not wipe the tracker's remembered ones.
+        if (newTrack.input === "point") options[newTrack.tracker] = newTrack.options;
+        const saved: RememberedTrack = {
+          tracker: newTrack.tracker,
+          input: newTrack.input,
+          options,
+        };
+        localStorage.setItem(NEW_TRACK_KEY, JSON.stringify(saved));
+      } catch {
+        // Not remembering is fine; the draft still closes.
+      }
+    }
+    setNewTrack(null);
+    setToolRaw("move");
+  }, [newTrack]);
+
+  const setTool = useCallback(
+    (next: Tool) => {
+      if (next === "add-point" || next === "add-box") {
+        startNewTrack(next === "add-box" ? "box" : "point");
+        return;
+      }
+      setNewTrack(null);
+      setToolRaw(next);
+    },
+    [startNewTrack],
+  );
+
+  // The draft's settings, read from the server whenever the tracker or its
+  // options change. Debounced because a slider fires on every step, and a
+  // response that arrives after a newer request was made is dropped.
+  const previewTracker = newTrack && newTrack.input === "point" ? newTrack.tracker : null;
+  const previewOptions = newTrack ? JSON.stringify(newTrack.options) : "{}";
+  useEffect(() => {
+    if (previewTracker === null) {
+      setNewTrackPreview(null);
+      setNewTrackPreviewError(null);
+      return;
+    }
+    let stale = false;
+    const timer = setTimeout(() => {
+      api
+        .getTrackerSettings(previewTracker, JSON.parse(previewOptions))
+        .then((preview) => {
+          if (stale) return;
+          setNewTrackPreview(preview);
+          setNewTrackPreviewError(null);
+        })
+        .catch((err) => {
+          if (stale) return;
+          setNewTrackPreview(null);
+          setNewTrackPreviewError(err instanceof Error ? err.message : String(err));
+        });
+    }, PREVIEW_DEBOUNCE_MS);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [previewTracker, previewOptions]);
   const [stabilizedPreview, setStabilizedPreview] = useState(false);
   const [overlays, setOverlays] = useState<Overlays>(ALL_OVERLAYS);
   const [overlaysEnabled, setOverlaysEnabled] = useState(true);
@@ -742,10 +951,10 @@ export function ProjectProvider({
   // a just-placed anchor invisible in the list until the next run replaced the
   // cached track.
   const addAnchorAt = useCallback(
-    async (pointId: string, frame: number, x: number, y: number) => {
+    async (pointId: string, frame: number, x: number, y: number, box?: { w: number; h: number }) => {
       setEditError(null);
       try {
-        await api.addAnchor(projectId, pointId, frame, x, y);
+        await api.addAnchor(projectId, pointId, frame, x, y, box);
         await settle(pointId);
       } catch (err) {
         setEditError(err instanceof Error ? err.message : String(err));
@@ -895,7 +1104,14 @@ export function ProjectProvider({
         setTool("move");
       } else if (event.key === "n" || event.key === "N") {
         event.preventDefault();
-        setTool("add-point");
+        startNewTrack("point");
+      } else if (event.key === "b" || event.key === "B") {
+        // Only where a box tracker could take the result: the toolbar button
+        // is disabled in the same case, and an armed tool that can only fail
+        // is worse than a key that does nothing.
+        if (!trackers.some((t) => t.available && t.tracks_boxes)) return;
+        event.preventDefault();
+        startNewTrack("box");
       } else if (event.key === "d" || event.key === "D") {
         event.preventDefault();
         setTool("delete");
@@ -903,8 +1119,9 @@ export function ProjectProvider({
         event.preventDefault();
         setTool("pan");
       } else if (event.key === "Escape") {
-        // Always a way back to the harmless tool, from anywhere.
-        setTool("move");
+        // Always a way back to the harmless tool, from anywhere; it also
+        // abandons an open new-track draft.
+        cancelNewTrack();
       } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         if (!selectedPointId) return;
         const point = project.points.find((p) => p.id === selectedPointId);
@@ -932,6 +1149,9 @@ export function ProjectProvider({
     selectedPointId,
     tracks,
     tool,
+    trackers,
+    startNewTrack,
+    cancelNewTrack,
     addAnchorHere,
     setRangeMarker,
     goToMarker,
@@ -1020,6 +1240,13 @@ export function ProjectProvider({
       setSelectedPointId,
       tool,
       setTool,
+      newTrack,
+      startNewTrack,
+      updateNewTrack,
+      cancelNewTrack,
+      finishNewTrack,
+      newTrackPreview,
+      newTrackPreviewError,
       addAnchorHere,
       addAnchorAt,
       deleteAnchorAt,
@@ -1081,6 +1308,14 @@ export function ProjectProvider({
     followTracker,
     selectedPointId,
     tool,
+    setTool,
+    newTrack,
+    startNewTrack,
+    updateNewTrack,
+    cancelNewTrack,
+    finishNewTrack,
+    newTrackPreview,
+    newTrackPreviewError,
     addAnchorHere,
     addAnchorAt,
     deleteAnchorAt,
