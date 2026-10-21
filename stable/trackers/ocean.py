@@ -17,7 +17,10 @@ How it is used here
   does not include it.
 * The decoding is TracKit's: a penalty on boxes whose scale or aspect differ
   from what is expected, a cosine window favouring small motion, the best cell's
-  box, and a damped size update weighted by how sure the classifier is. The
+  box, and a damped size update weighted by how sure the classifier is. One
+  change: cells are ranked by the classifier *times* template similarity (see
+  Confidence), not the classifier alone, which scores a facade as highly as the
+  target and so beat a target far from the centre of a wide search. The
   hyper-parameters are the ones SOTS tuned this checkpoint to on OTB-2015, bar
   one: ``size_lr`` is 0.3, not 0.519. The box Ocean regresses around a patch is
   a far noisier scale signal than the box around an object, and the scale it
@@ -292,6 +295,10 @@ class OceanTracker(SiameseTrackerPlugin):
         centre_y = grid_y + (bottom - top) / 2.0
 
         cls = sigmoid(logits)
+        appearance = cls
+        if maps.similarity is not None:
+            # The classifier saturates on anything object-like; similarity says which is this one.
+            appearance = cls * np.maximum(maps.similarity[slot, 0].astype(np.float64), 0.0)
         expected_w, expected_h = max(expected_box[0], 1e-6), max(expected_box[1], 1e-6)
         scale_change = _change(_padded_size(width, height) / _padded_size(expected_w, expected_h))
         aspect_change = _change((expected_w / expected_h) / (width / height))
@@ -302,7 +309,8 @@ class OceanTracker(SiameseTrackerPlugin):
             cosine_window(grid, expected_centre[1], half_span),
             cosine_window(grid, expected_centre[0], half_span),
         )
-        score = penalty * cls * (1.0 - self.window_influence) + window * self.window_influence
+        influence = self.window_influence
+        score = penalty * appearance * (1.0 - influence) + window * influence
         if math.isfinite(reach):
             limit = reach + stride / 2.0
             outside = (np.abs(grid_x - expected_centre[0]) > limit) | (

@@ -546,8 +546,7 @@ export function ProjectProvider({
     if (newTrack) {
       try {
         const options = { ...(readRemembered()?.options ?? {}) };
-        // A box track takes no options, so it must not wipe the tracker's remembered ones.
-        if (newTrack.input === "point") options[newTrack.tracker] = newTrack.options;
+        options[newTrack.tracker] = { ...options[newTrack.tracker], ...newTrack.options };
         const saved: RememberedTrack = {
           tracker: newTrack.tracker,
           input: newTrack.input,
@@ -577,7 +576,8 @@ export function ProjectProvider({
   // The draft's settings, read from the server whenever the tracker or its
   // options change. Debounced because a slider fires on every step, and a
   // response that arrives after a newer request was made is dropped.
-  const previewTracker = newTrack && newTrack.input === "point" ? newTrack.tracker : null;
+  const previewTracker = newTrack?.tracker ?? null;
+  const previewBox = newTrack?.input === "box";
   const previewOptions = newTrack ? JSON.stringify(newTrack.options) : "{}";
   useEffect(() => {
     if (previewTracker === null) {
@@ -588,7 +588,7 @@ export function ProjectProvider({
     let stale = false;
     const timer = setTimeout(() => {
       api
-        .getTrackerSettings(previewTracker, JSON.parse(previewOptions))
+        .getTrackerSettings(previewTracker, JSON.parse(previewOptions), previewBox)
         .then((preview) => {
           if (stale) return;
           setNewTrackPreview(preview);
@@ -604,7 +604,7 @@ export function ProjectProvider({
       stale = true;
       clearTimeout(timer);
     };
-  }, [previewTracker, previewOptions]);
+  }, [previewTracker, previewOptions, previewBox]);
   const [stabilizedPreview, setStabilizedPreview] = useState(false);
   const [overlays, setOverlays] = useState<Overlays>(ALL_OVERLAYS);
   const [overlaysEnabled, setOverlaysEnabled] = useState(true);

@@ -583,6 +583,9 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             again around it.
         search_radius: How far the point may move between frames, in source
             pixels at the anchor's scale. See the module docstring.
+        box_search_size: Search crop side for box queries, in network pixels.
+            Defaults to the trained 255; larger crops cover more source pixels
+            at the same feature resolution. Must grow in steps of 16, up to 511.
         window_influence: Weight of the cosine prior favouring small motion, in
             ``[0, 1)``. Higher is steadier and slower to follow a fast feature.
         confidence_range: ``(low, high)`` calibration of the raw evidence (see
@@ -660,6 +663,7 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         *,
         template_radius: int = 16,
         search_radius: int = 32,
+        box_search_size: int = 255,
         window_influence: float = 0.3,
         confidence_range: tuple[float, float] = (0.2, 0.8),
         visible_threshold: float = 0.5,
@@ -684,6 +688,13 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
             raise ContractError(f"template_radius must be >= 1, got {self.template_radius}")
         if self.search_radius < 0:
             raise ContractError(f"search_radius must be >= 0, got {self.search_radius}")
+        self.box_search_size = int(box_search_size)
+        if (
+            self.box_search_size != box_search_size
+            or not self.trained_instance_size <= self.box_search_size <= self.max_instance_size
+            or (self.box_search_size - self.trained_instance_size) % (2 * self.total_stride)
+        ):
+            raise ContractError("box_search_size must be 255 to 511 in steps of 16")
         self.window_influence = float(window_influence)
         if not 0.0 <= self.window_influence < 1.0:
             raise ContractError(f"window_influence must lie in [0, 1), got {self.window_influence}")
@@ -953,17 +964,17 @@ class SiameseTrackerPlugin(ModelTrackerPlugin[SiameseBackend]):
         """Return how ``query`` is searched for.
 
         A point is the ``2r + 1`` box searched as ``search_radius`` asks (see
-        :meth:`search_geometry`). A box is searched the way the networks were
-        trained and benchmarked: the trained search side, around the box the
-        operator drew, with nothing beyond the cosine window to limit how far it
-        may move — ``search_radius`` describes a point's patch, not an object.
+        :meth:`search_geometry`). A box uses ``box_search_size`` around the box
+        the operator drew, with nothing beyond the cosine window to limit its
+        motion. The default preserves the trained search side; increasing it
+        expands coverage without shrinking the object in network pixels.
         """
         if query.size is None:
             side = float(self.box_side)
             instance_size, reach = point_geometry
             return _Seed(query.x, query.y, side, side, False, instance_size, reach)
         width, height = query.size
-        return _Seed(query.x, query.y, width, height, True, self.trained_instance_size, math.inf)
+        return _Seed(query.x, query.y, width, height, True, self.box_search_size, math.inf)
 
     def _search_side(self, target: _Target, seed: _Seed) -> float:
         """Return the reference search crop's side, in source pixels, at ``target``'s scale."""

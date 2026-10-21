@@ -73,6 +73,7 @@ __all__ = [
     "SETTINGS",
     "WINDOW_ATTRIBUTES",
     "TrackerSetting",
+    "box_search_scale",
     "constructor_parameters",
     "load_tracker_options",
     "point_options",
@@ -98,6 +99,9 @@ anything; above 128 the patch stops being a feature and starts being the shot.
 
 SEARCH_RADIUS_RANGE = (2, 256)
 """Bounds on how far beyond the template to search each frame."""
+
+SIAMESE_EXEMPLAR_SIZE = 127
+"""Network-pixel side of the Siamese exemplar (``stable.trackers.siamese.EXEMPLAR_SIZE``)."""
 
 
 @dataclass(frozen=True)
@@ -129,10 +133,13 @@ class TrackerSetting:
     maximum: int
     step: int = 1
     help: str = ""
+    display_unit: str | None = None
 
     @property
     def unit(self) -> str:
         """How to read a value: a half-size, a full side, or neither."""
+        if self.display_unit is not None:
+            return self.display_unit
         if self.radius_factor == 1.0:
             return "radius"
         if self.radius_factor == 0.5:
@@ -212,6 +219,19 @@ SETTINGS: tuple[TrackerSetting, ...] = (
         maximum=SEARCH_RADIUS_RANGE[1],
         help="How far beyond the pattern to look each frame. It has to exceed the "
         "fastest per-frame motion; every extra pixel costs search time.",
+    ),
+    TrackerSetting(
+        attribute="box_search_size",
+        role="search",
+        label="Search window",
+        radius_factor=0.0,
+        minimum=255,
+        maximum=511,
+        step=16,
+        display_unit="network_side",
+        help="Search crop side in network pixels, scaled with the tracked box. "
+        "Larger windows cover more motion without resizing the template, but cost "
+        "more time and memory. The trained default is 255.",
     ),
     TrackerSetting(
         attribute="max_level",
@@ -296,6 +316,8 @@ def _validate(options: dict[str, Any]) -> dict[str, Any]:
             raise ProjectError(
                 f"{key} must lie in [{setting.minimum}, {setting.maximum}], got {value}"
             )
+        if setting.unit == "network_side" and (value - setting.minimum) % setting.step:
+            raise ProjectError(f"{key} must grow from {setting.minimum} in steps of {setting.step}")
         checked[key] = value
     return checked
 
@@ -543,7 +565,7 @@ def _effective(tracker_name: str, setting: TrackerSetting, stored: dict[str, Any
 
 
 def tracker_settings(
-    tracker_name: str, options: dict[str, Any] | None = None
+    tracker_name: str, options: dict[str, Any] | None = None, *, box: bool = False
 ) -> list[dict[str, Any]]:
     """Describe every per-point setting ``tracker_name`` actually accepts.
 
@@ -555,6 +577,7 @@ def tracker_settings(
         tracker_name: Registered plugin name.
         options: The point's stored overrides, which win over the plugin's own
             defaults exactly as they do when a run is created.
+        box: Offer box-query controls instead of point-query controls.
 
     Returns:
         One row per setting, each carrying the current ``value``, the plugin's
@@ -565,6 +588,11 @@ def tracker_settings(
     stored = options or {}
     rows: list[dict[str, Any]] = []
     for setting in SETTINGS:
+        if box:
+            if setting.role == "window" or setting.attribute == "search_radius":
+                continue
+        elif setting.attribute == "box_search_size":
+            continue
         value = _effective(tracker_name, setting, stored)
         if value is None:
             continue
@@ -614,6 +642,17 @@ def tracker_window(
             continue
         return max(1, setting.radius(value)), setting.attribute
     return DEFAULT_PREVIEW_RADIUS, None
+
+
+def box_search_scale(tracker_name: str, options: dict[str, Any] | None = None) -> float | None:
+    """Return a box's search side as a multiple of its context side, or ``None``.
+
+    The context side is SiamFC's ``sqrt((w + p) * (h + p))`` with ``p = (w + h) / 2``;
+    the search crop covers ``box_search_size / 127`` of it in source pixels.
+    """
+    setting = setting_for("box_search_size")
+    value = None if setting is None else _effective(tracker_name, setting, options or {})
+    return None if value is None else value / SIAMESE_EXEMPLAR_SIZE
 
 
 def tracker_search(

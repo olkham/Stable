@@ -51,6 +51,8 @@ export interface PointWindow {
   attribute: string | null;
   search_radius: number | null;
   search_attribute: string | null;
+  /** Box tracks: search side as a multiple of the box's context side, else null. */
+  box_search_scale?: number | null;
 }
 
 export interface PointSummary {
@@ -318,7 +320,7 @@ export interface TrackerSetting {
   minimum: number;
   maximum: number;
   step: number;
-  unit: "radius" | "side" | "count";
+  unit: "radius" | "side" | "count" | "network_side";
   radius: number;
   help: string;
   /** Whether this point has overridden the plugin's own default. */
@@ -493,12 +495,19 @@ export type TrackInput = "point" | "box";
  */
 export interface TrackerSettingsPreview {
   tracker: string;
+  input: TrackInput;
   inputs: TrackInput[];
   settings: TrackerSetting[];
   /** The pattern region in source pixels from the point. */
   window: { radius: number; attribute: string | null };
   /** The search region; `radius` is null where there is none, and `note` says why. */
-  search: { radius: number | null; attribute: string | null; note: string };
+  search: {
+    radius: number | null;
+    attribute: string | null;
+    note: string;
+    /** Box input: search side as a multiple of the box's context side. */
+    box_scale?: number | null;
+  };
 }
 
 export interface DeviceInfo {

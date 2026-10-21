@@ -318,6 +318,12 @@ function canvasToSource(cx: number, cy: number, t: ViewTransform, videoW: number
   return { x: (cx - t.originX) / t.scale + videoW / 2, y: (cy - t.originY) / t.scale + videoH / 2 };
 }
 
+/** Side, in source pixels, of a Siamese tracker's search crop around a `w x h` box. */
+function boxSearchSide(w: number, h: number, scale: number): number {
+  const pad = (w + h) / 2;
+  return Math.sqrt((w + pad) * (h + pad)) * scale;
+}
+
 /**
  * Where a point sits on one frame, in source pixels: what the tracker found
  * there, or the anchor the operator placed there if it has not been tracked
@@ -866,8 +872,8 @@ export function Viewer() {
       // for this feature, and does it move further than that between frames?"
       // by looking rather than by guessing. Selected point only: at eight
       // points this would be a mesh, and the size being judged is the one
-      // whose sliders are open in the panel below. A box track has neither:
-      // its pattern is the box already drawn, and its search scales with it.
+      // whose sliders are open in the panel below. A box track's pattern is its
+      // box, and its search square (below) scales with that box.
       if (showWindows && isSelected && !point.box) {
         const at = markerPosition(point, track, viewFrame);
         if (at) {
@@ -888,6 +894,28 @@ export function Viewer() {
           const search = point.window?.search_radius ?? null;
           if (search !== null) box(search, true, "rgba(255,255,255,0.55)");
           if (point.window?.radius) box(point.window.radius, false, color);
+        }
+      }
+
+      const boxScale = point.window?.box_search_scale;
+      if (showWindows && isSelected && point.box && boxScale) {
+        const at = markerPosition(point, track, viewFrame);
+        const anchor = point.queries.find((q) => q.frame === viewFrame) ?? point.queries[0];
+        const w = track?.w?.[viewFrame] ?? anchor?.w;
+        const h = track?.h?.[viewFrame] ?? anchor?.h;
+        if (at && w && h) {
+          const side = boxSearchSide(w, h, boxScale);
+          ctx.save();
+          ctx.setLineDash([5, 4]);
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = "rgba(255,255,255,0.55)";
+          ctx.strokeRect(
+            toCanvasX(at.x - side / 2),
+            toCanvasY(at.y - side / 2),
+            side * t.scale,
+            side * t.scale,
+          );
+          ctx.restore();
         }
       }
     }
@@ -927,6 +955,23 @@ export function Viewer() {
         Math.abs(boxDraw.toX - boxDraw.fromX) * t.scale,
         Math.abs(boxDraw.toY - boxDraw.fromY) * t.scale,
       );
+      const scale = tool === "add-box" ? newTrackPreview?.search.box_scale : null;
+      const w = Math.abs(boxDraw.toX - boxDraw.fromX);
+      const h = Math.abs(boxDraw.toY - boxDraw.fromY);
+      if (scale && w > 0 && h > 0) {
+        const side = boxSearchSide(w, h, scale);
+        const cx = (boxDraw.fromX + boxDraw.toX) / 2;
+        const cy = (boxDraw.fromY + boxDraw.toY) / 2;
+        ctx.strokeStyle = "rgba(255,255,255,0.55)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(
+          toCanvasX(cx - side / 2),
+          toCanvasY(cy - side / 2),
+          side * t.scale,
+          side * t.scale,
+        );
+      }
       ctx.restore();
     }
 
@@ -1469,6 +1514,18 @@ export function Viewer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoW, videoH]);
 
+  function newTrackOptions(): Record<string, number> {
+    if (
+      !newTrack || newTrackPreview?.tracker !== newTrack.tracker ||
+      newTrackPreview.input !== newTrack.input
+    ) return {};
+    return Object.fromEntries(
+      newTrackPreview.settings
+        .filter((setting) => newTrack.options[setting.attribute] !== undefined)
+        .map((setting) => [setting.attribute, newTrack.options[setting.attribute]]),
+    );
+  }
+
   async function handleClick(evt: React.MouseEvent<HTMLCanvasElement>) {
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
@@ -1489,7 +1546,7 @@ export function Viewer() {
           y,
           newTrack.tracker,
           undefined,
-          newTrack.options,
+          newTrackOptions(),
         );
         finishNewTrack();
         setSelectedPointId(point.id);
@@ -1826,10 +1883,9 @@ export function Viewer() {
   /** Make a box track from a rectangle dragged on the frame; its centre is the position. */
   async function createBoxTrack(cx: number, cy: number, w: number, h: number) {
     try {
-      const point = await api.createPoint(project.id, viewFrame, cx, cy, newTrack?.tracker, {
-        w,
-        h,
-      });
+      const point = await api.createPoint(
+        project.id, viewFrame, cx, cy, newTrack?.tracker, { w, h }, newTrackOptions(),
+      );
       finishNewTrack();
       setSelectedPointId(point.id);
       await refresh();

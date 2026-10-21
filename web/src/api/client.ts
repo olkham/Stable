@@ -89,9 +89,10 @@ export const getTrackers = (): Promise<TrackerInfo[]> => request("/api/trackers"
 export const getTrackerSettings = (
   name: string,
   options: Record<string, number>,
+  box = false,
 ): Promise<TrackerSettingsPreview> => {
   const query = new URLSearchParams(
-    Object.entries(options).map(([key, value]) => [key, String(value)]),
+    [...Object.entries(options).map(([key, value]) => [key, String(value)]), ["box", String(box)]],
   ).toString();
   return request(`/api/trackers/${encodeURIComponent(name)}/settings${query ? `?${query}` : ""}`);
 };

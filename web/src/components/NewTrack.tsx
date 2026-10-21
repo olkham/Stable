@@ -33,7 +33,10 @@ export function NewTrack() {
   const info = trackers.find((t) => t.name === newTrack.tracker);
   const inputs = info?.inputs ?? [];
   const notes = [info?.license, info?.requires_gpu ? "GPU" : null].filter(Boolean);
-  const settings = newTrackPreview?.tracker === newTrack.tracker ? newTrackPreview : null;
+  const settings =
+    newTrackPreview?.tracker === newTrack.tracker && newTrackPreview.input === newTrack.input
+      ? newTrackPreview
+      : null;
 
   /** Drop one option, so the plugin's own default applies again. */
   function resetOption(attribute: string) {
@@ -89,7 +92,7 @@ export function NewTrack() {
         <span className="new-track__note">
           The box you draw is the pattern: the tracker follows the box's size.
         </span>
-      ) : (
+      ) : null}
         <div className="patch-panel__settings">
           {settings?.settings.map((setting) => {
             const chosen = newTrack.options[setting.attribute];
@@ -121,12 +124,11 @@ export function NewTrack() {
           {settings && settings.settings.length === 0 && (
             <span className="new-track__note">This tracker has no options to set.</span>
           )}
-          {settings && settings.search.radius === null && (
+          {settings && settings.search.radius === null && newTrack.input !== "box" && (
             <span className="new-track__note">{settings.search.note}</span>
           )}
           {newTrackPreviewError && <span className="error-text">{newTrackPreviewError}</span>}
         </div>
-      )}
 
       <div className="new-track__prompt">
         <span>

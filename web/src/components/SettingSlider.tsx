@@ -17,6 +17,7 @@ export function radiusOf(setting: TrackerSetting, value: number): number {
  * itself.
  */
 export function describeSetting(setting: TrackerSetting, value: number): string {
+  if (setting.unit === "network_side") return `${value} x ${value}`;
   if (setting.unit === "count") return `${value} levels`;
   if (setting.role === "search") return `±${radiusOf(setting, value)}px`;
   const side = setting.unit === "side" ? value : value * 2 + 1;

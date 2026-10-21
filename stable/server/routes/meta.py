@@ -13,6 +13,7 @@ from ...core.project import BORDER_POLICIES
 from ...smoothing.filters import describe_filters
 from ...trackers.registry import describe_trackers, get_tracker, tracker_inputs
 from ..tracker_options import (
+    box_search_scale,
     check_tracker_options,
     tracker_search,
     tracker_settings,
@@ -41,7 +42,7 @@ def trackers() -> list[dict[str, Any]]:
 
 
 @router.get("/trackers/{name}/settings")
-def tracker_settings_preview(name: str, request: Request) -> dict[str, Any]:
+def tracker_settings_preview(name: str, request: Request, box: bool = False) -> dict[str, Any]:
     """Describe a tracker's settings before any track uses it.
 
     A new track is set up tracker first: the operator picks the tracker, sizes
@@ -70,17 +71,29 @@ def tracker_settings_preview(name: str, request: Request) -> dict[str, Any]:
     except StableError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     try:
-        options = check_tracker_options(name, dict(request.query_params))
+        candidate = dict(request.query_params)
+        candidate.pop("box", None)
+        options = check_tracker_options(name, candidate)
     except StableError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     radius, attribute = tracker_window(name, options)
     search, search_attribute, note = tracker_search(name, options)
+    if box:
+        radius, attribute = 0, "box"
+        search, search_attribute = None, None
+        note = "Searched each frame around the box's last position, scaled to its size."
     return {
         "tracker": name,
+        "input": "box" if box else "point",
         "inputs": tracker_inputs(plugin),
-        "settings": tracker_settings(name, options),
+        "settings": tracker_settings(name, options, box=box),
         "window": {"radius": radius, "attribute": attribute},
-        "search": {"radius": search, "attribute": search_attribute, "note": note},
+        "search": {
+            "radius": search,
+            "attribute": search_attribute,
+            "note": note,
+            "box_scale": box_search_scale(name, options) if box else None,
+        },
     }
 
 

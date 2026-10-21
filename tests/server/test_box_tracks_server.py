@@ -494,6 +494,31 @@ def test_point_track_corrections_carry_no_box(client, project_id):
 # -- patches ------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("tracker", ["ocean", "siamdw"])
+def test_box_search_window_is_offered_saved_validated_and_reset(client, project_id, tracker):
+    point_id = make_box(client, project_id, tracker=tracker)["id"]
+    url = f"/api/projects/{project_id}/points/{point_id}/patches"
+    body = client.get(url).json()
+    assert body["radius_source"] == "box"
+    assert [setting["attribute"] for setting in body["settings"]] == ["box_search_size"]
+    setting = body["settings"][0]
+    assert setting["value"] == setting["default"] == 255
+    assert setting["unit"] == "network_side"
+    assert setting["step"] == 16
+    assert body["search"]["adjustable"] is True
+    saved = client.put(url, json={"box_search_size": 319})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["settings"][0]["value"] == 319
+    assert client.get(url).json()["settings"][0]["value"] == 319
+    summary = client.get(f"/api/projects/{project_id}/points").json()[0]
+    assert summary["window"]["box_search_scale"] == pytest.approx(319 / 127)
+    for invalid in [254, 256, 512]:
+        assert client.put(url, json={"box_search_size": invalid}).status_code == 400
+    reset = client.put(url, json={"box_search_size": None})
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["settings"][0]["value"] == 255
+
+
 def test_a_box_tracks_patch_is_the_box(client, project_id):
     point_id = make_box(client, project_id)["id"]
     client.post(

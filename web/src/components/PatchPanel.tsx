@@ -273,8 +273,6 @@ export function PatchPanel({ pointId }: { pointId: string }) {
           />
         ))}
 
-        {/* A box track's pattern is the box that was drawn, so there is no
-            slider to offer and an empty settings area would read as broken. */}
         {info.radius_source === "box" && (
           <span className="patch-panel__note">
             Box track — the pattern is the box you drew; resize it on an anchor frame to change it.

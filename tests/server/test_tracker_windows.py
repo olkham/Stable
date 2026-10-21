@@ -59,7 +59,9 @@ def place(client: TestClient, project_id: str, source, tracker: str) -> str:
 def test_every_setting_names_an_argument_some_tracker_actually_takes():
     """A row nothing accepts is a control that could never appear."""
     accepted: set[str] = set()
-    for name in ("lk", "klt", "template", "correlation", "meanshift", "kalman", "particle"):
+    for name in (
+        "lk", "klt", "template", "correlation", "meanshift", "kalman", "particle", "ocean", "siamdw"
+    ):
         accepted |= set(constructor_parameters(name))
     assert {s.attribute for s in SETTINGS} <= accepted
 

@@ -16,6 +16,7 @@ from ..core.project import PointSpec, Project
 from .storage import Workspace
 from .tracker_options import (
     TEMPLATE_RADIUS_RANGE,
+    box_search_scale,
     load_tracker_options,
     tracker_search,
     tracker_window,
@@ -152,6 +153,9 @@ def point_summary(
             "attribute": radius_source,
             "search_radius": search_radius,
             "search_attribute": search_source,
+            "box_search_scale": (
+                box_search_scale(point.tracker, options) if point.is_box else None
+            ),
         },
         **_load_track_stats(project, point),
     }

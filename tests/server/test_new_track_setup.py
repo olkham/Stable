@@ -125,6 +125,28 @@ def test_a_box_track_takes_no_pattern_settings(client: TestClient, pid: str):
     assert client.get(f"/api/projects/{pid}").json()["points"] == []
 
 
+@pytest.mark.parametrize("tracker", ["ocean", "siamdw"])
+def test_a_box_search_window_is_available_before_creation(client: TestClient, pid: str, tracker):
+    preview = client.get(f"/api/trackers/{tracker}/settings?box=true&box_search_size=319")
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["input"] == "box"
+    assert [row["attribute"] for row in body["settings"]] == ["box_search_size"]
+    assert body["settings"][0]["value"] == 319
+    assert body["search"]["box_scale"] == pytest.approx(319 / 127)
+    response = client.post(
+        f"/api/projects/{pid}/points",
+        json={
+            "frame": 0, "x": 30.0, "y": 20.0, "w": 12.0, "h": 10.0,
+            "tracker": tracker, "options": {"box_search_size": 319},
+        },
+    )
+    assert response.status_code == 200, response.text
+    point_id = response.json()["id"]
+    saved = client.get(f"/api/projects/{pid}/points/{point_id}/patches").json()
+    assert saved["settings"][0]["value"] == 319
+
+
 def test_a_point_created_without_settings_stores_none(client: TestClient, pid: str):
     point = client.post(
         f"/api/projects/{pid}/points",

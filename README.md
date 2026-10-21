@@ -126,6 +126,12 @@ an occluder crossed it on 11 of 12 clips. SiamDW searches scales, not shapes,
 so its box keeps the aspect it was drawn with (mean IoU 0.68 on the same clips,
 lost on all three that stretched) — use it for objects that only move and
 scale.
+For either box tracker, new-track controls and the track's patch panel offer a **Search window**
+from 255 to 511 network pixels per side, in steps of 16. The trained default
+is 255; increasing it searches more of the source image at the same template
+resolution, at a higher time and memory cost. The source-pixel coverage scales
+with the tracked box. Point tracks instead use **Search area** (`search_radius`)
+to control their per-frame motion reach.
 CoTracker3 and TAPIR also need their model *code*, which is not ours to vendor
 — `stable trackers` prints the exact command for whichever is missing:
 

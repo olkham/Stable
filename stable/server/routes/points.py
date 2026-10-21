@@ -138,9 +138,12 @@ def create_point(
             tracker = body.tracker or "lk"
         options: dict[str, Any] = {}
         if body.options:
-            if body.w is not None:
+            allowed = {
+                row["attribute"] for row in tracker_settings(tracker, box=body.w is not None)
+            }
+            if body.w is not None and body.options.keys() - allowed:
                 raise ProjectError(
-                    "a box track's pattern is its box: it takes no pattern or search settings"
+                    "a box track's pattern is its box: only box search settings may be set"
                 )
             # Checked before the point exists, so a refused setting leaves nothing behind.
             options = check_tracker_options(tracker, body.options)
@@ -715,16 +718,12 @@ def get_point_patches(
 
     stored = point_options(workspace.project_dir(project_id), point_id)
     radius, source_attribute = tracker_window(point.tracker, stored)
-    settings = tracker_settings(point.tracker, stored)
+    settings = tracker_settings(point.tracker, stored, box=point.is_box)
     search_radius, search_attribute, search_note = tracker_search(point.tracker, stored)
     default_radius, default_search = _template_defaults()
     box_radius = box_patch_radius(point) if point.is_box else None
     if box_radius is not None:
-        # The patch is the box, so there is no window to size: nothing for the
-        # panel to offer, and the radius is a property of the anchors. Nor is
-        # there a search radius: a box is searched the way its tracker was
-        # trained, over a region that scales with the box.
-        radius, source_attribute, settings = box_radius, "box", []
+        radius, source_attribute = box_radius, "box"
         search_radius, search_attribute = None, None
         search_note = "Searched each frame around the box's last position, scaled to its size."
 

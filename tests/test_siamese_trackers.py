@@ -141,6 +141,28 @@ def test_an_unreachable_search_radius_is_capped_rather_than_unbounded(cls):
     assert size == cls.max_instance_size
 
 
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_a_box_search_window_can_grow_without_changing_its_template(cls):
+    query = Query(0, 100.0, 100.0, 40.0, 20.0)
+    default = cls()
+    wider = cls(box_search_size=319)
+    seed = default._seed(query, default.search_geometry())
+    wide_seed = wider._seed(query, wider.search_geometry())
+    assert seed.instance_size == 255
+    assert wide_seed.instance_size == 319
+    assert wide_seed.anchor_scale == seed.anchor_scale
+    target = _Target(query.x, query.y)
+    ratio = wider._search_side(target, wide_seed) / default._search_side(target, seed)
+    assert ratio == pytest.approx(319 / 255)
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+@pytest.mark.parametrize("size", [254, 256, 512, 319.5])
+def test_invalid_box_search_windows_are_rejected(cls, size):
+    with pytest.raises(ContractError, match="box_search_size"):
+        cls(box_search_size=size)
+
+
 # -- riding, scale and holding -----------------------------------------------------
 
 
@@ -392,6 +414,32 @@ def test_a_box_is_searched_as_trained_whatever_the_search_radius(cls):
     backend = SiameseMarkerBackend("ocean" if cls is OceanTracker else "siamdw")
     cls(backend=backend, search_radius=120).track(video, [video.query(0)], (0, 4), "fwd")
     assert {shape[2] for shape in backend.searches} == {255}
+
+
+@pytest.mark.parametrize("cls", PLUGINS)
+def test_a_wider_box_search_window_reaches_inference(cls):
+    video = ShapeShiftingBox()
+    backend = SiameseMarkerBackend("ocean" if cls is OceanTracker else "siamdw")
+    result = cls(backend=backend, box_search_size=319).track(
+        video, [video.query(0)], (0, 4), "fwd"
+    )
+    assert {shape[2] for shape in backend.searches} == {319}
+    assert np.isfinite(result.points[0, :4]).all()
+    assert np.isfinite(result.sizes[0, :4]).all()
+
+
+def test_ocean_prefers_the_matching_target_to_a_saturated_distractor_near_the_centre():
+    """The classifier scores a facade like the drone; template similarity tells them apart."""
+    cells, offset = 57, 17
+    centre = cells // 2
+    logits = np.full((1, 1, cells, cells), 8.0, dtype=np.float32)
+    boxes = np.full((1, 1, 4, cells, cells), 30.0, dtype=np.float32)
+    similarity = np.zeros((1, 1, cells, cells), dtype=np.float32)
+    similarity[0, 0, centre, centre + offset] = 0.6
+    maps = SiameseMaps(score=logits, boxes=boxes, similarity=similarity)
+    step = OceanTracker()._decode(maps, 0, (60.0, 60.0), (0.0, 0.0), math.inf, box=True)
+    assert step.dx == pytest.approx(offset * 8.0)
+    assert step.evidence > 0.5
 
 
 def test_a_lost_box_holds_its_place_and_its_size():
