@@ -4,13 +4,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Request
 
 from ... import __version__
 from ...core.device import device_info
+from ...core.errors import StableError
 from ...core.project import BORDER_POLICIES
 from ...smoothing.filters import describe_filters
-from ...trackers.registry import describe_trackers
+from ...trackers.registry import describe_trackers, get_tracker, tracker_inputs
+from ..tracker_options import (
+    check_tracker_options,
+    tracker_search,
+    tracker_settings,
+    tracker_window,
+)
 
 __all__ = ["router"]
 
@@ -31,6 +38,50 @@ def trackers() -> list[dict[str, Any]]:
     rather than letting a track job fail on a missing dependency or GPU).
     """
     return describe_trackers()
+
+
+@router.get("/trackers/{name}/settings")
+def tracker_settings_preview(name: str, request: Request) -> dict[str, Any]:
+    """Describe a tracker's settings before any track uses it.
+
+    A new track is set up tracker first: the operator picks the tracker, sizes
+    its pattern and search area, and only then marks the video. Every other
+    description of these settings belongs to an existing point, so this one
+    answers for a tracker alone, for whatever values the sliders are at.
+
+    Query parameters are candidate values under the settings' own argument
+    names (``?template_radius=24&search_radius=60``); any left out take the
+    plugin's default, exactly as they would in a run.
+
+    Returns:
+        ``tracker``; ``inputs``, what a track can be started from (preferred
+        first); ``settings``, one row per control, shaped as the patch panel's;
+        and ``window`` / ``search``, the regions those values describe in
+        source pixels from the point — what the viewer previews under the
+        cursor before the point is placed. ``search.radius`` is ``None`` for a
+        tracker with no search area, with ``note`` saying why.
+
+    Raises:
+        HTTPException: 404 for an unknown tracker; 400 for a setting it does
+            not take or a value out of range.
+    """
+    try:
+        plugin = get_tracker(name)
+    except StableError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        options = check_tracker_options(name, dict(request.query_params))
+    except StableError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    radius, attribute = tracker_window(name, options)
+    search, search_attribute, note = tracker_search(name, options)
+    return {
+        "tracker": name,
+        "inputs": tracker_inputs(plugin),
+        "settings": tracker_settings(name, options),
+        "window": {"radius": radius, "attribute": attribute},
+        "search": {"radius": search, "attribute": search_attribute, "note": note},
+    }
 
 
 @router.get("/filters")

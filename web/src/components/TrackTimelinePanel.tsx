@@ -6,6 +6,7 @@ import { useProjectContext } from "../state/ProjectContext";
 import type { PointSummary, Query, TrackData, TrackerInfo } from "../types";
 import { CompositeSources, DeriveTrackPanel } from "./DeriveTrack";
 import { JobProgress } from "./JobProgress";
+import { NewTrack } from "./NewTrack";
 import { PanelSwitch } from "./PanelSwitch";
 import { AllPatchesStrip, PatchPanel } from "./PatchPanel";
 import { TrackEdits } from "./TrackEdits";
@@ -44,7 +45,8 @@ export function TrackTimelinePanel({
   variant: PanelVariant;
   onVariantChange: (next: PanelVariant) => void;
 }) {
-  const { project, tool, setTool, selectedPointId, setSelectedPointId } = useProjectContext();
+  const { project, newTrack, startNewTrack, cancelNewTrack, selectedPointId, setSelectedPointId } =
+    useProjectContext();
 
   // How far every run from this panel reaches. One setting, in the header,
   // because it governs every ◀/▶ below it — on the old card it lived inside one
@@ -58,12 +60,15 @@ export function TrackTimelinePanel({
       <div className="panel__header">
         <h3>Tracks</h3>
         <button
-          className={tool === "add-point" ? "button--active" : ""}
-          onClick={() => setTool(tool === "add-point" ? "move" : "add-point")}
+          className={newTrack ? "button--active" : ""}
+          onClick={() => (newTrack ? cancelNewTrack() : startNewTrack())}
+          title="Choose a tracker and its settings, then mark what it should follow on the video (N for a point, B for a box)"
         >
-          {tool === "add-point" ? "Click video to place…" : "+ Add track"}
+          + New track
         </button>
       </div>
+
+      <NewTrack />
 
       <div className="panel__subhead">
         <span className="lbl">Runs</span>
@@ -93,7 +98,10 @@ export function TrackTimelinePanel({
       </div>
 
       {project.points.length === 0 && (
-        <p className="panel__empty">No tracks yet. Click "Add track" then click on the video.</p>
+        <p className="panel__empty">
+          No tracks yet. Click "New track", choose a tracker, then mark what it should follow on the
+          video.
+        </p>
       )}
 
       {/* Every point's patch on this frame — "which one has drifted", which the

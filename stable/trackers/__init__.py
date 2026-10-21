@@ -16,7 +16,7 @@ from .confidence import (
     visibility_from_confidence,
 )
 from .cotracker3 import CoTracker3Tracker
-from .deep import BackendPrediction, DeepTrackerPlugin, TrackerBackend
+from .deep import BackendPrediction, DeepTrackerPlugin, ModelTrackerPlugin, TrackerBackend
 from .dummy import DummyTracker
 from .lk import LKTracker
 from .merge import (
@@ -38,6 +38,7 @@ from .registry import (
     register_tracker,
     registry,
 )
+from .siamese import SiameseBackend, SiameseMaps, SiameseStep, SiameseTrackerPlugin
 from .tapir import TapirTracker
 from .template import TemplateTracker
 from .weights import (
@@ -59,9 +60,14 @@ __all__ = [
     "CoTracker3Tracker",
     "TapirTracker",
     # deep-tracker machinery (shared by every model plugin)
+    "ModelTrackerPlugin",
     "DeepTrackerPlugin",
     "TrackerBackend",
     "BackendPrediction",
+    "SiameseTrackerPlugin",
+    "SiameseBackend",
+    "SiameseMaps",
+    "SiameseStep",
     "Chunk",
     "ChunkStitcher",
     "plan_chunks",

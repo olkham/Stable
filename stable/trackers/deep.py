@@ -17,12 +17,25 @@ chunk/stitch/timeline path be tested on a machine with no GPU and no torch by
 injecting a fake backend, and means a future runtime (ONNX, TensorRT, a remote
 worker) is a new backend rather than a new plugin.
 
+Two layers
+----------
+Not every model wants windows. The Siamese trackers
+(:mod:`stable.trackers.siamese`) look at one frame at a time against a template
+fixed at the anchor, and cutting their run into re-anchored windows would
+re-template them on their own predictions every few dozen frames. What they do
+share with CoTracker3 and TAPIR is everything *around* the model, so that is its
+own base class:
+
+* :class:`ModelTrackerPlugin` — device policy, lazy weights, the injected-backend
+  seam and the CPU fallback, for any plugin that runs a loaded model;
+* :class:`DeepTrackerPlugin` — that, plus the windowed pipeline above.
+
 Device policy
 -------------
 ``prepare()`` resolves ``auto`` to CUDA when it is there and CPU when it is not.
 If the weights will not load on the GPU, or a window blows out GPU memory
 mid-run, the plugin moves to CPU and carries on — a slow result beats a crashed
-job, and :attr:`DeepTrackerPlugin.fell_back_to_cpu` records that it happened so
+job, and :attr:`ModelTrackerPlugin.fell_back_to_cpu` records that it happened so
 the UI can say so. Out-of-memory on CPU is a real failure and is reported as one.
 """
 
@@ -31,8 +44,9 @@ from __future__ import annotations
 import logging
 from abc import abstractmethod
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 import numpy as np
 
@@ -46,11 +60,15 @@ from .weights import ModelSpec, ensure_weights, is_downloaded, local_path
 
 __all__ = [
     "BackendPrediction",
+    "ModelBackend",
     "TrackerBackend",
+    "ModelTrackerPlugin",
     "DeepTrackerPlugin",
     "is_out_of_memory",
     "resize_frames",
 ]
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +197,31 @@ class BackendPrediction:
 
 
 @runtime_checkable
+class ModelBackend(Protocol):
+    """What the shared lifecycle needs from any loaded model, whatever it computes.
+
+    :class:`ModelTrackerPlugin` only ever moves a backend between devices and
+    frees it; what a backend is *asked* to do is the business of the pipeline
+    built on top (:class:`TrackerBackend` for windows,
+    :class:`~stable.trackers.siamese.SiameseBackend` for template/search pairs).
+    """
+
+    device: str
+
+    def to_device(self, device: str) -> None:
+        """Move the loaded model onto ``device`` (used by the CPU fallback)."""
+        ...
+
+    def release(self) -> None:
+        """Free the model and any device memory. Must be safe to call twice."""
+        ...
+
+
+BackendT = TypeVar("BackendT", bound=ModelBackend)
+"""The kind of backend a :class:`ModelTrackerPlugin` subclass drives."""
+
+
+@runtime_checkable
 class TrackerBackend(Protocol):
     """The model seam: NumPy in, :class:`BackendPrediction` out.
 
@@ -213,74 +256,57 @@ class TrackerBackend(Protocol):
         ...
 
 
-class DeepTrackerPlugin(TrackerPlugin):
-    """Base class implementing chunked, resolution-scaled, resilient tracking.
+class ModelTrackerPlugin(TrackerPlugin, Generic[BackendT]):
+    """Device policy, lazy weights and the CPU fallback, for any plugin with a model.
 
-    Subclasses set the class attributes below and implement
-    :meth:`_build_backend` and :meth:`normalize_confidence`.
+    The part of a deep plugin that has nothing to do with how its model is
+    *used*: resolve the device, fail fast when PyTorch or the model's own code
+    is missing, fetch and verify the checkpoint, build the backend, and move to
+    the CPU when the GPU will not cooperate. :class:`DeepTrackerPlugin` adds the
+    windowed pipeline on top; :class:`~stable.trackers.siamese.SiameseTrackerPlugin`
+    adds a frame-at-a-time one.
+
+    Subclasses set the class attributes below, implement :meth:`_build_backend`
+    and :meth:`~stable.trackers.base.TrackerPlugin.track`, and run every model
+    call through :meth:`_call_with_cpu_fallback`.
 
     Args:
-        chunk_size: Frames per inference window; ``None`` uses
-            :attr:`default_chunk_size`. Lower it if a GPU is tight on memory.
-        overlap: Frames shared between adjacent windows, crossfaded to hide the
-            seam; ``None`` uses :attr:`default_overlap`.
-        model_resolution: ``(height, width)`` the frames are resized to before
-            inference, or ``None`` to feed native resolution. This is the main
-            reason a 1080p clip fits in 8 GB.
         device: Preferred device string; ``None``/``"auto"`` picks CUDA when
             available. Resolved in :meth:`prepare`.
         allow_cpu_fallback: Whether an out-of-memory failure on the GPU should
             silently continue on the CPU.
-        backend: A ready-made :class:`TrackerBackend` to use instead of loading
-            weights. Intended for tests and alternative runtimes.
+        backend: A ready-made backend to use instead of loading weights.
+            Intended for tests and alternative runtimes.
         allow_download: Passed to :func:`~stable.trackers.weights.ensure_weights`;
             False makes :meth:`prepare` fail rather than hit the network.
 
     Attributes:
         model_spec: The checkpoint this plugin needs, or ``None`` if it has none.
-        default_chunk_size: Window length that fits a typical 8 GB GPU.
-        default_overlap: Default crossfade length between windows.
-        default_model_resolution: Input size the model was trained at.
-        install_hint: How to install the package holding the model code, shown
-            when it is missing.
+        install_hint: How to install what :meth:`_implementation_available`
+            checks for, shown when it is missing.
+        implementation_requirement: What :meth:`_implementation_available`
+            checks for, as the end of the sentence "``<name>`` needs ...".
     """
 
     model_spec: ModelSpec | None = None
     install_hint: str = ""
-    default_chunk_size: int = 48
-    default_overlap: int = 8
-    default_model_resolution: tuple[int, int] | None = None
+    implementation_requirement: str = "its model code, which Stable does not vendor"
 
     def __init__(
         self,
         *,
-        chunk_size: int | None = None,
-        overlap: int | None = None,
-        model_resolution: tuple[int, int] | None | str = "default",
         device: str | None = None,
         allow_cpu_fallback: bool = True,
-        backend: TrackerBackend | None = None,
+        backend: BackendT | None = None,
         allow_download: bool = True,
     ) -> None:
-        """Create an unprepared deep tracker; see the class docstring."""
+        """Create an unprepared model plugin; see the class docstring."""
         super().__init__()
-        self.chunk_size = int(chunk_size if chunk_size is not None else self.default_chunk_size)
-        self.overlap = int(overlap if overlap is not None else self.default_overlap)
-        if self.chunk_size < 2:
-            raise ContractError(f"chunk_size must be >= 2, got {self.chunk_size}")
-        if not 0 <= self.overlap < self.chunk_size:
-            raise ContractError(
-                f"overlap must lie in [0, chunk_size), got {self.overlap} with "
-                f"chunk_size={self.chunk_size}"
-            )
-        self.model_resolution: tuple[int, int] | None = (
-            self.default_model_resolution if isinstance(model_resolution, str) else model_resolution
-        )
         self.requested_device = device
         self.allow_cpu_fallback = bool(allow_cpu_fallback)
         self.allow_download = bool(allow_download)
         self.fell_back_to_cpu = False
-        self._backend: TrackerBackend | None = backend
+        self._backend: BackendT | None = backend
         self._injected_backend = backend
 
     # -- availability ----------------------------------------------------
@@ -298,7 +324,12 @@ class DeepTrackerPlugin(TrackerPlugin):
 
     @classmethod
     def _implementation_available(cls) -> bool:
-        """Whether the third-party package holding the model code is importable."""
+        """Whether the third-party package holding the model code is importable.
+
+        Named for the usual case; a plugin whose model code ships with Stable
+        uses it for whatever else it cannot run without, and says what that is
+        in :attr:`implementation_requirement`.
+        """
         return True
 
     @classmethod
@@ -318,7 +349,7 @@ class DeepTrackerPlugin(TrackerPlugin):
             )
         if not cls._implementation_available():
             hint = cls.install_hint or "See docs/windows-gpu-setup.md."
-            return f"{cls.name} needs its model code, which Stable does not vendor. {hint}"
+            return f"{cls.name} needs {cls.implementation_requirement}. {hint}"
         return None
 
     def _require_implementation(self) -> None:
@@ -339,8 +370,7 @@ class DeepTrackerPlugin(TrackerPlugin):
             )
         if not self._implementation_available():
             raise TrackerError(
-                f"{self.name} needs its model code, which Stable does not vendor. "
-                f"{self.install_hint}".strip()
+                f"{self.name} needs {self.implementation_requirement}. {self.install_hint}".strip()
             )
 
     @classmethod
@@ -417,7 +447,7 @@ class DeepTrackerPlugin(TrackerPlugin):
         super().release()
 
     @abstractmethod
-    def _build_backend(self, device: str, weights: Any) -> TrackerBackend:
+    def _build_backend(self, device: str, weights: Any) -> BackendT:
         """Load the model and return a backend bound to ``device``.
 
         Args:
@@ -426,9 +456,142 @@ class DeepTrackerPlugin(TrackerPlugin):
                 declares no :attr:`model_spec`.
 
         Returns:
-            A ready :class:`TrackerBackend`.
+            A ready backend of the kind this plugin drives.
         """
         raise NotImplementedError
+
+    def _call_with_cpu_fallback(
+        self,
+        call: Callable[[], _T],
+        *,
+        what: str,
+        advice: str = "",
+        on_cpu: Callable[[], None] | None = None,
+    ) -> _T:
+        """Run one model call, absorbing a GPU out-of-memory failure.
+
+        On GPU OOM the model is moved to the CPU and the call is retried there;
+        the rest of the run then stays on the CPU rather than thrashing back and
+        forth. OOM on the CPU is fatal.
+
+        Args:
+            call: The model call. It is invoked again for the retry, so it must
+                read anything device-bound (cached features, say) when it runs.
+            what: How much work the call was, for the out-of-memory message —
+                the operator's only clue to what to make smaller.
+            advice: What to make smaller, appended to that message.
+            on_cpu: Rebuilds whatever device-bound state the call depends on,
+                once the model is on the CPU and before the retry.
+
+        Returns:
+            Whatever ``call`` returns.
+
+        Raises:
+            TrackerError: If the call fails for any reason other than a
+                recoverable OOM.
+        """
+        try:
+            return call()
+        except Exception as exc:
+            if not is_out_of_memory(exc):
+                if isinstance(exc, StableError):
+                    raise
+                raise TrackerError(f"{self.name} inference failed: {exc}") from exc
+            if self.device == "cpu" or not self.allow_cpu_fallback:
+                raise TrackerError(
+                    f"{self.name} ran out of memory on {self.device} ({what}). {advice}".strip()
+                ) from exc
+            logger.warning(
+                "%s ran out of memory on %s; retrying on the CPU", self.name, self.device
+            )
+            _empty_cuda_cache()
+            backend = self._backend
+            try:
+                if backend is not None:
+                    backend.to_device("cpu")
+            except Exception as move_exc:  # pragma: no cover - backend-specific
+                raise TrackerError(
+                    f"{self.name} ran out of memory and could not fall back to CPU: {move_exc}"
+                ) from move_exc
+            self.device = "cpu"
+            self.fell_back_to_cpu = True
+            _empty_cuda_cache()
+            try:
+                if on_cpu is not None:
+                    on_cpu()
+                return call()
+            except Exception as retry_exc:
+                raise TrackerError(
+                    f"{self.name} inference failed after falling back to CPU: {retry_exc}"
+                ) from retry_exc
+
+
+class DeepTrackerPlugin(ModelTrackerPlugin[TrackerBackend]):
+    """Base class implementing chunked, resolution-scaled, resilient tracking.
+
+    Subclasses set the class attributes below and implement
+    :meth:`_build_backend` and :meth:`normalize_confidence`.
+
+    Args:
+        chunk_size: Frames per inference window; ``None`` uses
+            :attr:`default_chunk_size`. Lower it if a GPU is tight on memory.
+        overlap: Frames shared between adjacent windows, crossfaded to hide the
+            seam; ``None`` uses :attr:`default_overlap`.
+        model_resolution: ``(height, width)`` the frames are resized to before
+            inference, or ``None`` to feed native resolution. This is the main
+            reason a 1080p clip fits in 8 GB.
+        device: Preferred device string; ``None``/``"auto"`` picks CUDA when
+            available. Resolved in :meth:`prepare`.
+        allow_cpu_fallback: Whether an out-of-memory failure on the GPU should
+            silently continue on the CPU.
+        backend: A ready-made :class:`TrackerBackend` to use instead of loading
+            weights. Intended for tests and alternative runtimes.
+        allow_download: Passed to :func:`~stable.trackers.weights.ensure_weights`;
+            False makes :meth:`prepare` fail rather than hit the network.
+
+    Attributes:
+        model_spec: The checkpoint this plugin needs, or ``None`` if it has none.
+        default_chunk_size: Window length that fits a typical 8 GB GPU.
+        default_overlap: Default crossfade length between windows.
+        default_model_resolution: Input size the model was trained at.
+        install_hint: How to install the package holding the model code, shown
+            when it is missing.
+    """
+
+    default_chunk_size: int = 48
+    default_overlap: int = 8
+    default_model_resolution: tuple[int, int] | None = None
+
+    def __init__(
+        self,
+        *,
+        chunk_size: int | None = None,
+        overlap: int | None = None,
+        model_resolution: tuple[int, int] | None | str = "default",
+        device: str | None = None,
+        allow_cpu_fallback: bool = True,
+        backend: TrackerBackend | None = None,
+        allow_download: bool = True,
+    ) -> None:
+        """Create an unprepared deep tracker; see the class docstring."""
+        super().__init__(
+            device=device,
+            allow_cpu_fallback=allow_cpu_fallback,
+            backend=backend,
+            allow_download=allow_download,
+        )
+        self.chunk_size = int(chunk_size if chunk_size is not None else self.default_chunk_size)
+        self.overlap = int(overlap if overlap is not None else self.default_overlap)
+        if self.chunk_size < 2:
+            raise ContractError(f"chunk_size must be >= 2, got {self.chunk_size}")
+        if not 0 <= self.overlap < self.chunk_size:
+            raise ContractError(
+                f"overlap must lie in [0, chunk_size), got {self.overlap} with "
+                f"chunk_size={self.chunk_size}"
+            )
+        self.model_resolution: tuple[int, int] | None = (
+            self.default_model_resolution if isinstance(model_resolution, str) else model_resolution
+        )
 
     @abstractmethod
     def normalize_confidence(self, prediction: BackendPrediction) -> tuple[np.ndarray, np.ndarray]:
@@ -614,9 +777,8 @@ class DeepTrackerPlugin(TrackerPlugin):
     def _infer(self, frames: np.ndarray, queries: np.ndarray) -> BackendPrediction:
         """Run one window through the backend, absorbing out-of-memory failures.
 
-        On GPU OOM the model is moved to the CPU and the window is retried
-        there; the rest of the run then stays on the CPU rather than thrashing
-        back and forth. OOM on the CPU is fatal.
+        See :meth:`ModelTrackerPlugin._call_with_cpu_fallback`: a window that
+        blows out GPU memory is retried on the CPU, and OOM on the CPU is fatal.
 
         Raises:
             TrackerError: If inference fails for any reason other than a
@@ -624,41 +786,11 @@ class DeepTrackerPlugin(TrackerPlugin):
         """
         backend = self._backend
         assert backend is not None  # noqa: S101 - track() checks this
-        try:
-            return backend.infer(frames, queries)
-        except Exception as exc:
-            if not is_out_of_memory(exc):
-                if isinstance(exc, StableError):
-                    raise
-                raise TrackerError(f"{self.name} inference failed: {exc}") from exc
-            if self.device == "cpu" or not self.allow_cpu_fallback:
-                raise TrackerError(
-                    f"{self.name} ran out of memory on {self.device} "
-                    f"(window of {frames.shape[0]} frames at "
-                    f"{frames.shape[2]}x{frames.shape[1]}). Reduce chunk_size or "
-                    "model_resolution."
-                ) from exc
-            logger.warning(
-                "%s ran out of memory on %s; retrying this window on the CPU",
-                self.name,
-                self.device,
-            )
-            _empty_cuda_cache()
-            try:
-                backend.to_device("cpu")
-            except Exception as move_exc:  # pragma: no cover - backend-specific
-                raise TrackerError(
-                    f"{self.name} ran out of memory and could not fall back to CPU: {move_exc}"
-                ) from move_exc
-            self.device = "cpu"
-            self.fell_back_to_cpu = True
-            _empty_cuda_cache()
-            try:
-                return backend.infer(frames, queries)
-            except Exception as retry_exc:
-                raise TrackerError(
-                    f"{self.name} inference failed after falling back to CPU: {retry_exc}"
-                ) from retry_exc
+        return self._call_with_cpu_fallback(
+            lambda: backend.infer(frames, queries),
+            what=f"window of {frames.shape[0]} frames at {frames.shape[2]}x{frames.shape[1]}",
+            advice="Reduce chunk_size or model_resolution.",
+        )
 
     def __repr__(self) -> str:
         """Return a debug representation naming the device and window size."""

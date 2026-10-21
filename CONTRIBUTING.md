@@ -66,6 +66,15 @@ merge layer and the UI all assume them, and the shared test suite checks them:
 5. **Report progress.** Call `progress(fraction, message)` often enough for a
    progress bar, and never assume it does something.
 
+A tracker that follows *boxes* — one initialised from a detection, like Ocean
+and SiamDW — also sets `tracks_boxes = True`. A query may then carry a box
+(`Query.w`, `Query.h`, with `x, y` its **centre**), and `track()` returns
+`TrackResult.sizes`: `[N, T, 2]` widths and heights, `NaN` where unknown and on
+any plain-point query in the same call. Position stays the centre, so the
+solver never sees a box. The app offers only box-tracking plugins for box
+tracks; a plugin that leaves `tracks_boxes` unset and is handed a box anyway
+tracks its centre and returns no sizes.
+
 Raise `stable.core.errors.TrackerError` for anything you refuse to do.
 
 ### Publishing it
@@ -165,6 +174,23 @@ exists at a time, and it is downscaled first. Pick `chunk_size` so
 enough that the model has real temporal context after re-anchoring (8 frames is
 a reasonable floor). Users can override both per-instance.
 
+### Models that look at one frame at a time
+
+Windows suit models that reason over many frames at once. A model that compares
+each frame with a template fixed at the anchor — a Siamese tracker — would be
+re-templated on its own guesses at every window boundary, so it subclasses
+`ModelTrackerPlugin` (`stable/trackers/deep.py`) instead: the same `ModelSpec`,
+`_build_backend`, device policy and lazy weights, without the windowing. Run
+every model call through `_call_with_cpu_fallback` so an out-of-memory GPU
+hands the run to the CPU rather than ending it.
+
+For a template/search network specifically, `SiameseTrackerPlugin`
+(`stable/trackers/siamese.py`) already does the rest — exact crops, the search
+radius, the anchor frame's own reading that the point rides on, scale, holding
+through a loss, batching — and a plugin supplies its network and a `_decode`
+that reads the network's maps. `stable/trackers/siamdw.py` is the shorter
+example; `stable/trackers/ocean.py` shows a decoder with box regression.
+
 ---
 
 ## Calibrating confidence
@@ -200,6 +226,15 @@ How the shipped plugins do it:
 | `template` | NCC peak, clamped at 0 | identity |
 | `cotracker3` | `visibility x confidence` heads | `(0.10, 0.95)` |
 | `tapir` | `(1 - sigmoid(occlusion)) x (1 - sigmoid(expected_dist))` | `(0.15, 0.90)` |
+| `ocean` | `sigmoid(cls)` x feature cosine at the position found | `(0.45, 0.62)` |
+| `siamdw` | correlation peak / the anchor frame's own peak | `(0.55, 0.72)` |
+
+The last two were fitted to measurements, not chosen: both trackers were run
+with the real checkpoints over clips of known motion and over an occluder
+sweeping across the point, and each range puts every covered frame at `0` while
+keeping frames within 2 px of the truth near `1`. Ocean's classifier alone could
+not have been calibrated at all — it scored 0.86 with the target covered — which
+is why its signal is a product; see `stable/trackers/ocean.py`.
 
 Sanity check your choice: on clean, unambiguous footage your plugin should score
 `> 0.9`, and through a full occlusion it should approach `0`. The shared suite
@@ -232,6 +267,8 @@ not invented or copied from a third party.
 |---|---|---|
 | `bootstapir` | `8493c7a69e02c85b9382fbb3c7b8b539b36bc08ede744b9e99feb739a0129f4b` | 218,886,140 bytes |
 | `cotracker3_offline` | `2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834` | 101,890,938 bytes |
+| `ocean_offline` | `16badb707871ba83a786f32fce5bdf7946254679cbc0051f32bf1f2c8e6cd805` | 103,788,031 bytes |
+| `siamdw_res22w` | `1392552b0be47bef518219c47df8ccc7abbf1bc63c44ca5039e66c38ca9bedad` | 9,920,295 bytes |
 
 How they were verified, so the next model follows the same bar rather than a
 lower one:
@@ -256,6 +293,35 @@ lower one:
    tracks".
 5. `sha256_file()` on the verified download produced the digests above, which
    were then written into the `ModelSpec`s in `tapir.py` / `cotracker3.py`.
+
+`ocean_offline` and `siamdw_res22w` (the TracKit trackers) were held to the
+same bar, on a CUDA machine this time, with three additions because their
+network code is Stable's own port rather than a package's:
+
+1. **Provenance.** TracKit's own Google Drive links are dead; its MIT README
+   now points at the authors' SOTS repository for models, and both files come
+   from SOTS's model folder. `SiamDW.pth`'s 120 tensors are *identical* to the
+   `state_dict` inside `SiamFCRes22W.pth`, the checkpoint the MIT-licensed
+   `researchmm/SiamDW` README links (that file is a training checkpoint with
+   pickled NumPy scalars, so the plain weights are the one Stable loads).
+   `Ocean.pth` is SOTS's offline ResNet-50 model; SOTS itself carries no
+   licence file, so its `ModelSpec` says where the MIT reading comes from.
+2. **Network equivalence.** The ported networks in `siamese_nets.py` load
+   each checkpoint with no missing or unexpected tensor (bar the BatchNorm
+   counters SiamDW's predates), and reproduce the outputs of the authors' own
+   SOTS module definitions on identical inputs to within 1e-5, at search sizes
+   255, 271 and 287.
+3. **Real tracking.** `ensure_weights()` fetched both files through Stable's own
+   downloader, and both plugins then tracked real clips through their actual
+   `_build_backend`: textured footage of known motion, an occluder sweep, and
+   the bundled sample clip through `stable track` and through the server API.
+   SiamDW measured 0.65 px median error over the motion clips, Ocean 0.74 px;
+   the full numbers are in each plugin's module docstring.
+
+Both also run on the CPU, at 46 ms (SiamDW) and 61 ms (Ocean) a frame for one
+point. Checking that is how the SiamDW release's 715,493 denormal weights were
+found: unflushed, one CPU frame took 3.5 s — see `_denormals_flushed` in
+`stable/trackers/siamese.py`.
 
 Note for contributors: `tapnet` and `cotracker` are **not** installed by
 `pip install -e ".[dev,video,server]"` or even `.[torch]` — they are the

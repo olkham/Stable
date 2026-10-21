@@ -24,8 +24,9 @@ pattern window and the search area:
     tracker has one.
 ``search``
     How far from the last known position that pattern is looked for. Only the
-    trackers that perform an explicit spatial search have one
-    (``template``, ``kalman``); phase correlation measures a shift without
+    trackers that perform an explicit spatial search have one (``template``,
+    ``kalman``, and the Siamese ``ocean`` and ``siamdw``, whose network scores a
+    whole search region); phase correlation measures a shift without
     searching at all, and LK's reach comes from its pyramid depth instead —
     :func:`tracker_search` reports that reach and where it came from rather than
     inventing a control that would do nothing.
@@ -75,6 +76,7 @@ __all__ = [
     "constructor_parameters",
     "load_tracker_options",
     "point_options",
+    "check_tracker_options",
     "save_point_options",
     "setting_for",
     "template_patch",
@@ -298,6 +300,35 @@ def _validate(options: dict[str, Any]) -> dict[str, Any]:
     return checked
 
 
+def check_tracker_options(tracker_name: str, options: dict[str, Any]) -> dict[str, Any]:
+    """Refuse settings ``tracker_name`` would not act on, and range-check the rest.
+
+    A setting the plugin does not accept would be dropped when its run is
+    created, so storing it would make a control that appears to work and does
+    nothing; a key this server does not know is not a setting at all. Both are
+    the caller's bug, and said so, rather than a silent no-op.
+
+    Args:
+        tracker_name: The plugin the settings are for.
+        options: ``{attribute: value}`` in the plugin's own argument names. A
+            ``None`` value — "restore the default" — passes and is dropped.
+
+    Returns:
+        The settings, coerced to integers.
+
+    Raises:
+        ProjectError: On an unknown attribute, one the tracker does not take,
+            or a value that is not an integer in range.
+    """
+    accepted = constructor_parameters(tracker_name)
+    for key in options:
+        if setting_for(key) is None:
+            raise ProjectError(f"{key!r} is not a settable tracker option")
+        if key not in accepted:
+            raise ProjectError(f"tracker {tracker_name!r} has no {key!r} setting")
+    return _validate(options)
+
+
 def save_point_options(project_dir: Path, point_id: str, options: dict[str, Any]) -> dict[str, Any]:
     """Merge ``options`` into one point's settings and persist them.
 
@@ -450,7 +481,8 @@ factor turning each into a *radius*.
 
 Every classic-CV tracker in this project matches a small neighbourhood of the
 point, but they do not agree on what to call it — ``template_radius`` (template,
-kalman, particle), ``patch_radius`` (correlation), ``window_radius`` (meanshift)
+kalman, particle, and the target box of ocean and siamdw), ``patch_radius``
+(correlation), ``window_radius`` (meanshift)
 or ``win_size`` (lk, klt, which state a full side length, hence the 0.5). Rather
 than teach the panel about each plugin, the effective radius is read from
 whichever of these the plugin declares, in this order. A tracker declaring none
@@ -592,8 +624,8 @@ def tracker_search(
     The Resolve-style "search area", answered honestly per algorithm rather than
     invented for the ones that do not have one:
 
-    * an explicit ``search_radius`` (``template``, ``kalman``) is reported as
-      it is stored — the box really is scanned;
+    * an explicit ``search_radius`` (``template``, ``kalman``, ``ocean``,
+      ``siamdw``) is reported as it is stored — the box really is scanned;
     * optical flow (``lk``, ``klt``) has no box. Its reach is the window carried
       up the pyramid, ``win_size / 2 * 2 ** max_level``, so that is what is
       reported, attributed to ``max_level``;

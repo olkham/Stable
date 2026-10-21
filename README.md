@@ -41,6 +41,19 @@ stable sample          # writes ./stable-sample/{clip.mp4, tracks.json, curves.c
 no GPU, no model download, nothing to configure — so there is something
 concrete to look at within seconds of installing.
 
+`stable serve` listens on this machine only. To open it from another computer
+on your network, run `stable serve --host 0.0.0.0` (or set
+`STABLE_HOST=0.0.0.0` to make that the default) — Stable has no login, so do
+that only on a network you trust.
+
+A track starts from its tracker. **New track** (or `N` / `B`) opens a card:
+choose the tracker, and the card shows what that tracker can be started from
+and its settings — a point with a pattern size and search area for most, a box
+for the ones built to follow objects — while the viewer previews the pattern
+and search boxes under the cursor. Then mark the video the way the tracker
+wants: a click for a point, a dragged rectangle for a box. The card remembers
+your last tracker and its settings for the next track.
+
 Everything a track does hangs off its **anchors**. An anchor says "on this
 frame, this feature is *here*"; you can place one on any frame, track forwards
 or backwards from it with the `◀` / `▶` beside it on the track's card, and
@@ -52,10 +65,11 @@ selected track's anchors, `A` anchors it where it is on this frame (`⇧A` to
 click the position instead), `I`/`O` set the working range, `+`/`-`/`0` and the
 wheel zoom, middle-drag pans. Correcting a track needs no mode: select it and
 click or drag on the frame (`Ctrl+Z` undoes).
-Each point's **pattern** and **search** sizes are per point, set on the sliders
-beside its patch thumbnails and drawn on the frame as a solid and a dashed box,
-so a feature bigger than the tracker's default window is a slider away rather
-than a reason the track fails.
+Each point's **pattern** and **search** sizes are per point, chosen on the new
+track's card before it is placed and adjustable afterwards on the sliders
+beside its patch thumbnails; both are drawn on the frame as a solid and a dashed
+box, so a feature bigger than the tracker's default window is a slider away
+rather than a reason the track fails.
 
 ## Install
 
@@ -90,9 +104,30 @@ route and troubleshooting. On headless Linux, see the CUDA `Dockerfile` at the
 repo root instead.
 
 `raft` works as soon as PyTorch is in place (its model ships inside
-torchvision). CoTracker3 and TAPIR also need their model *code*, which is not
-ours to vendor — `stable trackers` prints the exact command for whichever is
-missing:
+torchvision), and so do `ocean` and `siamdw`, the two Siamese trackers from
+[TracKit](https://github.com/researchmm/TracKit): their network code is MIT and
+ships with Stable, and their checkpoints download on first use. They are the
+ones to reach for when the feature gets covered — measured on footage with an
+occluder sweeping across the point, `siamdw` came back to it every time and
+`lk` never did — while `lk` stays the more precise on clean, unoccluded motion.
+
+Both were built to follow an *object* from the box a detector draws around it,
+so they can also track **boxes**: choose one for a new track (it arms the box
+tool, `B`) and drag a rectangle around something, and the track follows the
+box's centre — which is
+what the solver, smoothing and export see, as for any track — and its changing
+size. Resize an anchor's box by its corners; draw a new box on a later frame
+(the ◆ tool) where the object has turned or deformed, and the runs merge like
+any other anchors. Exports gain `w`/`h` columns. Ocean regresses each side, so
+its box follows changes of shape: on composited clips of a face, a logo and a
+blob texture zooming, shrinking and stretching to nearly three times their
+aspect, its box overlapped the truth by a mean IoU of 0.92, and recovered after
+an occluder crossed it on 11 of 12 clips. SiamDW searches scales, not shapes,
+so its box keeps the aspect it was drawn with (mean IoU 0.68 on the same clips,
+lost on all three that stretched) — use it for objects that only move and
+scale.
+CoTracker3 and TAPIR also need their model *code*, which is not ours to vendor
+— `stable trackers` prints the exact command for whichever is missing:
 
 ```bash
 pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"          # tapir
@@ -118,6 +153,12 @@ not bugs:
   checkbox, `--accept-noncommercial`, or `STABLE_ACCEPT_NONCOMMERCIAL=1`.
   TAPIR/BootsTAP's weights are Apache-2.0 and need no licence opt-in, just
   the unpinned one above.
+- **Ocean's and SiamDW's checkpoints** (`ocean_offline`, 104 MB;
+  `siamdw_res22w`, 10 MB) are pinned and MIT, so they download with no opt-in
+  at all. Both come from the authors' SOTS model folder, which TracKit's own
+  README now points to; SiamDW's is tensor-for-tensor the one the MIT-licensed
+  SiamDW release links, while the SOTS repository hosting Ocean's has no licence
+  file of its own — CONTRIBUTING.md "Pinning a checkpoint" has the details.
 
 In the browser, click **Models** (top-right in a project, or from the
 project list) to see every checkpoint's cache/licence state and download or
@@ -127,6 +168,7 @@ delete it, with live progress. Headlessly:
 stable models                                              # list, with cache/pin/licence state
 stable models download bootstapir                          # Apache-2.0, no opt-in needed
 stable models download cotracker3_offline --accept-noncommercial
+stable models download siamdw_res22w                        # MIT, pinned: no opt-in
 stable models remove bootstapir                             # free the disk space back
 ```
 
@@ -148,6 +190,10 @@ stable track clip.mp4 --point 120.5,80@0 --point 640,360@0 \
 # rather than ignoring the flag)
 stable track clip.mp4 --point 120.5,80@0 --tracker template \
     --window 24 --search 48 --out tracks.json
+
+# ...or follow an object from a box, given as left,top,width,height@frame the
+# way a detector reports it (Ocean and SiamDW; the output adds each frame's size)
+stable track clip.mp4 --box 300,200,120,90@0 --tracker ocean --out tracks.json
 
 # 2. export the solved X/Y/R/S curves
 stable solve tracks.json --out curves.csv --video clip.mp4
@@ -233,7 +279,11 @@ trackers' model code) — the frontend is already built into the package
 | `stable.trackers.dummy` | A deterministic tracker so everything is testable |
 | `stable.trackers.lk` | Pyramidal Lucas-Kanade with forward-backward confidence |
 | `stable.trackers.template` | NCC template matching with adaptive template update |
-| `stable.trackers.deep` | Chunked inference, GPU→CPU fallback, the model backend seam |
+| `stable.trackers.deep` | The model lifecycle (device, weights, GPU→CPU fallback); chunked inference and its backend seam |
+| `stable.trackers.siamese` | Siamese trackers as point trackers: a fixed anchor template, the point riding on the network's own reading |
+| `stable.trackers.siamese_nets` | The Ocean and SiamDW networks, ported from TracKit to plain PyTorch |
+| `stable.trackers.ocean` | Ocean (TracKit): anchor-free box regression — accurate on object-like features |
+| `stable.trackers.siamdw` | SiamDW (TracKit): CIResNet-22W SiamFC — tracks through occlusion and says so |
 | `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
 | `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
 | `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |

@@ -163,12 +163,18 @@ def export_tracks(
             continue
         for frame in range(track.n_frames):
             x, y = track.points[frame]
+            # The box is empty for a point track and for any frame without one,
+            # but the columns are always there: a fixed schema is what lets a
+            # script read both kinds of project the same way.
+            size = track.size_at(frame)
             rows.append(
                 {
                     "point_id": point.id,
                     "frame": frame,
                     "x": None if math.isnan(x) else float(x),
                     "y": None if math.isnan(y) else float(y),
+                    "w": None if size is None else float(size[0]),
+                    "h": None if size is None else float(size[1]),
                     "confidence": float(track.confidence[frame]),
                     "visible": bool(track.visible[frame]),
                 }
@@ -179,7 +185,7 @@ def export_tracks(
         return Response(content=body, media_type="application/json")
 
     buffer = io.StringIO()
-    fieldnames = ["point_id", "frame", "x", "y", "confidence", "visible"]
+    fieldnames = ["point_id", "frame", "x", "y", "w", "h", "confidence", "visible"]
     writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(rows)

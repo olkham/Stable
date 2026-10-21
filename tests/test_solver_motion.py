@@ -171,6 +171,21 @@ def test_one_point_degrades_to_translation_and_is_flagged():
     assert solve.transform_at(7).tx == pytest.approx(moved[0] - 100.0, abs=TOL)
 
 
+def test_one_point_is_a_full_solve_when_only_x_and_y_were_asked_for():
+    """Rotation and scale switched off: nothing requested is missing, nothing flagged.
+
+    Flagging every frame of such a solve is what hid the frames that really
+    were not measured — the interpolated ones — among the ones that were.
+    """
+    transforms = handheld_transforms(20, pivot=PIVOT)
+    tracks = tracks_from(transforms, [(100.0, 90.0)])
+    channels = {"x": True, "y": True, "r": False, "s": False}
+    solve = solve_motion(tracks, frame_size=(320, 240), config=SolveConfig(channels=channels))
+
+    assert (solve.status == int(SolveStatus.SOLVED)).all()
+    assert not solve.flagged.any()
+
+
 def test_a_hole_in_the_middle_is_interpolated_and_flagged(known_motion):
     """Frames with nothing usable are filled from their solved neighbours."""
     _, tracks = known_motion

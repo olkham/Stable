@@ -48,6 +48,16 @@ Frames covered by a single run pass through untouched, and anchor frames are
 overwritten with the user's ground truth afterwards, so neither is subject to
 the blend at all.
 
+Box tracks
+----------
+When runs carry per-frame box sizes (or an anchor states a box) the merged track
+carries sizes too: a single-run frame passes its size through, an overlapped
+frame takes the same ``share`` weights restricted to the runs whose size is
+finite there (renormalised; ``NaN`` if none), and a box anchor's ``(w, h)`` is a
+hard constraint exactly like its position. Disagreement and the agreement guard
+stay position-only: the centre is what the operator sees drift. Point tracks
+carry no sizes and merge exactly as before.
+
 Runs that cross an anchor
 -------------------------
 :func:`plan_anchor_runs` never plans a run *through* an anchor — each span is
@@ -426,19 +436,30 @@ def enforce_anchor_agreement(
     trimmed_points[cut] = np.nan
     trimmed_conf[cut] = 0.0
     trimmed_visible[cut] = False
+    trimmed_sizes = None
+    if track.sizes is not None:
+        trimmed_sizes = np.array(track.sizes, dtype=np.float32, copy=True)
+        trimmed_sizes[cut] = np.nan
     return (
-        PointTrack(points=trimmed_points, confidence=trimmed_conf, visible=trimmed_visible),
+        PointTrack(
+            points=trimmed_points,
+            confidence=trimmed_conf,
+            visible=trimmed_visible,
+            sizes=trimmed_sizes,
+        ),
         violations,
     )
 
 
 def _gather(
     runs: list[TrackRun], n_frames: int, min_confidence: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     """Stack run arrays and mask out samples that are missing or too weak.
 
     Returns:
-        ``(positions [R, T, 2], confidence [R, T], visible [R, T], usable [R, T])``.
+        ``(positions [R, T, 2], confidence [R, T], visible [R, T], usable [R, T],
+        sizes [R, T, 2] or None)``. ``sizes`` has ``NaN`` rows for runs without
+        sizes and is ``None`` when no run has any.
     """
     positions = np.stack([r.track.points.astype(np.float64) for r in runs])
     confidence = np.stack([r.track.confidence.astype(np.float64) for r in runs])
@@ -447,7 +468,13 @@ def _gather(
     usable: np.ndarray = np.asarray(np.isfinite(positions).all(axis=2), dtype=bool)
     if min_confidence > 0.0:
         usable = np.asarray(usable & (confidence >= min_confidence), dtype=bool)
-    return positions, confidence, visible, usable
+    sizes = None
+    if any(r.track.sizes is not None for r in runs):
+        nan_rows = np.full((n_frames, 2), np.nan, dtype=np.float64)
+        sizes = np.stack(
+            [nan_rows if r.track.sizes is None else r.track.sizes.astype(np.float64) for r in runs]
+        )
+    return positions, confidence, visible, usable, sizes
 
 
 def _falloff(
@@ -540,12 +567,17 @@ def merge_anchor_runs(
     merged_points = np.full((n_frames, 2), np.nan, dtype=np.float64)
     merged_conf = np.zeros(n_frames, dtype=np.float64)
     merged_visible = np.zeros(n_frames, dtype=bool)
+    # Box tracks only: allocated once a run or an anchor brings a size.
+    has_sizes = any(r.track.sizes is not None for r in runs) or any(a.has_box for a in anchors)
+    merged_sizes = np.full((n_frames, 2), np.nan, dtype=np.float64) if has_sizes else None
 
     # Anchor frames are overwritten at the end with the user's ground truth
     # whatever the runs say, so runs meeting on an anchor (a point's own forward
     # and backward runs always do) is never a conflict.
     if runs:
-        positions, confidence, visible, usable = _gather(runs, n_frames, config.min_confidence)
+        positions, confidence, visible, usable, sizes = _gather(
+            runs, n_frames, config.min_confidence
+        )
         contributions = usable.sum(axis=0).astype(np.int32)
         disagreement = _disagreement(positions, usable)
 
@@ -558,6 +590,8 @@ def merge_anchor_runs(
             merged_points[frames] = positions[which[frames], frames]
             merged_conf[frames] = confidence[which[frames], frames]
             merged_visible[frames] = visible[which[frames], frames]
+            if merged_sizes is not None and sizes is not None:
+                merged_sizes[frames] = sizes[which[frames], frames]
 
         overlapped = np.where(contributions > 1)[0]
         if overlapped.size:
@@ -586,6 +620,18 @@ def merge_anchor_runs(
             merged_conf[overlapped] = np.clip(blended_conf * penalty, 0.0, 1.0)
             clean_visible = np.where(live, visible[:, overlapped], False).astype(np.float64)
             merged_visible[overlapped] = np.einsum("rf,rf->f", share, clean_visible) >= 0.5
+
+            if merged_sizes is not None and sizes is not None:
+                run_sizes = sizes[:, overlapped, :]
+                sized = live & np.isfinite(run_sizes).all(axis=2)
+                size_weights = np.where(sized, columns, 0.0)
+                size_total = size_weights.sum(axis=0)
+                known = size_total > 0.0
+                size_share = size_weights / np.where(known, size_total, 1.0)
+                blended_sizes = np.einsum(
+                    "rf,rfc->fc", size_share, np.where(sized[:, :, None], run_sizes, 0.0)
+                )
+                merged_sizes[overlapped] = np.where(known[:, None], blended_sizes, np.nan)
     else:
         contributions = np.zeros(n_frames, dtype=np.int32)
         disagreement = np.full(n_frames, np.nan)
@@ -595,11 +641,18 @@ def merge_anchor_runs(
         merged_points[anchor.frame] = (anchor.x, anchor.y)
         merged_conf[anchor.frame] = config.anchor_confidence
         merged_visible[anchor.frame] = True
+        if merged_sizes is not None and anchor.size is not None:
+            merged_sizes[anchor.frame] = anchor.size
 
     contributions.setflags(write=False)
     disagreement.setflags(write=False)
     return MergeResult(
-        track=PointTrack(points=merged_points, confidence=merged_conf, visible=merged_visible),
+        track=PointTrack(
+            points=merged_points,
+            confidence=merged_conf,
+            visible=merged_visible,
+            sizes=merged_sizes,
+        ),
         report=MergeReport(
             contributions=contributions,
             disagreement=disagreement,

@@ -26,6 +26,8 @@ import math
 import pytest
 from fastapi.testclient import TestClient
 
+from stable.server.frames import frame_geometry, geometry_context
+
 from ._helpers import seed_tracks, upload_clip, wait_job
 
 FRAMES_WS = "/ws/projects/{}/frames"
@@ -255,3 +257,95 @@ def test_prefetch_is_served_and_carries_no_geometry(client, streamable):
     assert header["frame"] == 9
     assert "geometry" not in header
     assert payload == client.get(f"/api/projects/{project_id}/frames/9").content
+
+
+# -- per frame, only per-frame work (REVIEW.md P1, R3) ----------------------------
+
+
+def _hold(client: TestClient, project_id: str, *marks: dict) -> None:
+    response = client.put(
+        f"/api/projects/{project_id}/render/options", json={"target": {"points": list(marks)}}
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_the_geometry_context_is_built_once_and_reused_until_an_input_changes(
+    client, workspace, streamable
+):
+    """The export tab asks for geometry on every frame it draws.
+
+    Everything except the frame's own rows is the same for all of them, so it
+    is built once and handed back unchanged — and rebuilt the moment any file
+    it came from changes, or the preview would describe settings that are gone.
+    """
+    project_id = streamable
+    first = geometry_context(workspace, project_id)
+    assert first is not None
+    assert geometry_context(workspace, project_id) is first
+
+    _hold(client, project_id, {"id": "t1", "point_ids": ["p1"], "place": {"u": 0.5, "v": 0.5}})
+    second = geometry_context(workspace, project_id)
+    assert second is not first
+    assert second.revision != first.revision
+    assert second.targets is not None
+    assert geometry_context(workspace, project_id) is second
+
+
+def test_cached_geometry_is_the_geometry_computed_from_scratch(client, workspace, streamable):
+    """The cache changes what is computed per frame, never what comes out.
+
+    One raw mark and one smoothed mark, the costly kind: a smoothed path is
+    every frame of the track pushed through the smoothing's warp.
+    """
+    project_id = streamable
+    _hold(
+        client,
+        project_id,
+        {"id": "t1", "point_ids": ["p1"], "place": {"u": 0.4, "v": 0.4}},
+        {"id": "t2", "point_ids": ["p2"], "source": "smoothed", "place": {"u": 0.6, "v": 0.6}},
+    )
+    context = geometry_context(workspace, project_id)
+    assert context is not None and context.targets is not None
+    for frame in (0, 7, 20):
+        cached = frame_geometry(
+            context.project,
+            context.plan,
+            context.options,
+            frame,
+            context.motion,
+            targets=context.targets,
+        )
+        fresh = frame_geometry(
+            context.project, context.plan, context.options, frame, context.motion
+        )
+        assert cached == fresh
+        assert all(row["landed"] is not None for row in cached["targets"])
+
+
+def test_a_change_to_what_a_target_holds_reaches_the_preview(client, streamable):
+    """A target holds the *current* tracks, so changing them changes the plan.
+
+    The interactive edits (corrections, undo, anchors) clear the plan cache
+    themselves, but nothing else that rewrites the project did — a finished
+    track or retrack job, a point taken out of the solve, a derived or deleted
+    point. After one of those the preview kept the old fit while reporting
+    against the new tracks, and the export, which plans afresh, did something
+    else again. The plan is now keyed on the project file, so every writer
+    counts.
+    """
+    project_id = streamable
+    # Held: the mean of every solve-enabled track, the default kind of target.
+    _hold(client, project_id, {"id": "t1", "point_ids": [], "place": {"u": 0.5, "v": 0.5}})
+    before = client.get(f"/api/projects/{project_id}/export/preview?frame=10").json()
+    assert before["targets"][0]["residual"] < 0.5  # one mark is held exactly
+
+    dropped = client.patch(
+        f"/api/projects/{project_id}/points/p1", json={"enabled_for_solve": False}
+    )
+    assert dropped.status_code == 200, dropped.text
+
+    after = client.get(f"/api/projects/{project_id}/export/preview?frame=10").json()
+    # Still held exactly, which is only true if the plan was fitted to the mean
+    # of the five tracks now held, not the six it was first fitted to.
+    assert after["targets"][0]["residual"] < 0.5
+    assert after["output_warp"] != before["output_warp"]

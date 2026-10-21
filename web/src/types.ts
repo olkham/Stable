@@ -17,6 +17,9 @@ export interface Query {
   frame: number;
   x: number;
   y: number;
+  /** Box size in source pixels; only on a box track's anchors (x, y is then the centre). */
+  w?: number;
+  h?: number;
 }
 
 export interface VideoRef {
@@ -55,6 +58,8 @@ export interface PointSummary {
   /** This point's own anchors. See `Query` for why the field is not `anchors`. */
   queries: Query[];
   tracker: string;
+  /** True for a track drawn as a bounding box: x, y is the box centre, with a per-frame size. */
+  box: boolean;
   enabled_for_solve: boolean;
   /**
    * The colour this track is drawn in, or null for the palette's answer.
@@ -168,6 +173,10 @@ export interface TrackData {
   n_frames: number;
   x: (number | null)[];
   y: (number | null)[];
+  /** Box tracks only: per-frame box size (null where unknown). Both null for a point track. */
+  box: boolean;
+  w: (number | null)[] | null;
+  h: (number | null)[] | null;
   confidence: number[];
   visible: boolean[];
   disagreement: (number | null)[];
@@ -466,6 +475,30 @@ export interface TrackerInfo {
    * indistinguishable from "broken".
    */
   unavailable_reason: string | null;
+  /** Whether this tracker is initialised from a bounding box (so a box can be drawn for it). */
+  tracks_boxes: boolean;
+  /** What a track can be started from, preferred first (`"box"` before `"point"` for the box trackers). */
+  inputs: TrackInput[];
+}
+
+/** How a track is marked on the frame: a click, or a dragged bounding box. */
+export type TrackInput = "point" | "box";
+
+/**
+ * `GET /api/trackers/{name}/settings` — a tracker's settings *before any track
+ * exists*, for candidate option values. The rows have the `PointPatches` shape,
+ * with `stored` meaning "this attribute was passed", so the new-track card
+ * draws the same controls the patch panel does and the canvas can show the
+ * window on the footage before the first click.
+ */
+export interface TrackerSettingsPreview {
+  tracker: string;
+  inputs: TrackInput[];
+  settings: TrackerSetting[];
+  /** The pattern region in source pixels from the point. */
+  window: { radius: number; attribute: string | null };
+  /** The search region; `radius` is null where there is none, and `note` says why. */
+  search: { radius: number | null; attribute: string | null; note: string };
 }
 
 export interface DeviceInfo {

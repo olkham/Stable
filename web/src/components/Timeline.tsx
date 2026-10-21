@@ -1,10 +1,14 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { fitCanvas } from "../canvas";
 import { confidenceColor } from "../colors";
 import { PLAYBACK_RATES, TARGET_PLAYBACK_FPS } from "../playback";
 import { useProjectContext } from "../state/ProjectContext";
 
 /** Colour of an anchor no tracking run could actually reach (todos 13, 15). */
 const FLAGGED_ANCHOR_COLOR = "#ff3b30";
+
+/** Height of the strip, in CSS pixels. */
+const STRIP_HEIGHT = 28;
 
 /**
  * Transport controls + scrub bar + per-point anchor marks + confidence
@@ -125,28 +129,57 @@ export function Timeline() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlaying, project.video.fps, playbackRate, playFrom, playTo]);
 
+  // The strip's width in CSS pixels, from the box it sits in, so a resized
+  // window or a panel opening redraws it rather than stretching the old one.
+  const [width, setWidth] = useState(0);
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const width = canvas.clientWidth || 800;
-    const height = 28;
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, width, height);
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const observer = new ResizeObserver(() => setWidth(wrap.clientWidth));
+    observer.observe(wrap);
+    setWidth(wrap.clientWidth);
+    return () => observer.disconnect();
+  }, []);
 
-    // Heat-strip: one column per frame, coloured by confidence (grey if untracked).
-    for (let f = 0; f < frames; f++) {
-      const x0 = Math.floor((f / frames) * width);
-      const x1 = Math.max(x0 + 1, Math.floor(((f + 1) / frames) * width));
+  /**
+   * Everything on the strip except the playhead, drawn off-screen.
+   *
+   * None of it depends on the playhead, and the playhead moves on every frame
+   * of playback — redrawing the whole clip for each of those used to cost a
+   * `fillRect` and a colour string *per frame of the footage*, every frame
+   * (REVIEW.md P3). Now it is drawn when what it shows changes, and a frame
+   * of playback is one copy of it plus a line.
+   */
+  const strip = useMemo<{ layer: HTMLCanvasElement; dpr: number } | null>(() => {
+    if (width <= 0) return null;
+    const dpr = window.devicePixelRatio || 1;
+    const layer = document.createElement("canvas");
+    fitCanvas(layer, width, STRIP_HEIGHT, dpr);
+    const ctx = layer.getContext("2d");
+    if (!ctx) return null;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const height = STRIP_HEIGHT;
+
+    // Heat strip, one pixel column at a time, grey where nothing is tracked.
+    // On a clip longer than the strip is wide a column covers several frames,
+    // and it takes the colour of the *worst* of them: the strip exists to show
+    // where confidence dips, and a column that showed whichever of its frames
+    // happened to be drawn last could hide a dip of a few frames entirely.
+    const columns = Math.ceil(width);
+    for (let px = 0; px < columns; px++) {
       let color = "#333";
       if (selectedTrack) {
-        const valid = selectedTrack.x[f] != null;
-        if (valid) color = confidenceColor(selectedTrack.confidence[f]);
+        const from = Math.min(frames - 1, Math.floor((px / width) * frames));
+        const to = Math.min(frames, Math.max(from + 1, Math.floor(((px + 1) / width) * frames)));
+        let worst = Infinity;
+        for (let f = from; f < to; f++) {
+          if (selectedTrack.x[f] == null) continue;
+          worst = Math.min(worst, selectedTrack.confidence[f]);
+        }
+        if (worst !== Infinity) color = confidenceColor(worst);
       }
       ctx.fillStyle = color;
-      ctx.fillRect(x0, 0, x1 - x0, height);
+      ctx.fillRect(px, 0, 1, height);
     }
 
     // Correction markers for the selected point, along the top edge: a bar for
@@ -226,20 +259,12 @@ export function Timeline() {
       ctx.stroke();
       ctx.restore();
     }
-
-    // Playhead.
-    const px = (currentFrame / frames) * width;
-    ctx.strokeStyle = "#fff";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(px, 0);
-    ctx.lineTo(px, height);
-    ctx.stroke();
+    return { layer, dpr };
   }, [
+    width,
     project.points,
     selectedTrack,
     selectedPointId,
-    currentFrame,
     frames,
     flagged,
     anchorFrames,
@@ -247,6 +272,28 @@ export function Timeline() {
     clipRange,
     colorFor,
   ]);
+
+  // Per frame: the strip as drawn above, and the playhead over it.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !strip) return;
+    const { layer, dpr } = strip;
+    fitCanvas(canvas, width, STRIP_HEIGHT, dpr);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(layer, 0, 0);
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const px = (currentFrame / frames) * width;
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, STRIP_HEIGHT);
+    ctx.stroke();
+  }, [strip, currentFrame, frames, width]);
 
   function seekFromEvent(evt: React.MouseEvent<HTMLDivElement>) {
     const wrap = wrapRef.current;
@@ -358,7 +405,7 @@ export function Timeline() {
           window.addEventListener("mouseup", up);
         }}
       >
-        <canvas ref={canvasRef} />
+        <canvas ref={canvasRef} style={{ height: STRIP_HEIGHT }} />
       </div>
     </div>
   );

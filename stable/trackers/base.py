@@ -17,6 +17,10 @@ Contract rules a plugin must honour
 #. ``track`` performs **one run** — a single pass from the given queries. It
    never merges multiple anchors; :mod:`stable.trackers.merge` does that,
    tracker-agnostically.
+#. A plugin that sets ``tracks_boxes`` starts from the anchor's box
+   (``Query.w``/``Query.h``, ``Query.position`` being its centre) and reports
+   ``TrackResult.sizes``. One that does not ignores the box, tracks the centre
+   and returns no sizes; the merge layer copes with either.
 #. ``progress`` is called with a fraction in ``[0, 1]`` often enough for a UI
    progress bar, and the plugin must tolerate it being a no-op.
 """
@@ -76,12 +80,17 @@ class TrackerPlugin(ABC):
         license: SPDX-ish licence of the plugin **and its weights**. Non-commercial
             models (e.g. CoTracker's ``CC-BY-NC-4.0``) must say so here; the UI
             surfaces it and never bundles such weights.
+        tracks_boxes: True if the plugin starts from an anchor's box
+            (``Query.w``/``Query.h``) and reports ``TrackResult.sizes``. A plugin
+            that does not ignores the box and tracks the centre
+            (``Query.position``), returning no sizes.
     """
 
     name: str = ""
     display_name: str = ""
     requires_gpu: bool = False
     license: str = "MIT"
+    tracks_boxes: bool = False
 
     def __init__(self) -> None:
         """Create an unprepared plugin instance (no weights loaded yet)."""

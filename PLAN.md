@@ -204,3 +204,4 @@ Model download manager UI; `stable serve` one-command launch that opens the brow
 - Each phase = one subagent run. Prompt: "Read PLAN.md. Implement Phase N. Respect the Stack/Architecture/Data-model sections as fixed decisions. Meet the acceptance criteria; write tests proving them."
 - If a phase agent wants to change a contract, it must update PLAN.md in the same PR and say why.
 - Keep test media tiny (bundle one 5 s 720p clip); never commit model weights.
+- Everything after Phase 6 — the ten feedback rounds, what each changed, what is still open, and the latest full review with its prioritised fix list — is in `REVIEW.md`.

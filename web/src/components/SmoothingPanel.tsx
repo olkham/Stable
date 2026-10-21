@@ -2,6 +2,7 @@ import { useCallback, useMemo } from "react";
 import { CHANNEL_COLOR, CHANNEL_LABEL } from "../colors";
 import { useFilterCatalogue } from "../hooks/useFilterCatalogue";
 import { isActive, joinSpecs, splitSpecs, type SmoothingModel } from "../smoothing";
+import { unmeasuredRuns } from "../solveStatus";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Channel } from "../types";
 import { CHANNELS } from "../types";
@@ -34,14 +35,32 @@ import { CHANNELS } from "../types";
  * one that is missing a feature.
  */
 export function SmoothingPanel() {
-  const { project, currentFrame, setCurrentFrame, smoothing, smoothingError, commitSmoothing } =
-    useProjectContext();
+  const {
+    project,
+    currentFrame,
+    setCurrentFrame,
+    smoothing,
+    smoothingError,
+    commitSmoothing,
+    clipRange,
+  } = useProjectContext();
 
   const catalogue = useFilterCatalogue();
   const solving = project.points.filter((point) => point.enabled_for_solve && point.has_track);
 
   const raw = smoothing?.curves.raw ?? null;
   const smoothed = smoothing?.curves.smoothed ?? null;
+  const unmeasured = useMemo(() => unmeasuredRuns(raw?.status), [raw]);
+  // Counted inside the In/Out range only: past it nothing was meant to be
+  // tracked, so those frames are shaded but are not something to go and fix.
+  const unmeasuredFrames = useMemo(() => {
+    const first = clipRange?.in ?? 0;
+    const last = (clipRange?.out ?? Number.POSITIVE_INFINITY) - 1;
+    return unmeasured.reduce(
+      (sum, [from, to]) => sum + Math.max(0, Math.min(to, last) - Math.max(from, first) + 1),
+      0,
+    );
+  }, [unmeasured, clipRange]);
   const model = useMemo(
     () => (smoothing ? splitSpecs(smoothing.filters) : null),
     [smoothing],
@@ -102,6 +121,16 @@ export function SmoothingPanel() {
         — not any one track's path. To smooth a single track's own trajectory, open its card on
         the Tracks tab and use <em>Edits → Smooth path</em>.
       </p>
+      {unmeasuredFrames > 0 && (
+        // The disagreement this explains: a curve held flat here while the
+        // stabilised trail on the canvas still moves on these frames.
+        <p className="modal__hint smoothing-panel__unmeasured">
+          <strong>{unmeasuredFrames}</strong> frame{unmeasuredFrames === 1 ? "" : "s"} in the
+          working range (shaded red) had no usable track — no position, or confidence too low — so the solve filled in the
+          camera there. Smoothing cannot hold a feature on frames it never measured: anchor or
+          re-track those stretches until the track is confident there, then solve again.
+        </p>
+      )}
       {!raw && <p className="panel__empty">Run solve first to preview smoothing.</p>}
 
       {CHANNELS.map((channel) => {
@@ -199,6 +228,7 @@ export function SmoothingPanel() {
             {raw && (
               <CurvePreview
                 raw={raw[channel]}
+                unmeasured={unmeasured}
                 smoothed={smoothed ? smoothed[channel] : undefined}
                 color={CHANNEL_COLOR[channel]}
                 cursor={currentFrame}
@@ -215,12 +245,15 @@ export function SmoothingPanel() {
 /** A small raw-vs-smoothed sparkline for one channel. */
 function CurvePreview({
   raw,
+  unmeasured,
   smoothed,
   color,
   cursor,
   onSeek,
 }: {
   raw: number[];
+  /** Frame runs the solve filled in rather than measured, shaded behind the curves. */
+  unmeasured: [number, number][];
   smoothed: number[] | undefined;
   color: string;
   cursor: number;
@@ -274,6 +307,20 @@ function CurvePreview({
       preserveAspectRatio="none"
       onMouseDown={handleMouseDown}
     >
+      {unmeasured.map(([first, last]) => {
+        const x0 = ((first - 0.5) / (raw.length - 1)) * width;
+        const x1 = ((last + 0.5) / (raw.length - 1)) * width;
+        return (
+          <rect
+            key={first}
+            x={x0}
+            y={0}
+            width={Math.max(x1 - x0, 1)}
+            height={height}
+            fill="rgba(214, 69, 69, 0.22)"
+          />
+        );
+      })}
       <polyline
         points={toPoints(raw)}
         fill="none"

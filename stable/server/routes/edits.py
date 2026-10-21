@@ -21,6 +21,7 @@ Endpoints, all under ``/projects/{project_id}``:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -40,7 +41,12 @@ from ..jobs import JobManager, get_job_manager
 from ..schemas import CorrectionIn, CorrectionUpdate, RetrackRequest
 from ..serialize import point_summary
 from ..storage import Workspace, get_workspace
-from ..tracking import load_display_track, retrack_resolver, run_point_retrack
+from ..tracking import (
+    load_display_track,
+    resolve_box_size,
+    retrack_resolver,
+    run_point_retrack,
+)
 
 __all__ = ["router", "history_for"]
 
@@ -140,6 +146,9 @@ def _promotion_for(
     neighbours, and the frame the operator actually pointed at is pinned
     exactly, before and after any re-track.
 
+    On a box track the companion carries the track's box at that frame, so the
+    promoted anchor is a box like the others and a re-track keeps following it.
+
     Returns:
         The companion correction to append, or ``None`` when the edit states no
         position (``gap_fill``, ``delete_range``) or the track has no sample at
@@ -156,7 +165,18 @@ def _promotion_for(
     )
     if position is None:
         return None
-    return ReplaceCorrection(frame=correction.frame, x=position[0], y=position[1])
+    size = None
+    if point.is_box:
+        size = edited.size_at(correction.frame) or resolve_box_size(
+            project, point, correction.frame
+        )
+    return ReplaceCorrection(
+        frame=correction.frame,
+        x=position[0],
+        y=position[1],
+        w=None if size is None else size[0],
+        h=None if size is None else size[1],
+    )
 
 
 @router.post("/points/{point_id}/corrections")
@@ -195,8 +215,15 @@ def add_correction(
         )
 
     def _mutate(project: Project, point: PointSpec) -> None:
-        promoted = _promotion_for(project, point, correction)
-        appended = [correction] if promoted is None else [correction, promoted]
+        stated = correction
+        if isinstance(stated, ReplaceCorrection) and point.is_box and stated.w is None:
+            # A replace states a position; on a box track the box has to come
+            # with it or the anchor it promotes to would be a bare point.
+            size = resolve_box_size(project, point, stated.frame)
+            if size is not None:
+                stated = replace(stated, w=size[0], h=size[1])
+        promoted = _promotion_for(project, point, stated)
+        appended = [stated] if promoted is None else [stated, promoted]
         point.corrections = [*point.corrections, *appended]
 
     return _edit(

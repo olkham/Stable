@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CHANNEL_COLOR, CHANNEL_LABEL } from "../colors";
 import { joinSpecs, splitSpecs, type ChannelConfig, type SmoothingModel } from "../smoothing";
+import { unmeasuredRuns } from "../solveStatus";
 import { useProjectContext } from "../state/ProjectContext";
 import type { Channel, SmoothedCurves } from "../types";
 import { CHANNELS } from "../types";
 
 const LANE_HEIGHT = 84;
+/** Shade behind frames the solve filled in rather than measured. */
+const UNMEASURED_FILL = "rgba(214, 69, 69, 0.16)";
 const LANE_GAP = 8;
 const RULER_HEIGHT = 18;
 const PAD_LEFT = 46;
@@ -114,6 +117,8 @@ export function CurveEditor() {
       ctx.fillText(String(frame), x + 2, 10);
     }
 
+    const unmeasured = unmeasuredRuns(raw.status);
+
     lanes.forEach((channel, index) => {
       const top = RULER_HEIGHT + index * (LANE_HEIGHT + LANE_GAP);
       const bottom = top + LANE_HEIGHT;
@@ -145,6 +150,17 @@ export function CurveEditor() {
       min -= pad;
       max += pad;
       const toY = (value: number) => bottom - ((value - min) / (max - min)) * LANE_HEIGHT;
+
+      // Frames the solve filled in because no track was usable there. The
+      // curves are interpolated across them, so a curve held flat here does
+      // not hold the feature: it was never measured (see solveStatus.ts).
+      ctx.fillStyle = UNMEASURED_FILL;
+      for (const [first, last] of unmeasured) {
+        if (last < from || first > to) continue;
+        const x0 = toX(first - 0.5);
+        const x1 = toX(last + 0.5);
+        ctx.fillRect(x0, top, Math.max(x1 - x0, 1), LANE_HEIGHT);
+      }
 
       // The sub-range this channel's smoothing is restricted to.
       if (config?.range) {
@@ -428,6 +444,7 @@ export function CurveEditor() {
         <span className="curve-editor__key curve-editor__key--raw" /> raw solve
         <span className="curve-editor__key curve-editor__key--ghost" /> previous smoothing
         <span className="curve-editor__key curve-editor__key--now" /> current smoothing
+        <span className="curve-editor__key curve-editor__key--unmeasured" /> not measured
         {" · "}wheel zooms, alt-drag pans, shift-drag selects a range, click/drag scrubs
       </p>
     </div>

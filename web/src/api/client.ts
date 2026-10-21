@@ -23,6 +23,7 @@ import type {
   SolveResponse,
   TrackData,
   TrackerInfo,
+  TrackerSettingsPreview,
 } from "../types";
 
 export class ApiError extends Error {
@@ -77,6 +78,23 @@ function patchJson<T>(path: string, body: unknown): Promise<T> {
 // -- meta ---------------------------------------------------------------
 
 export const getTrackers = (): Promise<TrackerInfo[]> => request("/api/trackers");
+
+/**
+ * A tracker's settings for candidate values, before any track exists.
+ *
+ * Keyed by the settings' own `attribute` names; an omitted one takes the
+ * plugin's default. A value the tracker does not take or that is out of range
+ * is a 400, which the caller shows rather than drawing a stale window.
+ */
+export const getTrackerSettings = (
+  name: string,
+  options: Record<string, number>,
+): Promise<TrackerSettingsPreview> => {
+  const query = new URLSearchParams(
+    Object.entries(options).map(([key, value]) => [key, String(value)]),
+  ).toString();
+  return request(`/api/trackers/${encodeURIComponent(name)}/settings${query ? `?${query}` : ""}`);
+};
 export const getDevices = (): Promise<DeviceInfo> => request("/api/devices");
 /** The smoothing catalogue with each filter's parameter schema — the UI builds
  *  its controls from this rather than hardcoding parameter names. */
@@ -159,8 +177,19 @@ export const createPoint = (
   x: number,
   y: number,
   tracker?: string,
+  /** A bounding box: x, y is then its centre. The server picks a box tracker if none is named. */
+  box?: { w: number; h: number },
+  /** The point's tracker settings, as the patch panel's PUT would store them. Never for a box. */
+  options?: Record<string, number>,
 ): Promise<PointSummary> =>
-  postJson(`/api/projects/${projectId}/points`, { frame, x, y, tracker });
+  postJson(`/api/projects/${projectId}/points`, {
+    frame,
+    x,
+    y,
+    tracker,
+    ...box,
+    ...(options && Object.keys(options).length > 0 ? { options } : {}),
+  });
 
 /**
  * Change a point's tracker, its solve flag or its colour.
@@ -206,8 +235,10 @@ export const addAnchor = (
   frame: number,
   x: number,
   y: number,
+  /** Box size for a box track; omitted, the server keeps the track's size at that frame. */
+  box?: { w: number; h: number },
 ): Promise<PointSummary> =>
-  postJson(`/api/projects/${projectId}/points/${pointId}/anchors`, { frame, x, y });
+  postJson(`/api/projects/${projectId}/points/${pointId}/anchors`, { frame, x, y, ...box });
 
 /**
  * Remove the anchor on `frame`, and whatever asserted it.

@@ -31,9 +31,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 from .corrections import Correction, correction_from_dict
 from .errors import ProjectError, SchemaVersionError
@@ -68,6 +69,53 @@ Migration = Callable[[dict[str, Any]], dict[str, Any]]
 
 MIGRATIONS: dict[int, Migration] = {}
 """Registered migrations, keyed by the version they upgrade *from*."""
+
+_T = TypeVar("_T")
+
+_SHARING_RETRY_DELAYS: tuple[float, ...] = (0.005, 0.01, 0.02, 0.04, 0.08, 0.12, 0.16, 0.2)
+"""Seconds to wait between attempts on a file another handle is briefly holding.
+
+Windows refuses to rename over a file that any other handle has open, and can
+refuse to open one that is part-way through being replaced — both surface as
+``PermissionError``. The server reads the project file from many threads at once
+(request handlers, jobs, the frame stream once per frame), each for well under a
+millisecond, so a save that collides with one of those reads only has to wait
+for it. About 0.6 s in all: long enough to outlast any read, short enough that a
+file that really is locked still fails promptly.
+"""
+
+_RETRY_SHARING_VIOLATIONS = os.name == "nt"
+"""Whether a ``PermissionError`` on the project file can be transient here.
+
+Only on Windows. Elsewhere a rename over an open file succeeds and a
+``PermissionError`` means the permissions really are wrong, so retrying would
+only delay the error.
+"""
+
+
+def _retry_sharing_violations(operation: Callable[[], _T], path: str) -> _T:
+    """Run a file operation, retrying while another handle briefly holds the file.
+
+    Args:
+        operation: The open or rename to attempt.
+        path: The file it acts on. Windows reports a directory there as
+            ``PermissionError`` too, but that is a mistake rather than a
+            moment's contention, so it fails at once instead of after every
+            retry.
+
+    Returns:
+        Whatever ``operation`` returns, from the first attempt that succeeds.
+
+    Raises:
+        PermissionError: From the last attempt, if the file stays held.
+    """
+    if _RETRY_SHARING_VIOLATIONS and not os.path.isdir(path):
+        for delay in _SHARING_RETRY_DELAYS:
+            try:
+                return operation()
+            except PermissionError:
+                time.sleep(delay)
+    return operation()
 
 
 def register_migration(from_version: int, fn: Migration) -> None:
@@ -213,6 +261,15 @@ class PointSpec:
         if not _HEX_COLOR.fullmatch(color):
             raise ProjectError(f"point colour must be #rrggbb, got {self.color!r}")
         self.color = color
+
+    @property
+    def is_box(self) -> bool:
+        """Whether this is a **box track**: one whose anchors state boxes.
+
+        Position is still the box centre; the box adds a per-frame size to the
+        track and needs a tracker with ``tracks_boxes``.
+        """
+        return any(q.has_box for q in self.queries)
 
     @property
     def is_composite(self) -> bool:
@@ -463,7 +520,10 @@ class Project:
         """Write the project to disk atomically.
 
         The file is written to a temporary sibling and then moved into place, so
-        an interrupted save can never truncate an existing project.
+        an interrupted save can never truncate an existing project. On Windows
+        the move waits out a reader that has the file open at that instant
+        rather than failing with "Access is denied" (see
+        :data:`_SHARING_RETRY_DELAYS`).
 
         Args:
             path: Destination; defaults to :attr:`path` (the file it came from).
@@ -483,7 +543,7 @@ class Project:
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(self.to_json())
             handle.write("\n")
-        os.replace(tmp, target)
+        _retry_sharing_violations(lambda: os.replace(tmp, target), target)
         self.path = target
         return target
 
@@ -502,9 +562,15 @@ class Project:
             SchemaVersionError: If it is too new to read.
         """
         target = os.path.abspath(os.fspath(path))
-        try:
+
+        def read() -> str:
             with open(target, encoding="utf-8") as handle:
-                text = handle.read()
+                return handle.read()
+
+        try:
+            # A read that lands while a save is replacing the file can be
+            # refused on Windows; it is a moment, not a missing project.
+            text = _retry_sharing_violations(read, target)
         except OSError as exc:
             raise ProjectError(f"cannot read project {target}: {exc}") from exc
         return cls.from_json(text, path=target)

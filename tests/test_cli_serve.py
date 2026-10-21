@@ -28,6 +28,7 @@ from stable.cli.serve import (
     _source_web_dir,
     _wait_until_serving,
     add_serve_parser,
+    browse_url,
     run_serve,
 )
 
@@ -85,16 +86,68 @@ def fake_uvicorn(monkeypatch):
     return calls
 
 
-def test_serve_subcommand_is_registered():
-    import argparse as ap
-
-    parser = ap.ArgumentParser()
+def _parse_serve(*argv: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     add_serve_parser(subparsers)
-    args = parser.parse_args(["serve", "--port", "9999", "--no-browser"])
+    return parser.parse_args(["serve", *argv])
+
+
+def test_serve_subcommand_is_registered(monkeypatch):
+    monkeypatch.delenv("STABLE_HOST", raising=False)
+    args = _parse_serve("--port", "9999", "--no-browser")
     assert args.port == 9999
     assert args.no_browser is True
-    assert args.host == "localhost"  # default
+    # Loopback by default: the server has no login, so the network is opt-in.
+    assert args.host == "localhost"
+
+
+def test_stable_host_makes_another_interface_the_default(monkeypatch):
+    monkeypatch.setenv("STABLE_HOST", "0.0.0.0")
+    assert _parse_serve().host == "0.0.0.0"
+    # ...and an explicit flag still wins over it.
+    assert _parse_serve("--host", "127.0.0.1").host == "127.0.0.1"
+
+
+def test_the_browse_url_is_one_this_machine_can_connect_to():
+    # Windows refuses to connect to 0.0.0.0 at all (WinError 10049), so a
+    # wildcard bind is announced and opened through loopback.
+    assert browse_url("0.0.0.0", 8000) == "http://localhost:8000/"
+    assert browse_url("::", 8000) == "http://localhost:8000/"
+    assert browse_url("localhost", 8123) == "http://localhost:8123/"
+    assert browse_url("192.168.1.20", 8000) == "http://192.168.1.20:8000/"
+    assert browse_url("::1", 8000) == "http://[::1]:8000/"
+
+
+def test_a_wildcard_bind_announces_and_opens_a_reachable_url(
+    fake_uvicorn, monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr("stable.server.app.web_dist_dir", lambda: tmp_path)
+    polled: list[str] = []
+    opened: list[str] = []
+
+    def wait(url, **_kw):
+        polled.append(url)
+        return True
+
+    monkeypatch.setattr("stable.cli.serve._wait_until_serving", wait)
+    monkeypatch.setattr("webbrowser.open", lambda url: opened.append(url))
+    rc = run_serve(_args(host="0.0.0.0", no_browser=False))
+    assert rc == 0
+    import time
+
+    for _ in range(50):
+        if opened:
+            break
+        time.sleep(0.02)
+    assert polled == ["http://localhost:8123/"]
+    assert opened == ["http://localhost:8123/"]
+    out = capsys.readouterr().out
+    assert "http://0.0.0.0" not in out
+    # Being on the network is said out loud, along with what that exposes.
+    assert "every network interface" in out
+    assert "no login" in out
+    assert fake_uvicorn["kwargs"]["host"] == "0.0.0.0"  # still bound as asked
 
 
 def test_run_serve_starts_uvicorn_with_the_requested_host_and_port(

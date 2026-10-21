@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from ..trackers.merge import DEFAULT_ANCHOR_TOLERANCE_PX
 
@@ -62,21 +62,57 @@ class TemplateOptionsUpdate(BaseModel):
     search_radius: int | None = None
 
 
+def _box_given_whole(w: float | None, h: float | None) -> None:
+    """Raise unless ``w`` and ``h`` are both present or both absent."""
+    if (w is None) != (h is None):
+        raise ValueError("w and h must be given together or not at all")
+
+
 class PointCreate(BaseModel):
-    """Body for ``POST /api/projects/{id}/points``: place a new point's first anchor."""
+    """Body for ``POST /api/projects/{id}/points``: place a new point's first anchor.
+
+    ``w``/``h`` make it a **box track**: the anchor states a bounding box whose
+    centre is ``x, y``, and the point needs a tracker that follows boxes (left
+    unnamed, the server picks one).
+    """
 
     frame: int
     x: float
     y: float
     tracker: str | None = None
+    w: float | None = Field(default=None, gt=0)
+    h: float | None = Field(default=None, gt=0)
+    # The tracker's settings, chosen before the point was marked, under the
+    # plugin's own argument names — stored exactly as the patch panel's PUT
+    # stores them. A box track takes none: its pattern is its box.
+    options: dict[str, int] | None = None
+
+    @model_validator(mode="after")
+    def box_is_whole(self) -> PointCreate:
+        """Refuse a box with only one of its two sides."""
+        _box_given_whole(self.w, self.h)
+        return self
 
 
 class AnchorCreate(BaseModel):
-    """Body for ``POST /api/projects/{id}/points/{point_id}/anchors``: add an anchor."""
+    """Body for ``POST /api/projects/{id}/points/{point_id}/anchors``: add an anchor.
+
+    ``w``/``h`` are for a box track and are optional even there: omitted, the
+    server fills the box in from the track's size at that frame. On a point
+    track they are refused.
+    """
 
     frame: int
     x: float
     y: float
+    w: float | None = Field(default=None, gt=0)
+    h: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def box_is_whole(self) -> AnchorCreate:
+        """Refuse a box with only one of its two sides."""
+        _box_given_whole(self.w, self.h)
+        return self
 
 
 class PointUpdate(BaseModel):
