@@ -117,6 +117,24 @@ rem can be tested -- see scripts\install_gpu.py. It asks first, skips silently
 rem on a machine with no NVIDIA GPU, and never fails the install.
 "%VENVPY%" scripts\install_gpu.py --python "%VENVPY%"
 
+rem ------------------------------------------------------------ deep tracker code
+rem Optional and never fails the install; empty input (e.g. piped) means skip.
+echo.
+echo CoTracker3 and TAPIR need their model code from GitHub (requires git).
+set "DEEPCHOICE="
+set /p "DEEPCHOICE=Install it now? [y/N]: "
+if /I not "%DEEPCHOICE:~0,1%"=="y" goto :deep_done
+where git >nul 2>nul
+if not %errorlevel%==0 (
+    echo git not found on PATH - skipping. Install git and see the README.
+    goto :deep_done
+)
+"%VENVPY%" -m pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git"
+if not %errorlevel%==0 echo WARNING: installing TAPIR ^(tapnet^) failed - see the pip output above.
+"%VENVPY%" -m pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git"
+if not %errorlevel%==0 echo WARNING: installing CoTracker3 failed - see the pip output above.
+:deep_done
+
 rem ---------------------------------------------------------------------- activate
 echo.
 call ".venv\Scripts\activate.bat"
@@ -137,8 +155,9 @@ echo      stable devices     show whether your GPU is being used
 echo      stable --help      every command
 echo.
 echo  The deep trackers (CoTracker3 / TAPIR) also need their model
-echo  code, which is not ours to ship - see docs\windows-gpu-setup.md
-echo  step 4. RAFT needs nothing further.
+echo  code, which is not ours to ship. If you skipped that step
+echo  above, see docs\windows-gpu-setup.md step 4. RAFT needs
+echo  nothing further.
 echo.
 echo  Next time, reactivate with:  .venv\Scripts\activate.bat
 echo ============================================================

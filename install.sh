@@ -136,6 +136,26 @@ _stable_install() {
     # silently on a machine with no NVIDIA GPU, and never fails the install.
     ( cd "$here" && "$venvpy" scripts/install_gpu.py --python "$venvpy" )
 
+    # ------------------------------------------------------- deep tracker code
+    # Optional and never fails the install; skipped when not on a terminal.
+    if [ -t 0 ]; then
+        printf '\nCoTracker3 and TAPIR need their model code from GitHub (requires git).\n'
+        printf 'Install it now? [y/N]: '
+        read -r choice
+        case "$choice" in
+            [yY]*)
+                if ! command -v git >/dev/null 2>&1; then
+                    printf 'git not found on PATH - skipping. Install git and see the README.\n'
+                else
+                    "$venvpy" -m pip install "tapnet @ git+https://github.com/google-deepmind/tapnet.git" \
+                        || printf '\nWARNING: installing TAPIR (tapnet) failed - see the pip output above.\n'
+                    "$venvpy" -m pip install "cotracker @ git+https://github.com/facebookresearch/co-tracker.git" \
+                        || printf '\nWARNING: installing CoTracker3 failed - see the pip output above.\n'
+                fi
+                ;;
+        esac
+    fi
+
     return 0
 }
 
@@ -172,8 +192,9 @@ if [ "$_stable_rc" -eq 0 ]; then
      stable --help      every command
 
  The deep trackers (CoTracker3 / TAPIR) also need their model
- code, which is not ours to ship - see docs/windows-gpu-setup.md
- step 4. RAFT needs nothing further.
+ code, which is not ours to ship. If you skipped that step
+ above, see docs/windows-gpu-setup.md step 4. RAFT needs
+ nothing further.
 
  Next time, reactivate with:  $_stable_activate_hint
 ============================================================
