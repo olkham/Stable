@@ -90,7 +90,15 @@ class StubProcessor:
         )
 
     def post_process_masks(self, masks, original_sizes, **kwargs):
-        return [np.asarray(masks)]
+        # The real one interpolates masks[i] (4D) to original_sizes[i] per image.
+        assert isinstance(masks, list) and len(masks) == len(original_sizes)
+        out = []
+        for batch, size in zip(masks, original_sizes, strict=True):
+            array = np.asarray(batch)
+            assert array.ndim == 4, "bilinear mode needs 4D input"
+            assert tuple(size) == array.shape[-2:]
+            out.append(array)
+        return out
 
 
 class StubModel:
@@ -106,7 +114,7 @@ class StubModel:
         height, width = inference_session.video_height, inference_session.video_width
         n_objects = len(inference_session.prompts)
         for index, _frame in enumerate(inference_session.frames):
-            masks = np.zeros((n_objects, height, width), dtype=bool)
+            masks = np.zeros((n_objects, 1, height, width), dtype=bool)
             scores = np.zeros((n_objects,), dtype=np.float32)
             hidden = bool(self.occluded) and self.occluded[0] <= index < self.occluded[1]
             for obj in range(n_objects):
@@ -118,7 +126,7 @@ class StubModel:
                     continue
                 x0 = int(round(cx - self.size / 2))
                 y0 = int(round(cy - self.size / 2))
-                masks[obj, y0 : y0 + self.size, x0 : x0 + self.size] = True
+                masks[obj, 0, y0 : y0 + self.size, x0 : x0 + self.size] = True
                 scores[obj] = 6.0
             yield StubOutput(index, masks, scores, list(range(n_objects)))
 

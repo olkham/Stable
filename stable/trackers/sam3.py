@@ -164,9 +164,11 @@ class Sam3Backend:
                 frame_index = int(output.frame_idx)
                 if not 0 <= frame_index < length:  # pragma: no cover - defensive
                     continue
+                # One entry per image: a [objects, 1, h, w] batch and its (H, W).
                 masks = self._processor.post_process_masks(
-                    output.pred_masks.cpu(),
-                    [session.video_height, session.video_width],
+                    [output.pred_masks.cpu()],
+                    [[session.video_height, session.video_width]],
+                    mask_threshold=self.mask_threshold,
                     binarize=True,
                 )[0]
                 mask_array = np.asarray(masks)
