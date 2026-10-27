@@ -1283,6 +1283,10 @@ button:disabled {
   color: var(--danger);
 }
 
+.model-list__token input {
+  flex: 1;
+}
+
 /* -- tracked patches panel (todo 14) ------------------------------------- */
 
 .patch-panel {

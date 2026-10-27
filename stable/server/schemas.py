@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from ..trackers.merge import DEFAULT_ANCHOR_TOLERANCE_PX
 
@@ -32,6 +32,7 @@ __all__ = [
     "CorrectionUpdate",
     "RetrackRequest",
     "ModelDownloadRequest",
+    "HfModelDownloadRequest",
     "TemplateOptionsUpdate",
 ]
 
@@ -299,3 +300,14 @@ class ModelDownloadRequest(BaseModel):
 
     accept_noncommercial: bool = False
     allow_unpinned: bool = False
+
+
+class HfModelDownloadRequest(BaseModel):
+    """Body for ``POST /api/models/hf/{tracker}/download``.
+
+    ``token`` is a Hugging Face access token for gated repos. It is used for
+    this one download only and never stored; omit it to fall back to
+    ``HF_TOKEN`` or a prior ``huggingface-cli login``.
+    """
+
+    token: SecretStr | None = Field(default=None, max_length=512)

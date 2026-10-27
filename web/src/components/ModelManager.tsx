@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../api/client";
 import { useModelJobsSocket } from "../hooks/useModelJobsSocket";
-import type { ModelInfo } from "../types";
+import type { HfModelInfo, ModelInfo } from "../types";
 import { JobProgress } from "./JobProgress";
 
 interface OptIn {
@@ -22,6 +22,9 @@ interface OptIn {
  */
 export function ModelManager({ onClose }: { onClose: () => void }) {
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [hfModels, setHfModels] = useState<HfModelInfo[]>([]);
+  const [hfTokenConfigured, setHfTokenConfigured] = useState(false);
+  const [hfToken, setHfToken] = useState("");
   const [env, setEnv] = useState({ allow_unpinned: false, accept_noncommercial: false });
   const [opt, setOpt] = useState<Record<string, OptIn>>({});
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +36,8 @@ export function ModelManager({ onClose }: { onClose: () => void }) {
       .listModels()
       .then((res) => {
         setModels(res.models);
+        setHfModels(res.hf_models ?? []);
+        setHfTokenConfigured(res.hf_token_configured ?? false);
         setEnv(res.env);
         setLoaded(true);
       })
@@ -72,6 +77,15 @@ export function ModelManager({ onClose }: { onClose: () => void }) {
         allowUnpinned: flags.unpinned,
         acceptNoncommercial: flags.noncommercial,
       });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleHfDownload(model: HfModelInfo) {
+    setError(null);
+    try {
+      await api.downloadHfModel(model.key, hfToken.trim());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -198,6 +212,63 @@ export function ModelManager({ onClose }: { onClose: () => void }) {
               );
             })}
           </ul>
+          {hfModels.length > 0 && (
+            <>
+              <h3>Hugging Face models</h3>
+              <p className="modal__hint">
+                These download into the Hugging Face cache. Gated repos need you to accept the
+                licence on the model page first, then an access token (from{" "}
+                <code>huggingface.co/settings/tokens</code>). The token is used for this download
+                only and is not stored.
+              </p>
+              <label className="field-row model-list__token">
+                <span>HF token</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder={
+                    hfTokenConfigured ? "optional — a saved login was found" : "hf_…"
+                  }
+                  value={hfToken}
+                  onChange={(e) => setHfToken(e.target.value)}
+                />
+              </label>
+              <ul className="model-list">
+                {hfModels.map((model) => {
+                  const job = Object.values(jobs)
+                    .filter((j) => j.kind === "model_download" && j.target === `hf:${model.key}`)
+                    .sort((a, b) => b.updated_at - a.updated_at)[0];
+                  const running = job && job.status !== "done" && job.status !== "error";
+                  const canDownload = hfTokenConfigured || hfToken.trim() !== "";
+                  return (
+                    <li key={model.key} className="model-list__item">
+                      <div className="model-list__row">
+                        <span className="model-list__key">{model.repo}</span>
+                        <span className="model-list__license">{model.license}</span>
+                        {model.downloaded && (
+                          <span className="model-list__badge model-list__badge--ok">cached</span>
+                        )}
+                      </div>
+                      <div className="model-list__meta">used by: {model.trackers.join(", ")}</div>
+                      <div className="model-list__actions">
+                        {!model.downloaded && (
+                          <button
+                            disabled={!canDownload || running}
+                            title={canDownload ? undefined : "Enter a Hugging Face token first"}
+                            onClick={() => handleHfDownload(model)}
+                          >
+                            {running ? "Downloading…" : "Download"}
+                          </button>
+                        )}
+                        <JobProgress job={job} />
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
         </div>
       </div>
     </div>

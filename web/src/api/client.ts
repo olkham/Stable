@@ -120,6 +120,10 @@ export const downloadModel = (
 export const deleteModel = (key: string): Promise<ModelInfo & { removed: boolean }> =>
   request(`/api/models/${encodeURIComponent(key)}`, { method: "DELETE" });
 
+/** `token` is used for this download only; the server never stores it. */
+export const downloadHfModel = (key: string, token?: string): Promise<{ job_id: string }> =>
+  postJson(`/api/models/hf/${encodeURIComponent(key)}/download`, { token: token || null });
+
 // -- projects -------------------------------------------------------------
 
 export const listProjects = (): Promise<ProjectMeta[]> => request("/api/projects");

@@ -541,8 +541,21 @@ export interface ModelInfo {
   trackers: string[];
 }
 
+export interface HfModelInfo {
+  /** Tracker plugin name; also the download key. */
+  key: string;
+  repo: string;
+  license: string;
+  downloaded: boolean;
+  trackers: string[];
+}
+
 export interface ModelsResponse {
   models: ModelInfo[];
+  /** Checkpoints fetched from a Hugging Face repo into the HF cache (e.g. SAM 3). */
+  hf_models: HfModelInfo[];
+  /** Whether HF_TOKEN or a `huggingface-cli login` token is already available. */
+  hf_token_configured: boolean;
   /** Whether the process-wide opt-in env vars are set (see stable/trackers/weights.py). */
   env: { allow_unpinned: boolean; accept_noncommercial: boolean };
 }

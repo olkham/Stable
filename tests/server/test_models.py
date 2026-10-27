@@ -162,3 +162,38 @@ def test_non_commercial_download_fails_closed_without_opt_in(
     )
     job = wait_model_job(client, response.json()["job_id"])
     assert job["status"] == "done", job
+
+
+# -- Hugging Face-hosted checkpoints (SAM 3) ---------------------------------
+
+
+def test_lists_sam3_as_a_hugging_face_model(client: TestClient) -> None:
+    body = client.get("/api/models").json()
+    rows = {row["key"]: row for row in body["hf_models"]}
+    assert rows["sam3"]["repo"] == "facebook/sam3"
+    assert rows["sam3"]["trackers"] == ["sam3"]
+    assert isinstance(body["hf_token_configured"], bool)
+
+
+def test_hf_download_passes_the_token_and_never_echoes_it(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_snapshot_download(repo: str, token: str | None = None) -> str:
+        calls.append((repo, token))
+        return "/fake/snapshot"
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    secret = "hf_" + uuid4().hex
+    response = client.post("/api/models/hf/sam3/download", json={"token": secret})
+    assert response.status_code == 200
+    job = wait_model_job(client, response.json()["job_id"])
+    assert job["status"] == "done", job
+    assert calls == [("facebook/sam3", secret)]
+    assert secret not in str(job)
+
+
+def test_hf_download_unknown_tracker_404(client: TestClient) -> None:
+    assert client.post("/api/models/hf/lk/download", json={}).status_code == 404

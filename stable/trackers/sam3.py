@@ -235,6 +235,8 @@ class Sam3Tracker(DeepTrackerPlugin):
     # No ModelSpec: the checkpoint is a Hugging Face repo that `transformers`
     # fetches and verifies itself. See the module docstring.
     model_spec = None
+    hf_repo = DEFAULT_CHECKPOINT
+    """Hugging Face repo the model manager downloads for this plugin."""
     install_hint = (
         "Install it with: pip install 'stable-tracker[sam3]' "
         "(transformers >= 5.14, which is where Sam3Tracker landed)"
@@ -283,7 +285,7 @@ class Sam3Tracker(DeepTrackerPlugin):
         except Exception:
             return False
         try:
-            snapshot_download(DEFAULT_CHECKPOINT, local_files_only=True)
+            snapshot_download(cls.hf_repo, local_files_only=True)
         except Exception:
             return False
         return True
@@ -317,8 +319,18 @@ class Sam3Tracker(DeepTrackerPlugin):
                 "pip install 'stable-tracker[sam3]'"
             ) from exc
         try:
-            model = Sam3TrackerVideoModel.from_pretrained(self.checkpoint)
-            processor = Sam3TrackerVideoProcessor.from_pretrained(self.checkpoint)
+            # The cache comes first: the token used to download a gated repo is
+            # not persisted, so an online revision check here could be refused.
+            try:
+                model = Sam3TrackerVideoModel.from_pretrained(
+                    self.checkpoint, local_files_only=True
+                )
+                processor = Sam3TrackerVideoProcessor.from_pretrained(
+                    self.checkpoint, local_files_only=True
+                )
+            except Exception:
+                model = Sam3TrackerVideoModel.from_pretrained(self.checkpoint)
+                processor = Sam3TrackerVideoProcessor.from_pretrained(self.checkpoint)
         except Exception as exc:
             raise TrackerError(
                 f"could not load SAM 3 checkpoint {self.checkpoint!r}: {exc}. "
