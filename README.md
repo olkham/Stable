@@ -111,7 +111,16 @@ ones to reach for when the feature gets covered — measured on footage with an
 occluder sweeping across the point, `siamdw` came back to it every time and
 `lk` never did — while `lk` stays the more precise on clean, unoccluded motion.
 
-Both were built to follow an *object* from the box a detector draws around it,
+`sutrack` needs nothing further either: SUTrack-T224
+([AAAI 2025](https://github.com/chenxin-dlut/SUTrack)), a newer one-stream
+transformer that encodes the template and the search region together, with its
+network ported to plain PyTorch and shipped with Stable (MIT). On clips of
+known motion built the same way its median error was 0.42 px — 0.40 px on
+patches of a natural photograph, where SiamDW measured 0.92 and Ocean 1.4 — it
+came back after five of six occluder sweeps, and it runs at 22 ms a frame on a
+CPU (6 ms on a GPU).
+
+All three were built to follow an *object* from the box a detector draws around it,
 so they can also track **boxes**: choose one for a new track (it arms the box
 tool, `B`) and drag a rectangle around something, and the track follows the
 box's centre — which is
@@ -125,8 +134,10 @@ aspect, its box overlapped the truth by a mean IoU of 0.92, and recovered after
 an occluder crossed it on 11 of 12 clips. SiamDW searches scales, not shapes,
 so its box keeps the aspect it was drawn with (mean IoU 0.68 on the same clips,
 lost on all three that stretched) — use it for objects that only move and
-scale.
-For either box tracker, new-track controls and the track's patch panel offer a **Search window**
+scale. SUTrack regresses the object's box like Ocean: on composited clips built
+the same way its box overlapped the truth by a mean IoU of 0.93, and it
+recovered after the occluder on all twelve.
+For any of these box trackers, new-track controls and the track's patch panel offer a **Search window**
 from 255 to 511 network pixels per side, in steps of 16. The trained default
 is 255; increasing it searches more of the source image at the same template
 resolution, at a higher time and memory cost. The source-pixel coverage scales
@@ -165,6 +176,12 @@ not bugs:
   README now points to; SiamDW's is tensor-for-tensor the one the MIT-licensed
   SiamDW release links, while the SOTS repository hosting Ocean's has no licence
   file of its own — CONTRIBUTING.md "Pinning a checkpoint" has the details.
+- **SUTrack's checkpoint** (`sutrack_t224`) is pinned and MIT too, from a fixed
+  revision of the authors' Hugging Face release. It is a 1 GB download because
+  the authors' file carries the whole CLIP ViT-L/14 model it was trained
+  beside; for RGB video SUTrack only uses CLIP to make one constant token, which
+  Stable computes once when the model loads, keeping the 28M parameters that
+  track.
 
 In the browser, click **Models** (top-right in a project, or from the
 project list) to see every checkpoint's cache/licence state and download or
@@ -175,6 +192,7 @@ stable models                                              # list, with cache/pi
 stable models download bootstapir                          # Apache-2.0, no opt-in needed
 stable models download cotracker3_offline --accept-noncommercial
 stable models download siamdw_res22w                        # MIT, pinned: no opt-in
+stable models download sutrack_t224                         # MIT, pinned; 1 GB
 stable models remove bootstapir                             # free the disk space back
 ```
 
@@ -198,7 +216,8 @@ stable track clip.mp4 --point 120.5,80@0 --tracker template \
     --window 24 --search 48 --out tracks.json
 
 # ...or follow an object from a box, given as left,top,width,height@frame the
-# way a detector reports it (Ocean and SiamDW; the output adds each frame's size)
+# way a detector reports it (Ocean, SiamDW and SUTrack; the output adds each
+# frame's size)
 stable track clip.mp4 --box 300,200,120,90@0 --tracker ocean --out tracks.json
 
 # 2. export the solved X/Y/R/S curves
@@ -290,6 +309,8 @@ trackers' model code) — the frontend is already built into the package
 | `stable.trackers.siamese_nets` | The Ocean and SiamDW networks, ported from TracKit to plain PyTorch |
 | `stable.trackers.ocean` | Ocean (TracKit): anchor-free box regression — accurate on object-like features |
 | `stable.trackers.siamdw` | SiamDW (TracKit): CIResNet-22W SiamFC — tracks through occlusion and says so |
+| `stable.trackers.sutrack_net` | The SUTrack-T224 network (Fast-iTPN encoder, centre head), ported to plain PyTorch |
+| `stable.trackers.sutrack` | SUTrack (AAAI 2025): one-stream transformer — precise points and boxes, fast on a CPU |
 | `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
 | `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
 | `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |

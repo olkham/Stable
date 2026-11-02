@@ -247,9 +247,9 @@ if [ "$_stable_rc" -eq 0 ]; then
 
  The deep trackers (CoTracker3 / TAPIR) also need their model
  code, which is not ours to ship. If you skipped that step
- above, see docs/windows-gpu-setup.md step 4. RAFT needs
- nothing further. SAM 3 needs the sam3 extra and a Hugging
- Face login; re-run this installer to set up either.
+ above, see docs/windows-gpu-setup.md step 4. RAFT and
+ SUTrack need nothing further. SAM 3 needs the sam3 extra and
+ a Hugging Face login; re-run this installer to set up either.
 
  Next time, reactivate with:  $_stable_activate_hint
 ============================================================

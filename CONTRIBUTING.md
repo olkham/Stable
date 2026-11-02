@@ -228,13 +228,16 @@ How the shipped plugins do it:
 | `tapir` | `(1 - sigmoid(occlusion)) x (1 - sigmoid(expected_dist))` | `(0.15, 0.90)` |
 | `ocean` | `sigmoid(cls)` x feature cosine at the position found | `(0.45, 0.62)` |
 | `siamdw` | correlation peak / the anchor frame's own peak | `(0.55, 0.72)` |
+| `sutrack` | centre-head score at the cell chosen | `(0.45, 0.72)`; boxes `(0.35, 0.65)` |
 
-The last two were fitted to measurements, not chosen: both trackers were run
-with the real checkpoints over clips of known motion and over an occluder
+The last three were fitted to measurements, not chosen: each tracker was run
+with the real checkpoint over clips of known motion and over an occluder
 sweeping across the point, and each range puts every covered frame at `0` while
 keeping frames within 2 px of the truth near `1`. Ocean's classifier alone could
 not have been calibrated at all — it scored 0.86 with the target covered — which
-is why its signal is a product; see `stable/trackers/ocean.py`.
+is why its signal is a product; see `stable/trackers/ocean.py`. SUTrack's centre
+score needed no second signal: it fell to a median 0.23 with the point covered
+against 0.88 on tracked frames; see `stable/trackers/sutrack.py`.
 
 Sanity check your choice: on clean, unambiguous footage your plugin should score
 `> 0.9`, and through a full occlusion it should approach `0`. The shared suite
@@ -269,6 +272,7 @@ not invented or copied from a third party.
 | `cotracker3_offline` | `2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834` | 101,890,938 bytes |
 | `ocean_offline` | `16badb707871ba83a786f32fce5bdf7946254679cbc0051f32bf1f2c8e6cd805` | 103,788,031 bytes |
 | `siamdw_res22w` | `1392552b0be47bef518219c47df8ccc7abbf1bc63c44ca5039e66c38ca9bedad` | 9,920,295 bytes |
+| `sutrack_t224` | `5815a447480fba64d67cfa6cb011f23bb5b89465685043292464ad283f91210d` | 1,044,947,583 bytes |
 
 How they were verified, so the next model follows the same bar rather than a
 lower one:
@@ -322,6 +326,30 @@ Both also run on the CPU, at 46 ms (SiamDW) and 61 ms (Ocean) a frame for one
 point. Checking that is how the SiamDW release's 715,493 denormal weights were
 found: unflushed, one CPU frame took 3.5 s — see `_denormals_flushed` in
 `stable/trackers/siamese.py`.
+
+`sutrack_t224` (SUTrack, AAAI 2025) was held to the same bar:
+
+1. **Provenance.** The authors' README links Baidu and Hugging Face; the file
+   is the Hugging Face one (`xche32/SUTrack`, whose model card is MIT, as is
+   the code), fetched from a fixed revision so the URL cannot change under the
+   digest. The digest above is also the file's Hugging Face LFS hash. It is
+   upstream's training checkpoint: 1 GB, nearly all of it the OpenAI CLIP
+   ViT-L/14 (MIT) that SUTrack only uses for one constant token on RGB video.
+2. **Network equivalence.** `stable/trackers/sutrack_net.py` loads every tensor
+   it keeps with strict matching (377; the 446 CLIP tensors, the two unused
+   text norms and the task-recognition head are dropped, and why is in its
+   docstring), and on identical inputs reproduces the authors' own modules —
+   CLIP rebuilt from the same checkpoint for the language token — to within
+   2.4e-7 on the score map and 5e-5 network pixels on the box on the CPU, and
+   1e-5 / 2e-3 px on a GPU, where upstream runs CLIP in half precision.
+   SUTrack-B224's network was checked the same way and matched as closely.
+3. **Real tracking.** `ensure_weights()` fetched the file through Stable's own
+   downloader, and the plugin tracked through its actual `_build_backend`:
+   points and boxes on clips of known motion, occluder sweeps, the bundled
+   sample clip through `stable track`, and the server's tracker and model
+   listings. The numbers are in `stable/trackers/sutrack.py`'s docstring; it
+   runs at 22 ms a frame for one point on eight CPU threads (6 ms on a GPU), and
+   its weights carry no denormals.
 
 Note for contributors: `tapnet` and `cotracker` are **not** installed by
 `pip install -e ".[dev,video,server]"` or even `.[torch]` — they are the
