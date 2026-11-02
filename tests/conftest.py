@@ -506,6 +506,74 @@ class SiameseMarkerBackend:
         self.released = True
 
 
+class MixFormerMarkerBackend(SiameseMarkerBackend):
+    """A MixFormerV2-shaped :class:`~stable.trackers.siamese.SiameseBackend` that finds the marker.
+
+    MixFormerV2 has no score map: per search crop it regresses **one** box and
+    scores it. This stub does the same from the crop's pixels, so the plugin's
+    reading of a 1x1 map — riding, scale, reach, holding, calibration — runs on
+    real crops with only the network stubbed. Where the marker is visible the
+    score logit is high, the box is the size a square target fills of the
+    exemplar (half its side) centred on the marker, and the edges are sharp
+    (a small spread); where it is not, the logit is low, the box sits at the
+    crop centre and the spread is wide, as the real network's is.
+
+    Args:
+        bias: ``(dx, dy)`` added to where the box is reported, in crop pixels.
+        oom_on: See :class:`SiameseMarkerBackend`.
+        fail_on: See :class:`SiameseMarkerBackend`.
+    """
+
+    def __init__(
+        self,
+        *,
+        bias: tuple[float, float] = (0.0, 0.0),
+        oom_on: tuple[int, ...] = (),
+        fail_on: tuple[int, ...] = (),
+    ) -> None:
+        """Create a fake backend on the CPU."""
+        super().__init__("mixformerv2", bias=bias, oom_on=oom_on, fail_on=fail_on)
+
+    def box_for(self, crop: np.ndarray) -> tuple[float, float, float, float] | None:
+        """Return ``(x1, y1, x2, y2)`` around the marker, relative to the crop centre."""
+        found = find_marker(crop)
+        if found is None:
+            return None
+        centre = (crop.shape[0] - 1) / 2.0
+        half = 127 / 4.0
+        mx, my = found[0] - centre + self.bias[0], found[1] - centre + self.bias[1]
+        return (mx - half, my - half, mx + half, my + half)
+
+    def match(self, kernels: dict[str, object], searches: np.ndarray):
+        """Box the marker in every search crop, as MixFormerV2's one-box output."""
+        from stable.trackers.mixformerv2 import MixFormerV2Maps
+
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise RuntimeError("simulated backend explosion")
+        if self.calls in self.oom_on and self.device != "cpu":
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        if kernels["device"] != self.device:
+            raise RuntimeError("templates live on another device; rebuild them after a move")
+        self.searches.append(tuple(searches.shape))
+
+        count, scales = searches.shape[:2]
+        half = 127 / 4.0
+        score = np.full((count, scales, 1, 1), -6.0, dtype=np.float32)
+        boxes = np.full((count, scales, 4, 1, 1), half, dtype=np.float32)
+        spread = np.full((count, scales, 1, 1), 40.0, dtype=np.float32)
+        for i in range(count):
+            for k in range(scales):
+                box = self.box_for(searches[i, k])
+                if box is None:
+                    continue
+                x1, y1, x2, y2 = box
+                score[i, k] = 6.0
+                boxes[i, k, :, 0, 0] = (-x1, -y1, x2, y2)
+                spread[i, k] = 3.0
+        return MixFormerV2Maps(score=score, boxes=boxes, spread=spread)
+
+
 class EchoBackend:
     """A backend that reports every query as motionless, at full confidence.
 
