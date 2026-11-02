@@ -13,14 +13,19 @@ while still exercising everything the *plugin* owns — window planning, frame
 loading, coordinate scaling, re-anchoring, stitching, confidence normalisation
 and timeline assembly. Only the neural network itself is stubbed. Ocean and
 SiamDW do the same through :class:`~conftest.SiameseMarkerBackend`, which finds
-the marker in the template and search crops they cut.
+the marker in the template and search crops they cut, and the MixFormerV2 pair
+through :class:`~conftest.MixFormerMarkerBackend`, its one-box counterpart.
 """
 
 from __future__ import annotations
 
+import tomllib
+from importlib import metadata
+from pathlib import Path
+
 import numpy as np
 import pytest
-from conftest import MarkerBackend, SiameseMarkerBackend, anchor_at
+from conftest import MarkerBackend, MixFormerMarkerBackend, SiameseMarkerBackend, anchor_at
 
 from stable.core.errors import TrackerError
 from stable.core.types import Query, TrackResult
@@ -31,10 +36,16 @@ from stable.trackers.kalman import KalmanTracker
 from stable.trackers.klt import KLTTracker
 from stable.trackers.lk import LKTracker
 from stable.trackers.meanshift import MeanShiftTracker
+from stable.trackers.mixformerv2 import MixFormerV2SmallTracker, MixFormerV2Tracker
 from stable.trackers.ocean import OceanTracker
 from stable.trackers.particle import ParticleFilterTracker
 from stable.trackers.raft import RaftTracker
-from stable.trackers.registry import available_trackers, describe_trackers, get_tracker
+from stable.trackers.registry import (
+    ENTRY_POINT_GROUP,
+    available_trackers,
+    describe_trackers,
+    get_tracker,
+)
 from stable.trackers.sam3 import Sam3Tracker
 from stable.trackers.siamdw import SiamDWTracker
 from stable.trackers.tapir import TapirTracker
@@ -77,6 +88,10 @@ def make_plugin(name: str):
         return OceanTracker(backend=SiameseMarkerBackend("ocean"))
     if name == "siamdw":
         return SiamDWTracker(backend=SiameseMarkerBackend("siamdw"))
+    if name == "mixformerv2":
+        return MixFormerV2Tracker(backend=MixFormerMarkerBackend())
+    if name == "mixformerv2_small":
+        return MixFormerV2SmallTracker(backend=MixFormerMarkerBackend())
     raise AssertionError(f"unknown tracker {name!r}")
 
 
@@ -94,9 +109,12 @@ TRACKERS = [
     "sam3",
     "ocean",
     "siamdw",
+    "mixformerv2",
+    "mixformerv2_small",
 ]
-# The windowed plugins; Ocean and SiamDW never cut a run into windows (see
-# stable/trackers/siamese.py), so the chunking criterion below is not theirs.
+# The windowed plugins; the Siamese ones (Ocean, SiamDW, MixFormerV2) never cut a
+# run into windows (see stable/trackers/siamese.py), so the chunking criterion
+# below is not theirs.
 DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 
 # The feature matchers are held to the same *registry* contract here, but
@@ -116,8 +134,26 @@ def plugin(request):
 # -- registry contract ----------------------------------------------------
 
 
+def _skip_if_installed_metadata_predates(name: str) -> None:
+    """Skip, saying why, when ``name`` is declared but the install has not published it.
+
+    Entry points come from the *installed* metadata, which an editable install
+    writes when it is installed — not when ``pyproject.toml`` changes. A plugin
+    added since then is undiscoverable until ``pip install -e .`` runs again;
+    that is a stale environment, not a broken plugin, as long as the
+    declaration itself is there.
+    """
+    if name in {entry.name for entry in metadata.entry_points(group=ENTRY_POINT_GROUP)}:
+        return
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    if name in declared["project"]["entry-points"][ENTRY_POINT_GROUP]:
+        pytest.skip(f"{name} is declared but not installed yet: re-run `pip install -e .`")
+
+
 @pytest.mark.parametrize("name", REGISTRY_TRACKERS)
 def test_every_tracker_is_discoverable_and_described(name):
+    _skip_if_installed_metadata_predates(name)
     plugin_class = get_tracker(name)
     assert name in available_trackers()
     row = {r["name"]: r for r in describe_trackers()}[name]

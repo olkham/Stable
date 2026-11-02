@@ -82,6 +82,8 @@ raft = "stable.trackers.raft:RaftTracker"
 sam3 = "stable.trackers.sam3:Sam3Tracker"
 ocean = "stable.trackers.ocean:OceanTracker"
 siamdw = "stable.trackers.siamdw:SiamDWTracker"
+mixformerv2 = "stable.trackers.mixformerv2:MixFormerV2Tracker"
+mixformerv2_small = "stable.trackers.mixformerv2:MixFormerV2SmallTracker"
 
 [tool.setuptools.packages.find]
 include = ["stable*"]

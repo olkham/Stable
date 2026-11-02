@@ -111,8 +111,22 @@ ones to reach for when the feature gets covered — measured on footage with an
 occluder sweeping across the point, `siamdw` came back to it every time and
 `lk` never did — while `lk` stays the more precise on clean, unoccluded motion.
 
-Both were built to follow an *object* from the box a detector draws around it,
-so they can also track **boxes**: choose one for a new track (it arms the box
+`mixformerv2` needs nothing further either: it is
+[MixFormerV2](https://github.com/MCG-NJU/MixFormerV2) (NeurIPS 2023), a
+*one-stream* transformer tracker — template and search go through one ViT
+together, and four learnt tokens read out the box — ported to plain PyTorch
+under its MIT licence. On the same measurement clips it was the most accurate of
+the three on points (median 0.27 px, 90th percentile 0.82 px; SiamDW 0.50 /
+0.89) and on boxes (below), came through every occluder sweep, and runs at
+about 220 fps on a GPU and 21 fps on eight CPU threads. Its weak spot is tiny
+features crowded together, as in the bundled 128x96 sample clip, where it boxes
+a cluster rather than the square you clicked — and its confidence drops to 0
+there rather than pretending otherwise. `mixformerv2_small` is its four-layer
+sibling: as good on boxes, about 100 fps on the CPU, but a poorer point tracker
+(use it for boxes on a machine without a GPU).
+
+All of them were built to follow an *object* from the box a detector draws
+around it, so they can also track **boxes**: choose one for a new track (it arms the box
 tool, `B`) and drag a rectangle around something, and the track follows the
 box's centre — which is
 what the solver, smoothing and export see, as for any track — and its changing
@@ -125,11 +139,16 @@ aspect, its box overlapped the truth by a mean IoU of 0.92, and recovered after
 an occluder crossed it on 11 of 12 clips. SiamDW searches scales, not shapes,
 so its box keeps the aspect it was drawn with (mean IoU 0.68 on the same clips,
 lost on all three that stretched) — use it for objects that only move and
-scale.
-For either box tracker, new-track controls and the track's patch panel offer a **Search window**
-from 255 to 511 network pixels per side, in steps of 16. The trained default
-is 255; increasing it searches more of the source image at the same template
-resolution, at a higher time and memory cost. The source-pixel coverage scales
+scale. MixFormerV2 regresses the box directly and measured a mean IoU of 0.95 on
+the same clips (Ocean 0.90 when re-run alongside it), recovering after the
+occluder on all twelve.
+For any of the box trackers, new-track controls and the track's patch panel offer a **Search window**
+from 255 to 511 network pixels per side, in steps of 16. Ocean's and SiamDW's
+trained default is 255; increasing it searches more of the source image at the
+same template resolution, at a higher time and memory cost. MixFormerV2 always
+runs its network at its own fixed size, so its window (default 319, upstream's
+5x search; 287 for `mixformerv2_small`) trades resolution for reach instead of
+costing time. The source-pixel coverage scales
 with the tracked box. Point tracks instead use **Search area** (`search_radius`)
 to control their per-frame motion reach.
 CoTracker3 and TAPIR also need their model *code*, which is not ours to vendor
@@ -165,6 +184,13 @@ not bugs:
   README now points to; SiamDW's is tensor-for-tensor the one the MIT-licensed
   SiamDW release links, while the SOTS repository hosting Ocean's has no licence
   file of its own — CONTRIBUTING.md "Pinning a checkpoint" has the details.
+- **MixFormerV2's checkpoints** (`mixformerv2_base`, 240 MB;
+  `mixformerv2_small`, 70 MB) are pinned too and come from the Google Drive
+  folder the MIT-licensed MixFormerV2 README links, so they also need no opt-in.
+  MIT is the only licence stated for them, but note their lineage before
+  commercial use: they were trained on research datasets (LaSOT, GOT-10k,
+  TrackingNet, COCO) and distilled from a teacher initialised from Meta's MAE
+  weights, which are CC-BY-NC.
 
 In the browser, click **Models** (top-right in a project, or from the
 project list) to see every checkpoint's cache/licence state and download or
@@ -198,8 +224,10 @@ stable track clip.mp4 --point 120.5,80@0 --tracker template \
     --window 24 --search 48 --out tracks.json
 
 # ...or follow an object from a box, given as left,top,width,height@frame the
-# way a detector reports it (Ocean and SiamDW; the output adds each frame's size)
+# way a detector reports it (Ocean, SiamDW and MixFormerV2; the output adds each
+# frame's size)
 stable track clip.mp4 --box 300,200,120,90@0 --tracker ocean --out tracks.json
+stable track clip.mp4 --box 300,200,120,90@0 --tracker mixformerv2 --out tracks.json
 
 # 2. export the solved X/Y/R/S curves
 stable solve tracks.json --out curves.csv --video clip.mp4
@@ -290,6 +318,8 @@ trackers' model code) — the frontend is already built into the package
 | `stable.trackers.siamese_nets` | The Ocean and SiamDW networks, ported from TracKit to plain PyTorch |
 | `stable.trackers.ocean` | Ocean (TracKit): anchor-free box regression — accurate on object-like features |
 | `stable.trackers.siamdw` | SiamDW (TracKit): CIResNet-22W SiamFC — tracks through occlusion and says so |
+| `stable.trackers.mixformerv2_net` | The MixFormerV2 network, ported from MCG-NJU to plain PyTorch |
+| `stable.trackers.mixformerv2` | MixFormerV2-B and -S (MCG-NJU): one-stream transformer box regression — the most accurate box and point tracker of the Siamese family |
 | `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
 | `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
 | `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |
