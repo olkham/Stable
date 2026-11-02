@@ -13,20 +13,27 @@ while still exercising everything the *plugin* owns — window planning, frame
 loading, coordinate scaling, re-anchoring, stitching, confidence normalisation
 and timeline assembly. Only the neural network itself is stubbed. Ocean and
 SiamDW do the same through :class:`~conftest.SiameseMarkerBackend`, which finds
-the marker in the template and search crops they cut.
+the marker in the template and search crops they cut, and HiT through
+:class:`~hit_backends.HiTMarkerBackend`, which draws its corner maps there.
 """
 
 from __future__ import annotations
 
+import tomllib
+from importlib import metadata
+from pathlib import Path
+
 import numpy as np
 import pytest
 from conftest import MarkerBackend, SiameseMarkerBackend, anchor_at
+from hit_backends import HiTMarkerBackend
 
 from stable.core.errors import TrackerError
 from stable.core.types import Query, TrackResult
 from stable.trackers.correlation import CorrelationTracker
 from stable.trackers.cotracker3 import CoTracker3Tracker
 from stable.trackers.features import OrbTracker, SiftTracker
+from stable.trackers.hit import HiTTracker
 from stable.trackers.kalman import KalmanTracker
 from stable.trackers.klt import KLTTracker
 from stable.trackers.lk import LKTracker
@@ -34,11 +41,38 @@ from stable.trackers.meanshift import MeanShiftTracker
 from stable.trackers.ocean import OceanTracker
 from stable.trackers.particle import ParticleFilterTracker
 from stable.trackers.raft import RaftTracker
-from stable.trackers.registry import available_trackers, describe_trackers, get_tracker
+from stable.trackers.registry import (
+    ENTRY_POINT_GROUP,
+    available_trackers,
+    describe_trackers,
+    get_tracker,
+    register_tracker,
+)
 from stable.trackers.sam3 import Sam3Tracker
 from stable.trackers.siamdw import SiamDWTracker
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.template import TemplateTracker
+
+
+def _register_unpublished_plugins() -> None:
+    """Register any plugin pyproject.toml declares that the installed metadata lacks.
+
+    An editable install publishes the entry points it had when it was installed,
+    so a plugin added to pyproject.toml since is not discoverable until
+    ``pip install -e .`` runs again. This suite is about the plugins in this
+    tree, not about how recently it was installed (``tests/test_registry.py``
+    covers publishing), so those are registered directly — a no-op once they
+    are published, since registering the same class twice is.
+    """
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["entry-points"]
+    installed = {ep.name for ep in metadata.entry_points(group=ENTRY_POINT_GROUP)}
+    for name, target in declared[ENTRY_POINT_GROUP].items():
+        if name not in installed:
+            register_tracker(metadata.EntryPoint(name, target, ENTRY_POINT_GROUP).load())
+
+
+_register_unpublished_plugins()
 
 # Small windows with a real overlap so the multi-chunk path is the *default* in
 # every test below, not a special case one test remembers to cover.
@@ -77,6 +111,8 @@ def make_plugin(name: str):
         return OceanTracker(backend=SiameseMarkerBackend("ocean"))
     if name == "siamdw":
         return SiamDWTracker(backend=SiameseMarkerBackend("siamdw"))
+    if name == "hit":
+        return HiTTracker(backend=HiTMarkerBackend())
     raise AssertionError(f"unknown tracker {name!r}")
 
 
@@ -94,8 +130,9 @@ TRACKERS = [
     "sam3",
     "ocean",
     "siamdw",
+    "hit",
 ]
-# The windowed plugins; Ocean and SiamDW never cut a run into windows (see
+# The windowed plugins; Ocean, SiamDW and HiT never cut a run into windows (see
 # stable/trackers/siamese.py), so the chunking criterion below is not theirs.
 DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 
