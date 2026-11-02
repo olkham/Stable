@@ -228,13 +228,18 @@ How the shipped plugins do it:
 | `tapir` | `(1 - sigmoid(occlusion)) x (1 - sigmoid(expected_dist))` | `(0.15, 0.90)` |
 | `ocean` | `sigmoid(cls)` x feature cosine at the position found | `(0.45, 0.62)` |
 | `siamdw` | correlation peak / the anchor frame's own peak | `(0.55, 0.72)` |
+| `hit` | template-token cosine under the box / the anchor frame's own | `(0.75, 0.90)` (Base) |
 
-The last two were fitted to measurements, not chosen: both trackers were run
+The last three were fitted to measurements, not chosen: each tracker was run
 with the real checkpoints over clips of known motion and over an occluder
 sweeping across the point, and each range puts every covered frame at `0` while
 keeping frames within 2 px of the truth near `1`. Ocean's classifier alone could
 not have been calibrated at all — it scored 0.86 with the target covered — which
-is why its signal is a product; see `stable/trackers/ocean.py`.
+is why its signal is a product; see `stable/trackers/ocean.py`. HiT has no score
+head at all, and its corner maps told good frames from lost ones poorly, so its
+signal is an appearance check computed from its own backbone; each of its three
+variants has its own measured range, and boxes another (see
+`stable/trackers/hit.py`).
 
 Sanity check your choice: on clean, unambiguous footage your plugin should score
 `> 0.9`, and through a full occlusion it should approach `0`. The shared suite
@@ -269,6 +274,9 @@ not invented or copied from a third party.
 | `cotracker3_offline` | `2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834` | 101,890,938 bytes |
 | `ocean_offline` | `16badb707871ba83a786f32fce5bdf7946254679cbc0051f32bf1f2c8e6cd805` | 103,788,031 bytes |
 | `siamdw_res22w` | `1392552b0be47bef518219c47df8ccc7abbf1bc63c44ca5039e66c38ca9bedad` | 9,920,295 bytes |
+| `hit_base` | `7d6ee218014c3dae93c04fff0df5284c5fd723d6fcf79d5210e83457bf242a00` | 511,212,333 bytes |
+| `hit_small` | `7f3d834d6d55eecf4ceea3f8c8cddf268a5bed8510678b25e5fc65b96855f475` | 137,177,837 bytes |
+| `hit_tiny` | `021a7583e1a18d96683bdb69e85b678ea4c7cac5d2522b9ec90e7fdc1f6fa90b` | 118,102,065 bytes |
 
 How they were verified, so the next model follows the same bar rather than a
 lower one:
@@ -322,6 +330,29 @@ Both also run on the CPU, at 46 ms (SiamDW) and 61 ms (Ocean) a frame for one
 point. Checking that is how the SiamDW release's 715,493 denormal weights were
 found: unflushed, one CPU frame took 3.5 s — see `_denormals_flushed` in
 `stable/trackers/siamese.py`.
+
+`hit_base`, `hit_small` and `hit_tiny` (HiT) were held to the same bar:
+
+1. **Provenance.** All three are the `VT_ep1500.pth.tar` files in the Google
+   Drive folder the MIT-licensed `kangben258/HiT` README links ("Models && Raw
+   results"); the URLs are those files' own download links. They are whole
+   training checkpoints — the optimiser state and the authors' harness settings
+   pickled beside the weights — so `torch.load(weights_only=True)` refuses
+   them; `stable/trackers/hit_net.py` reads them with an allow-list unpickler
+   that turns the harness's objects into inert placeholders and refuses any
+   other global, rather than trusting the file.
+2. **Network equivalence.** The port in `hit_net.py` loads each with
+   `load_state_dict(strict=True)` — including the dual-image position
+   encoding's index tables, which are compared with the ones it builds — and
+   reproduces the authors' own module code (their release commit, run beside it)
+   to within 3e-4 search pixels on the box and 1e-4 on the corner logits, on a
+   CUDA GPU and on the CPU.
+3. **Real tracking.** `ensure_weights()` fetched all three through Stable's own
+   downloader, and the plugin tracked real clips through its actual
+   `_build_backend`, on the GPU and the CPU, and through `stable track` with a
+   box and a point: composited box clips, clips of known motion, occluder
+   sweeps and the bundled sample clip. The numbers, and why Base is the
+   default, are in the module docstring of `stable/trackers/hit.py`.
 
 Note for contributors: `tapnet` and `cotracker` are **not** installed by
 `pip install -e ".[dev,video,server]"` or even `.[torch]` — they are the

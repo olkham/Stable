@@ -156,8 +156,8 @@ echo      stable --help      every command
 echo.
 echo  The deep trackers (CoTracker3 / TAPIR) also need their model
 echo  code, which is not ours to ship. If you skipped that step
-echo  above, see docs\windows-gpu-setup.md step 4. RAFT needs
-echo  nothing further.
+echo  above, see docs\windows-gpu-setup.md step 4. RAFT and HiT
+echo  need nothing further.
 echo.
 echo  Next time, reactivate with:  .venv\Scripts\activate.bat
 echo ============================================================
