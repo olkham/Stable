@@ -13,13 +13,19 @@ while still exercising everything the *plugin* owns — window planning, frame
 loading, coordinate scaling, re-anchoring, stitching, confidence normalisation
 and timeline assembly. Only the neural network itself is stubbed. Ocean and
 SiamDW do the same through :class:`~conftest.SiameseMarkerBackend`, which finds
-the marker in the template and search crops they cut.
+the marker in the template and search crops they cut, and SUTrack through
+:class:`_sutrack_stub.SUTrackMarkerBackend`, which answers in its map layout.
 """
 
 from __future__ import annotations
 
+import tomllib
+from importlib import metadata
+from pathlib import Path
+
 import numpy as np
 import pytest
+from _sutrack_stub import SUTrackMarkerBackend
 from conftest import MarkerBackend, SiameseMarkerBackend, anchor_at
 
 from stable.core.errors import TrackerError
@@ -34,9 +40,16 @@ from stable.trackers.meanshift import MeanShiftTracker
 from stable.trackers.ocean import OceanTracker
 from stable.trackers.particle import ParticleFilterTracker
 from stable.trackers.raft import RaftTracker
-from stable.trackers.registry import available_trackers, describe_trackers, get_tracker
+from stable.trackers.registry import (
+    ENTRY_POINT_GROUP,
+    available_trackers,
+    describe_trackers,
+    get_tracker,
+    register_tracker,
+)
 from stable.trackers.sam3 import Sam3Tracker
 from stable.trackers.siamdw import SiamDWTracker
+from stable.trackers.sutrack import SUTrackTracker
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.template import TemplateTracker
 
@@ -77,6 +90,8 @@ def make_plugin(name: str):
         return OceanTracker(backend=SiameseMarkerBackend("ocean"))
     if name == "siamdw":
         return SiamDWTracker(backend=SiameseMarkerBackend("siamdw"))
+    if name == "sutrack":
+        return SUTrackTracker(backend=SUTrackMarkerBackend())
     raise AssertionError(f"unknown tracker {name!r}")
 
 
@@ -94,8 +109,9 @@ TRACKERS = [
     "sam3",
     "ocean",
     "siamdw",
+    "sutrack",
 ]
-# The windowed plugins; Ocean and SiamDW never cut a run into windows (see
+# The windowed plugins; the Siamese ones never cut a run into windows (see
 # stable/trackers/siamese.py), so the chunking criterion below is not theirs.
 DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 
@@ -105,6 +121,20 @@ DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 # finds a single keypoint in the whole frame. Asserting tracking accuracy on
 # material a tracker cannot see would test the fixture, not the plugin.
 REGISTRY_TRACKERS = [*TRACKERS, "sift", "orb"]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _this_checkouts_trackers_are_registered():
+    """Register every tracker this checkout's pyproject.toml declares.
+
+    The registry discovers the *installed* entry points, which describe whatever
+    checkout was last ``pip install -e``'d. Registering the declared ones too (a
+    no-op for a class already registered) keeps this suite about the code under
+    test, not about the environment's metadata.
+    """
+    declared = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text("utf-8"))
+    for name, value in declared["project"]["entry-points"][ENTRY_POINT_GROUP].items():
+        register_tracker(metadata.EntryPoint(name, value, ENTRY_POINT_GROUP).load())
 
 
 @pytest.fixture(params=TRACKERS)
