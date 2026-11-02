@@ -84,6 +84,7 @@ ocean = "stable.trackers.ocean:OceanTracker"
 siamdw = "stable.trackers.siamdw:SiamDWTracker"
 mixformerv2 = "stable.trackers.mixformerv2:MixFormerV2Tracker"
 mixformerv2_small = "stable.trackers.mixformerv2:MixFormerV2SmallTracker"
+hit = "stable.trackers.hit:HiTTracker"
 
 [tool.setuptools.packages.find]
 include = ["stable*"]

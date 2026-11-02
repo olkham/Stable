@@ -109,10 +109,10 @@ Stable calls too (`stable.core.device.select_device`).
 
 `raft` needs nothing further — its architecture and weights ship inside
 torchvision, which step 3 installed, so it becomes available as soon as CUDA
-PyTorch is in place. Nor do `ocean`, `siamdw`, `mixformerv2` and
-`mixformerv2_small`: their network code ships with Stable itself, and their
-(pinned, MIT) checkpoints download on first use. MixFormerV2's checkpoints are
-read safely only by PyTorch 2.6 or newer, which step 3 installs.
+PyTorch is in place. Nor do `ocean`, `siamdw`, `mixformerv2`,
+`mixformerv2_small` and `hit`: their network code ships with Stable itself, and
+their (pinned, MIT) checkpoints download on first use. MixFormerV2's checkpoints
+are read safely only by PyTorch 2.6 or newer, which step 3 installs.
 
 CoTracker3 and TAPIR are different: their model code lives only on GitHub and
 is not Stable's to vendor. The checkpoints download separately (next step);

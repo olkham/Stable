@@ -142,13 +142,34 @@ lost on all three that stretched) — use it for objects that only move and
 scale. MixFormerV2 regresses the box directly and measured a mean IoU of 0.95 on
 the same clips (Ocean 0.90 when re-run alongside it), recovering after the
 occluder on all twelve.
+
+`hit` is another box tracker from the generation after Siamese correlation:
+[HiT](https://github.com/kangben258/HiT) (ICCV 2023), a lightweight
+hierarchical vision transformer that reads the template and the search region
+together and takes the box straight off two corner maps. Its network code is
+MIT, ported to plain PyTorch and shipped with Stable, and its checkpoint
+downloads on first use. On a fresh set of clips composited the same way (a
+face, a logo and a blob texture zooming 2x, shrinking, stretching and
+"breathing"), its box overlapped the face and the texture by a mean IoU of
+0.95, against 0.86 for Ocean and 0.70 for SiamDW on the same clips, and came
+back after an occluder crossed the object on 10 of 12; it lost the logo, a
+plain white card, when it shrank or stretched, as the authors' own tracker
+does. It tracks points on natural
+texture too (median 0.5 px), but it sees the picture in 16 px tokens: for
+features only a few pixels across, SiamDW is the one to use. About 4 ms a frame
+on a GPU and 26 ms on a CPU; HiT-Base is the default, and the lighter
+HiT-Small/HiT-Tiny (`variant="small"`/`"tiny"`) are faster on a CPU. HiT's
+input is a fixed 256 px, so a wider **Search window** buys reach with
+resolution rather than time — keep the default 255 unless the object really
+outruns it.
+
 For any of the box trackers, new-track controls and the track's patch panel offer a **Search window**
 from 255 to 511 network pixels per side, in steps of 16. Ocean's and SiamDW's
 trained default is 255; increasing it searches more of the source image at the
 same template resolution, at a higher time and memory cost. MixFormerV2 always
 runs its network at its own fixed size, so its window (default 319, upstream's
 5x search; 287 for `mixformerv2_small`) trades resolution for reach instead of
-costing time. The source-pixel coverage scales
+costing time, as HiT's does. The source-pixel coverage scales
 with the tracked box. Point tracks instead use **Search area** (`search_radius`)
 to control their per-frame motion reach.
 CoTracker3 and TAPIR also need their model *code*, which is not ours to vendor
@@ -191,6 +212,11 @@ not bugs:
   commercial use: they were trained on research datasets (LaSOT, GOT-10k,
   TrackingNet, COCO) and distilled from a teacher initialised from Meta's MAE
   weights, which are CC-BY-NC.
+- **HiT's checkpoints** (`hit_base`, 511 MB, the default; `hit_small`, 137 MB;
+  `hit_tiny`, 118 MB) are pinned and MIT too, from the Google Drive folder the
+  authors' MIT-licensed README links. They are whole training checkpoints,
+  hence the size; Stable reads the weights out of them without running any of
+  the authors' code.
 
 In the browser, click **Models** (top-right in a project, or from the
 project list) to see every checkpoint's cache/licence state and download or
@@ -224,8 +250,8 @@ stable track clip.mp4 --point 120.5,80@0 --tracker template \
     --window 24 --search 48 --out tracks.json
 
 # ...or follow an object from a box, given as left,top,width,height@frame the
-# way a detector reports it (Ocean, SiamDW and MixFormerV2; the output adds each
-# frame's size)
+# way a detector reports it (Ocean, SiamDW, MixFormerV2 and HiT; the output adds
+# each frame's size)
 stable track clip.mp4 --box 300,200,120,90@0 --tracker ocean --out tracks.json
 stable track clip.mp4 --box 300,200,120,90@0 --tracker mixformerv2 --out tracks.json
 
@@ -320,6 +346,8 @@ trackers' model code) — the frontend is already built into the package
 | `stable.trackers.siamdw` | SiamDW (TracKit): CIResNet-22W SiamFC — tracks through occlusion and says so |
 | `stable.trackers.mixformerv2_net` | The MixFormerV2 network, ported from MCG-NJU to plain PyTorch |
 | `stable.trackers.mixformerv2` | MixFormerV2-B and -S (MCG-NJU): one-stream transformer box regression — the most accurate box and point tracker of the Siamese family |
+| `stable.trackers.hit` | HiT (ICCV 2023): a hierarchical vision transformer box tracker — precise object boxes, fast on a GPU |
+| `stable.trackers.hit_net` | The HiT network (LeViT backbone, Bridge Module, corner head), ported to plain PyTorch |
 | `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
 | `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
 | `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |
