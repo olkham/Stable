@@ -228,13 +228,17 @@ How the shipped plugins do it:
 | `tapir` | `(1 - sigmoid(occlusion)) x (1 - sigmoid(expected_dist))` | `(0.15, 0.90)` |
 | `ocean` | `sigmoid(cls)` x feature cosine at the position found | `(0.45, 0.62)` |
 | `siamdw` | correlation peak / the anchor frame's own peak | `(0.55, 0.72)` |
+| `mixformerv2` | score head x edge sharpness vs the anchor's x box-shape agreement² (boxes: score head) | `(0.3, 0.7)`; boxes `(0.3, 0.75)` |
 
-The last two were fitted to measurements, not chosen: both trackers were run
+The last three were fitted to measurements, not chosen: each tracker was run
 with the real checkpoints over clips of known motion and over an occluder
 sweeping across the point, and each range puts every covered frame at `0` while
 keeping frames within 2 px of the truth near `1`. Ocean's classifier alone could
 not have been calibrated at all — it scored 0.86 with the target covered — which
-is why its signal is a product; see `stable/trackers/ocean.py`.
+is why its signal is a product; see `stable/trackers/ocean.py`. MixFormerV2's
+score head had the same problem on points (0.67 covered, and it happily boxed
+the occluder), so a point's evidence is a product too; see
+`stable/trackers/mixformerv2.py`.
 
 Sanity check your choice: on clean, unambiguous footage your plugin should score
 `> 0.9`, and through a full occlusion it should approach `0`. The shared suite
@@ -269,6 +273,8 @@ not invented or copied from a third party.
 | `cotracker3_offline` | `2670d4562ed69326dda775a26e54883925cd11b6fc9b24cb7aa9f8078bce7834` | 101,890,938 bytes |
 | `ocean_offline` | `16badb707871ba83a786f32fce5bdf7946254679cbc0051f32bf1f2c8e6cd805` | 103,788,031 bytes |
 | `siamdw_res22w` | `1392552b0be47bef518219c47df8ccc7abbf1bc63c44ca5039e66c38ca9bedad` | 9,920,295 bytes |
+| `mixformerv2_base` | `14a44d0c90ee856f3fe36af31c4f0af643cbc2ba47546de98c7162d3d704a228` | 240,205,177 bytes |
+| `mixformerv2_small` | `db94d947e2bf69918640aaf5dfce16a6dbed108fe942f43a8832324e5b6c569e` | 69,679,305 bytes |
 
 How they were verified, so the next model follows the same bar rather than a
 lower one:
@@ -322,6 +328,25 @@ Both also run on the CPU, at 46 ms (SiamDW) and 61 ms (Ocean) a frame for one
 point. Checking that is how the SiamDW release's 715,493 denormal weights were
 found: unflushed, one CPU frame took 3.5 s — see `_denormals_flushed` in
 `stable/trackers/siamese.py`.
+
+`mixformerv2_base` and `mixformerv2_small` (MixFormerV2-B and -S) went through
+the same three steps:
+
+1. **Provenance.** Both files are the ones in the Google Drive folder the
+   MIT-licensed `MCG-NJU/MixFormerV2` README links, fetched through Stable's own
+   downloader. They are pytracking training checkpoints that also pickle the
+   trainer's loss meters and settings; `mixformerv2_net.read_state_dict` reads
+   them with `weights_only=True` and inert stand-ins for those four classes, so
+   nothing in the file is executed (this needs PyTorch 2.6 or newer).
+2. **Network equivalence.** The port in `mixformerv2_net.py` loads each `net`
+   state dict with `strict=True` (114 and 66 tensors), and on identical inputs
+   reproduces the authors' own model code to 7e-7 of the search side on the box
+   (1.6e-4 px) and 9e-6 on the score logit, both variants, on the GPU.
+3. **Real tracking.** Both plugins tracked the motion clips, occluder sweeps and
+   composited box clips through their actual `_build_backend`, on the GPU and
+   the CPU, and the bundled sample clip through `stable track` and the server
+   API. MixFormerV2-B measured 0.27 px median error on the motion clips and a
+   box IoU of 0.95; the full numbers, and -S's, are in the module docstring.
 
 Note for contributors: `tapnet` and `cotracker` are **not** installed by
 `pip install -e ".[dev,video,server]"` or even `.[torch]` — they are the
