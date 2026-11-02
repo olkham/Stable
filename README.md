@@ -115,15 +115,24 @@ occluder sweeping across the point, `siamdw` came back to it every time and
 [MixFormerV2](https://github.com/MCG-NJU/MixFormerV2) (NeurIPS 2023), a
 *one-stream* transformer tracker — template and search go through one ViT
 together, and four learnt tokens read out the box — ported to plain PyTorch
-under its MIT licence. On the same measurement clips it was the most accurate of
-the three on points (median 0.27 px, 90th percentile 0.82 px; SiamDW 0.50 /
-0.89) and on boxes (below), came through every occluder sweep, and runs at
+under its MIT licence. On the same measurement clips it was more accurate than
+Ocean and SiamDW on points (median 0.27 px, 90th percentile 0.82 px; SiamDW
+0.50 / 0.89) and on boxes (below), came through every occluder sweep, and runs at
 about 220 fps on a GPU and 21 fps on eight CPU threads. Its weak spot is tiny
 features crowded together, as in the bundled 128x96 sample clip, where it boxes
 a cluster rather than the square you clicked — and its confidence drops to 0
 there rather than pretending otherwise. `mixformerv2_small` is its four-layer
 sibling: as good on boxes, about 100 fps on the CPU, but a poorer point tracker
 (use it for boxes on a machine without a GPU).
+
+`sutrack` needs nothing further either: SUTrack-T224
+([AAAI 2025](https://github.com/chenxin-dlut/SUTrack)), a newer one-stream
+transformer that encodes the template and the search region together, with its
+network ported to plain PyTorch and shipped with Stable (MIT). On clips of
+known motion built the same way its median error was 0.42 px — 0.40 px on
+patches of a natural photograph, where SiamDW measured 0.92 and Ocean 1.4 — it
+came back after five of six occluder sweeps, and it runs at 22 ms a frame on a
+CPU (6 ms on a GPU).
 
 All of them were built to follow an *object* from the box a detector draws
 around it, so they can also track **boxes**: choose one for a new track (it arms the box
@@ -141,7 +150,9 @@ so its box keeps the aspect it was drawn with (mean IoU 0.68 on the same clips,
 lost on all three that stretched) — use it for objects that only move and
 scale. MixFormerV2 regresses the box directly and measured a mean IoU of 0.95 on
 the same clips (Ocean 0.90 when re-run alongside it), recovering after the
-occluder on all twelve.
+occluder on all twelve. SUTrack regresses the object's box like Ocean: on
+composited clips built the same way its box overlapped the truth by a mean IoU
+of 0.93, and it recovered after the occluder on all twelve.
 
 `hit` is another box tracker from the generation after Siamese correlation:
 [HiT](https://github.com/kangben258/HiT) (ICCV 2023), a lightweight
@@ -169,7 +180,8 @@ trained default is 255; increasing it searches more of the source image at the
 same template resolution, at a higher time and memory cost. MixFormerV2 always
 runs its network at its own fixed size, so its window (default 319, upstream's
 5x search; 287 for `mixformerv2_small`) trades resolution for reach instead of
-costing time, as HiT's does. The source-pixel coverage scales
+costing time, as HiT's and SUTrack's (shrunk onto its trained 224 px input) do.
+The source-pixel coverage scales
 with the tracked box. Point tracks instead use **Search area** (`search_radius`)
 to control their per-frame motion reach.
 CoTracker3 and TAPIR also need their model *code*, which is not ours to vendor
@@ -217,6 +229,12 @@ not bugs:
   authors' MIT-licensed README links. They are whole training checkpoints,
   hence the size; Stable reads the weights out of them without running any of
   the authors' code.
+- **SUTrack's checkpoint** (`sutrack_t224`) is pinned and MIT too, from a fixed
+  revision of the authors' Hugging Face release. It is a 1 GB download because
+  the authors' file carries the whole CLIP ViT-L/14 model it was trained
+  beside; for RGB video SUTrack only uses CLIP to make one constant token, which
+  Stable computes once when the model loads, keeping the 28M parameters that
+  track.
 
 In the browser, click **Models** (top-right in a project, or from the
 project list) to see every checkpoint's cache/licence state and download or
@@ -227,6 +245,7 @@ stable models                                              # list, with cache/pi
 stable models download bootstapir                          # Apache-2.0, no opt-in needed
 stable models download cotracker3_offline --accept-noncommercial
 stable models download siamdw_res22w                        # MIT, pinned: no opt-in
+stable models download sutrack_t224                         # MIT, pinned; 1 GB
 stable models remove bootstapir                             # free the disk space back
 ```
 
@@ -250,8 +269,8 @@ stable track clip.mp4 --point 120.5,80@0 --tracker template \
     --window 24 --search 48 --out tracks.json
 
 # ...or follow an object from a box, given as left,top,width,height@frame the
-# way a detector reports it (Ocean, SiamDW, MixFormerV2 and HiT; the output adds
-# each frame's size)
+# way a detector reports it (Ocean, SiamDW, MixFormerV2, HiT and SUTrack; the
+# output adds each frame's size)
 stable track clip.mp4 --box 300,200,120,90@0 --tracker ocean --out tracks.json
 stable track clip.mp4 --box 300,200,120,90@0 --tracker mixformerv2 --out tracks.json
 
@@ -348,6 +367,8 @@ trackers' model code) — the frontend is already built into the package
 | `stable.trackers.mixformerv2` | MixFormerV2-B and -S (MCG-NJU): one-stream transformer box regression — the most accurate box and point tracker of the Siamese family |
 | `stable.trackers.hit` | HiT (ICCV 2023): a hierarchical vision transformer box tracker — precise object boxes, fast on a GPU |
 | `stable.trackers.hit_net` | The HiT network (LeViT backbone, Bridge Module, corner head), ported to plain PyTorch |
+| `stable.trackers.sutrack_net` | The SUTrack-T224 network (Fast-iTPN encoder, centre head), ported to plain PyTorch |
+| `stable.trackers.sutrack` | SUTrack (AAAI 2025): one-stream transformer — precise points and boxes, fast on a CPU |
 | `stable.trackers.chunking` | Window planning and overlap stitching for long clips |
 | `stable.trackers.confidence` | One confidence scale every plugin normalises onto |
 | `stable.trackers.weights` | Lazy, checksummed, licence-gated model download |

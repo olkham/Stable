@@ -230,8 +230,9 @@ How the shipped plugins do it:
 | `siamdw` | correlation peak / the anchor frame's own peak | `(0.55, 0.72)` |
 | `mixformerv2` | score head x edge sharpness vs the anchor's x box-shape agreement² (boxes: score head) | `(0.3, 0.7)`; boxes `(0.3, 0.75)` |
 | `hit` | template-token cosine under the box / the anchor frame's own | `(0.75, 0.90)` (Base) |
+| `sutrack` | centre-head score at the cell chosen | `(0.45, 0.72)`; boxes `(0.35, 0.65)` |
 
-The last four were fitted to measurements, not chosen: each tracker was run
+The last five were fitted to measurements, not chosen: each tracker was run
 with the real checkpoints over clips of known motion and over an occluder
 sweeping across the point, and each range puts every covered frame at `0` while
 keeping frames within 2 px of the truth near `1`. Ocean's classifier alone could
@@ -242,7 +243,9 @@ the occluder), so a point's evidence is a product too; see
 `stable/trackers/mixformerv2.py`. HiT has no score head at all, and its corner
 maps told good frames from lost ones poorly, so its signal is an appearance
 check computed from its own backbone; each of its three variants has its own
-measured range, and boxes another (see `stable/trackers/hit.py`).
+measured range, and boxes another (see `stable/trackers/hit.py`). SUTrack's
+centre score needed no second signal: it fell to a median 0.23 with the point
+covered against 0.88 on tracked frames; see `stable/trackers/sutrack.py`.
 
 Sanity check your choice: on clean, unambiguous footage your plugin should score
 `> 0.9`, and through a full occlusion it should approach `0`. The shared suite
@@ -282,6 +285,7 @@ not invented or copied from a third party.
 | `hit_base` | `7d6ee218014c3dae93c04fff0df5284c5fd723d6fcf79d5210e83457bf242a00` | 511,212,333 bytes |
 | `hit_small` | `7f3d834d6d55eecf4ceea3f8c8cddf268a5bed8510678b25e5fc65b96855f475` | 137,177,837 bytes |
 | `hit_tiny` | `021a7583e1a18d96683bdb69e85b678ea4c7cac5d2522b9ec90e7fdc1f6fa90b` | 118,102,065 bytes |
+| `sutrack_t224` | `5815a447480fba64d67cfa6cb011f23bb5b89465685043292464ad283f91210d` | 1,044,947,583 bytes |
 
 How they were verified, so the next model follows the same bar rather than a
 lower one:
@@ -377,6 +381,30 @@ the same three steps:
    box and a point: composited box clips, clips of known motion, occluder
    sweeps and the bundled sample clip. The numbers, and why Base is the
    default, are in the module docstring of `stable/trackers/hit.py`.
+
+`sutrack_t224` (SUTrack, AAAI 2025) was held to the same bar:
+
+1. **Provenance.** The authors' README links Baidu and Hugging Face; the file
+   is the Hugging Face one (`xche32/SUTrack`, whose model card is MIT, as is
+   the code), fetched from a fixed revision so the URL cannot change under the
+   digest. The digest above is also the file's Hugging Face LFS hash. It is
+   upstream's training checkpoint: 1 GB, nearly all of it the OpenAI CLIP
+   ViT-L/14 (MIT) that SUTrack only uses for one constant token on RGB video.
+2. **Network equivalence.** `stable/trackers/sutrack_net.py` loads every tensor
+   it keeps with strict matching (377; the 446 CLIP tensors, the two unused
+   text norms and the task-recognition head are dropped, and why is in its
+   docstring), and on identical inputs reproduces the authors' own modules —
+   CLIP rebuilt from the same checkpoint for the language token — to within
+   2.4e-7 on the score map and 5e-5 network pixels on the box on the CPU, and
+   1e-5 / 2e-3 px on a GPU, where upstream runs CLIP in half precision.
+   SUTrack-B224's network was checked the same way and matched as closely.
+3. **Real tracking.** `ensure_weights()` fetched the file through Stable's own
+   downloader, and the plugin tracked through its actual `_build_backend`:
+   points and boxes on clips of known motion, occluder sweeps, the bundled
+   sample clip through `stable track`, and the server's tracker and model
+   listings. The numbers are in `stable/trackers/sutrack.py`'s docstring; it
+   runs at 22 ms a frame for one point on eight CPU threads (6 ms on a GPU), and
+   its weights carry no denormals.
 
 Note for contributors: `tapnet` and `cotracker` are **not** installed by
 `pip install -e ".[dev,video,server]"` or even `.[torch]` — they are the

@@ -14,9 +14,10 @@ loading, coordinate scaling, re-anchoring, stitching, confidence normalisation
 and timeline assembly. Only the neural network itself is stubbed. Ocean and
 SiamDW do the same through :class:`~conftest.SiameseMarkerBackend`, which finds
 the marker in the template and search crops they cut, the MixFormerV2 pair
-through :class:`~conftest.MixFormerMarkerBackend`, its one-box counterpart, and
-HiT through :class:`~hit_backends.HiTMarkerBackend`, which draws its corner maps
-there.
+through :class:`~conftest.MixFormerMarkerBackend`, its one-box counterpart, HiT
+through :class:`~hit_backends.HiTMarkerBackend`, which draws its corner maps
+there, and SUTrack through :class:`_sutrack_stub.SUTrackMarkerBackend`, which
+answers in its map layout.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _sutrack_stub import SUTrackMarkerBackend
 from conftest import MarkerBackend, MixFormerMarkerBackend, SiameseMarkerBackend, anchor_at
 from hit_backends import HiTMarkerBackend
 
@@ -53,29 +55,9 @@ from stable.trackers.registry import (
 )
 from stable.trackers.sam3 import Sam3Tracker
 from stable.trackers.siamdw import SiamDWTracker
+from stable.trackers.sutrack import SUTrackTracker
 from stable.trackers.tapir import TapirTracker
 from stable.trackers.template import TemplateTracker
-
-
-def _register_unpublished_plugins() -> None:
-    """Register any plugin pyproject.toml declares that the installed metadata lacks.
-
-    An editable install publishes the entry points it had when it was installed,
-    so a plugin added to pyproject.toml since is not discoverable until
-    ``pip install -e .`` runs again. This suite is about the plugins in this
-    tree, not about how recently it was installed (``tests/test_registry.py``
-    covers publishing), so those are registered directly — a no-op once they
-    are published, since registering the same class twice is.
-    """
-    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["entry-points"]
-    installed = {ep.name for ep in metadata.entry_points(group=ENTRY_POINT_GROUP)}
-    for name, target in declared[ENTRY_POINT_GROUP].items():
-        if name not in installed:
-            register_tracker(metadata.EntryPoint(name, target, ENTRY_POINT_GROUP).load())
-
-
-_register_unpublished_plugins()
 
 # Small windows with a real overlap so the multi-chunk path is the *default* in
 # every test below, not a special case one test remembers to cover.
@@ -120,6 +102,8 @@ def make_plugin(name: str):
         return MixFormerV2SmallTracker(backend=MixFormerMarkerBackend())
     if name == "hit":
         return HiTTracker(backend=HiTMarkerBackend())
+    if name == "sutrack":
+        return SUTrackTracker(backend=SUTrackMarkerBackend())
     raise AssertionError(f"unknown tracker {name!r}")
 
 
@@ -140,10 +124,11 @@ TRACKERS = [
     "mixformerv2",
     "mixformerv2_small",
     "hit",
+    "sutrack",
 ]
-# The windowed plugins; the Siamese ones (Ocean, SiamDW, MixFormerV2, HiT) never
-# cut a run into windows (see stable/trackers/siamese.py), so the chunking
-# criterion below is not theirs.
+# The windowed plugins; the Siamese ones (Ocean, SiamDW, MixFormerV2, HiT,
+# SUTrack) never cut a run into windows (see stable/trackers/siamese.py), so the
+# chunking criterion below is not theirs.
 DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 
 # The feature matchers are held to the same *registry* contract here, but
@@ -152,6 +137,20 @@ DEEP = ["cotracker3", "tapir", "raft", "sam3"]
 # finds a single keypoint in the whole frame. Asserting tracking accuracy on
 # material a tracker cannot see would test the fixture, not the plugin.
 REGISTRY_TRACKERS = [*TRACKERS, "sift", "orb"]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _this_checkouts_trackers_are_registered():
+    """Register every tracker this checkout's pyproject.toml declares.
+
+    The registry discovers the *installed* entry points, which describe whatever
+    checkout was last ``pip install -e``'d. Registering the declared ones too (a
+    no-op for a class already registered) keeps this suite about the code under
+    test, not about the environment's metadata.
+    """
+    declared = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text("utf-8"))
+    for name, value in declared["project"]["entry-points"][ENTRY_POINT_GROUP].items():
+        register_tracker(metadata.EntryPoint(name, value, ENTRY_POINT_GROUP).load())
 
 
 @pytest.fixture(params=TRACKERS)
